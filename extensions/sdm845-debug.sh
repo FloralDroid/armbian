@@ -4,7 +4,7 @@
 function post_family_config__sdm845_debug() {
 	declare -g LINUXFAMILY="sdm845-debug"
 	declare -g KERNELPATCHDIR="${KERNELPATCHDIR} archive/sdm845-6.18-debug"
-	declare -g BOOTIMG_CMDLINE_EXTRA="${BOOTIMG_CMDLINE_EXTRA:+${BOOTIMG_CMDLINE_EXTRA} }crashkernel=512M"
+	declare -g BOOTIMG_CMDLINE_EXTRA="${BOOTIMG_CMDLINE_EXTRA:+${BOOTIMG_CMDLINE_EXTRA} }crashkernel=512M irqchip.gicv3_pseudo_nmi=1"
 }
 
 function custom_kernel_config__sdm845_debug() {
@@ -23,6 +23,7 @@ function custom_kernel_config__sdm845_debug() {
 		"SOFTLOCKUP_DETECTOR"
 		"SOFTLOCKUP_DETECTOR_INTR_STORM"
 		"HARDLOCKUP_DETECTOR"
+		"ARM64_PSEUDO_NMI"
 		"DETECT_HUNG_TASK"
 		"DETECT_HUNG_TASK_BLOCKER"
 		"WQ_WATCHDOG"
