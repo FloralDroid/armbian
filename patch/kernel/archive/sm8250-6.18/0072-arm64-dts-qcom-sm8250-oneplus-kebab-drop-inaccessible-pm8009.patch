@@ -1,0 +1,27 @@
+From 769b18baf0489976e77384e1a2e3074cd8d96146 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Fri, 18 Sep 2026 17:07:49 +0800
+Subject: [PATCH] arm64: dts: qcom: sm8250-oneplus-kebab: drop inaccessible
+ PM8009 SPMI nodes
+
+The firmware exposes the PM8009 regulators through RPMh, but direct SPMI
+transactions to USIDs 0xa and 0xb fail.
+
+The only children added by pm8009.dtsi are PON and GPIO blocks, neither
+of which has a consumer in the kebab device tree. Drop the direct SPMI
+nodes while retaining the RPMh regulator description.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-oneplus-kebab.dts b/arch/arm64/boot/dts/qcom/sm8250-oneplus-kebab.dts
+index 869dde53c..9ea826bec 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-oneplus-kebab.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-oneplus-kebab.dts
+@@ -8,7 +8,6 @@
+ #include "pm8150.dtsi"
+ #include "pm8150b.dtsi"
+ #include "pm8150l.dtsi"
+-#include "pm8009.dtsi"
+ 
+ /*
+  * Delete following upstream (sm8250.dtsi) reserved

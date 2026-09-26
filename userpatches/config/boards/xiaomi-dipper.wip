@@ -1,0 +1,42 @@
+# Xiaomi Mi 8 (dipper) Qualcomm SDM845 mobile device.
+declare -g BOARD_NAME="Xiaomi Mi 8"
+declare -g BOARD_VENDOR="xiaomi"
+declare -g BOARD_MAINTAINER=""
+declare -g INTRODUCED="2018"
+declare -g BOARDFAMILY="sdm845"
+declare -g KERNEL_TARGET="current"
+declare -g KERNEL_TEST_TARGET="current"
+declare -g EXTRAWIFI="no"
+declare -g BOOTCONFIG="none"
+declare -g IMAGE_PARTITION_TABLE="gpt"
+declare -g ABL_DTB_LIST=("sdm845-xiaomi-dipper")
+
+enable_extension "kernel-common"
+
+# Debug packages keep their own kernel release and module directory.
+if [[ "${SDM845_DEBUG:-no}" == "yes" ]]; then
+	enable_extension "sdm845-debug"
+fi
+
+function custom_kernel_config__xiaomi_dipper_drivers() {
+	opts_m+=(
+		"BATTERY_QCOM_FG"
+		"DRM_MSM"
+		"DRM_PANEL_SAMSUNG_EA8074"
+		"SND_SOC_QDSP6_Q6VOICE"
+		"SND_SOC_TAS2557"
+		"TOUCHSCREEN_STM_FTS_DOWNSTREAM"
+		"VIDEO_IMX363"
+		"VIDEO_OV7251"
+		"VIDEO_QCOM_VENUS"
+	)
+}
+
+# Use distribution firmware packages; proprietary device extraction stays outside Git.
+declare -g BOARD_FIRMWARE_INSTALL="-full"
+
+function post_family_tweaks_bsp__xiaomi_dipper_usb_network() {
+	install -Dm644 \
+		"${SRC}/packages/bsp/xiaomi-dipper/10-xiaomi-dipper-usb0.network" \
+		"${destination}/etc/systemd/network/10-xiaomi-dipper-usb0.network"
+}

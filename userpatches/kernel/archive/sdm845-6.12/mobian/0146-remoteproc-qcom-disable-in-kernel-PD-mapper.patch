@@ -1,0 +1,45 @@
+From 7e1ea84748d49b328213db529b524216600a9419 Mon Sep 17 00:00:00 2001
+From: Frank Oltmanns <frank@oltmanns.dev>
+Date: Mon, 30 Dec 2024 19:12:53 +0100
+Subject: [PATCH] HACK: remoteproc: qcom: disable in-kernel PD mapper
+
+Origin:https://gitlab.postmarketos.org/postmarketOS/pmaports/-/merge_requests/5966
+
+Somehow enabling in-kernel PD mapper (introduced in 5b9f51b200dcb
+"remoteproc: qcom: enable in-kernel PD mapper"), breaks the bottom mic
+on xiaomi-beryllium (Poco F1) and distorts audio on OP6 (and possibly
+OP6T). Temporarily disable it and log the rprocs in use until we better
+understand what causes the issue.
+
+Link: pmaports#3353
+Link: pmaports#3320
+Link: pmaports#3245
+Link: pmaports#3253
+
+Signed-off-by: Frank Oltmanns <frank@oltmanns.dev>
+---
+ drivers/remoteproc/qcom_common.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/remoteproc/qcom_common.c b/drivers/remoteproc/qcom_common.c
+index 5bbbe36..ca87293 100644
+--- a/drivers/remoteproc/qcom_common.c
++++ b/drivers/remoteproc/qcom_common.c
+@@ -589,6 +589,8 @@ static void pdm_notify_unprepare(struct rproc_subdev *subdev)
+  */
+ void qcom_add_pdm_subdev(struct rproc *rproc, struct qcom_rproc_pdm *pdm)
+ {
++	printk(KERN_INFO "aborting qcom_add_pdm_subdev, name %s\n", rproc->name);
++	return;
+ 	pdm->dev = &rproc->dev;
+ 	pdm->index = rproc->index;
+ 
+@@ -608,6 +610,8 @@ EXPORT_SYMBOL_GPL(qcom_add_pdm_subdev);
+  */
+ void qcom_remove_pdm_subdev(struct rproc *rproc, struct qcom_rproc_pdm *pdm)
+ {
++	printk(KERN_INFO "aborting qcom_remove_pdm_subdev, name %s\n", rproc->name);
++	return;
+ 	rproc_remove_subdev(rproc, &pdm->subdev);
+ }
+ EXPORT_SYMBOL_GPL(qcom_remove_pdm_subdev);

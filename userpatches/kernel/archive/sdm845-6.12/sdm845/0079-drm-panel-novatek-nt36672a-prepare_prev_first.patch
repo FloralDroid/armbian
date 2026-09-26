@@ -1,0 +1,24 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Wed, 17 Apr 2024 16:12:58 +0100
+Subject: drm/panel: novatek-nt36672a: prepare_prev_first
+
+This corrects the host initialisation sequence so that we can send
+DSI/DCS commands in prepare().
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ drivers/gpu/drm/panel/panel-novatek-nt36672a.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/gpu/drm/panel/panel-novatek-nt36672a.c b/drivers/gpu/drm/panel/panel-novatek-nt36672a.c
+index d93f102..dfd0c90 100644
+--- a/drivers/gpu/drm/panel/panel-novatek-nt36672a.c
++++ b/drivers/gpu/drm/panel/panel-novatek-nt36672a.c
+@@ -618,6 +618,7 @@ static int nt36672a_panel_add(struct nt36672a_panel *pinfo)
+ 				     "failed to get reset gpio from DT\n");
+ 
+ 	drm_panel_init(&pinfo->base, dev, &panel_funcs, DRM_MODE_CONNECTOR_DSI);
++	pinfo->base.prepare_prev_first = true;
+ 
+ 	ret = drm_panel_of_backlight(&pinfo->base);
+ 	if (ret)

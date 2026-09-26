@@ -1,0 +1,25 @@
+From: Dylan Van Assche <me@dylanvanassche.be>
+Date: Sun, 13 Aug 2023 19:24:55 +0200
+Subject: arm64: dts: qcom: sdm845-shift-axolotl: add ath10k calibration
+ variant
+
+SDM845-based SHIFTPHONES SHIFT6mq has its own calibration files
+for the WCN3990 WiFi/Bluetooth radio with the ath10k driver.
+Add the calibration variant name to the DTS to reflect this to
+allow using the calibration files from linux-firmware.
+
+Signed-off-by: Dylan Van Assche <me@dylanvanassche.be>
+---
+ arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
+index 5cc5a95..b2ad491 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
+@@ -997,4 +997,5 @@ &wifi {
+ 	vdd-3.3-ch1-supply = <&vreg_l23a_3p3>;
+ 
+ 	qcom,snoc-host-cap-8bit-quirk;
++	qcom,ath10k-calibration-variant = "shift_axolotl";
+ };

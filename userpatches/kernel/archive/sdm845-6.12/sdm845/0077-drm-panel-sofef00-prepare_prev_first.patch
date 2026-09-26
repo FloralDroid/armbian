@@ -1,0 +1,24 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Wed, 17 Apr 2024 16:11:31 +0100
+Subject: drm/panel: sofef00: prepare_prev_first
+
+This corrects the host initialisation sequence so that we can send
+DSI/DCS commands in prepare().
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ drivers/gpu/drm/panel/panel-samsung-sofef00.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/gpu/drm/panel/panel-samsung-sofef00.c b/drivers/gpu/drm/panel/panel-samsung-sofef00.c
+index 7e5a33b..82123a2 100644
+--- a/drivers/gpu/drm/panel/panel-samsung-sofef00.c
++++ b/drivers/gpu/drm/panel/panel-samsung-sofef00.c
+@@ -236,6 +236,7 @@ static int sofef00_panel_probe(struct mipi_dsi_device *dsi)
+ 
+ 	drm_panel_init(&ctx->panel, dev, &sofef00_panel_panel_funcs,
+ 		       DRM_MODE_CONNECTOR_DSI);
++	ctx->panel.prepare_prev_first = true;
+ 
+ 	ctx->panel.backlight = sofef00_create_backlight(dsi);
+ 	if (IS_ERR(ctx->panel.backlight))

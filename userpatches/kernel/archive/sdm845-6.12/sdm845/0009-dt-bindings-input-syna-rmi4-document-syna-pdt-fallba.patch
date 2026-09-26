@@ -1,0 +1,35 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Sat, 30 Sep 2023 17:49:32 +0100
+Subject: dt-bindings: input: syna,rmi4: document syna,pdt-fallback-desc
+
+This new property allows devices to specify some register values which
+are missing on units with third party replacement displays. These
+displays use unofficial touch ICs which only implement a subset of the
+RMI4 specification.
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ Documentation/devicetree/bindings/input/syna,rmi4.yaml | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/input/syna,rmi4.yaml b/Documentation/devicetree/bindings/input/syna,rmi4.yaml
+index b522c8d..04ce256 100644
+--- a/Documentation/devicetree/bindings/input/syna,rmi4.yaml
++++ b/Documentation/devicetree/bindings/input/syna,rmi4.yaml
+@@ -49,6 +49,16 @@ properties:
+     description:
+       Delay to wait after powering on the device.
+ 
++  syna,pdt-fallback-desc:
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    description:
++      An array of pairs of function number and version. These are used
++      on some devices with replacement displays that use unofficial touch
++      controllers. These controllers do report the properties of their PDT
++      entries, but leave the function_number and function_version registers
++      blank. These values should match exactly the 5th and 4th bytes of each
++      PDT entry from the original display's touch controller.
++
+   vdd-supply: true
+   vio-supply: true
+ 

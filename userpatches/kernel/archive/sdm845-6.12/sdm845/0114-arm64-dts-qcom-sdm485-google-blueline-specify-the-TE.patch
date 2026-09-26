@@ -1,0 +1,35 @@
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Tue, 14 May 2024 15:50:48 +0300
+Subject: arm64: dts: qcom: sdm485-google-blueline: specify the TE signal
+
+The Google Pixel 3 device uses a non-default pin to communicate the
+vsync event from the panel to the SoC. Specify it in the DT.
+
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+---
+ arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts b/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
+index 5196ed3..5f7dd63 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
+@@ -326,7 +326,17 @@ &mdss_dsi0 {
+ 	status = "okay";
+ 	vdda-supply = <&vdda_mipi_dsi0_1p2>;
+ 
+-	panel {
++	ports {
++		port@1 {
++			endpoint {
++				remote-endpoint = <&lg_sw43408_in_0>;
++				data-lanes = <0 1 2 3>;
++				qcom,te-source = "mdp_vsync_e";
++			};
++		};
++	};
++
++	panel@0 {
+ 		compatible = "lg,sw43408";
+ 		reg = <0>;
+ 

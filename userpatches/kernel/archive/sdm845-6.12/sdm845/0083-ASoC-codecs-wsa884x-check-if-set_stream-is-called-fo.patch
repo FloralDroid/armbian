@@ -1,0 +1,33 @@
+From: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Date: Wed, 25 Oct 2023 16:46:01 +0200
+Subject: ASoC: codecs: wsa884x: check if set_stream is called for proper bus
+
+If multiple WSA8840 speakers, from two separate Soundwire buses, are
+used in one codec DAI link, the set_stream() should ignore calls for
+setting stream from other Soundwire controller.
+
+Signed-off-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Co-developed-by: Krzysztof Kozlowski <krzysztof.kozlowski@linaro.org>
+Signed-off-by: Krzysztof Kozlowski <krzysztof.kozlowski@linaro.org>
+Link: https://lore.kernel.org/r/20231025144601.268645-3-krzysztof.kozlowski@linaro.org
+---
+ sound/soc/codecs/wsa884x.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index 951cb51..7195041 100644
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -1829,6 +1829,12 @@ static int wsa884x_set_stream(struct snd_soc_dai *dai,
+ 			      void *stream, int direction)
+ {
+ 	struct wsa884x_priv *wsa884x = dev_get_drvdata(dai->dev);
++	struct sdw_stream_runtime *sruntime = stream;
++	struct sdw_slave *sdw = dev_to_sdw_dev(dai->dev);
++
++	/* Check if this belongs to same bus */
++	if (sdw->bus->dev != sruntime->dev)
++		return 0;
+ 
+ 	wsa884x->sruntime = stream;
+ 

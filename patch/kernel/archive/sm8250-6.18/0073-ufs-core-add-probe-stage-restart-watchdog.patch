@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: debug debug <debug@debug>
+Date: Sun, 20 Sep 2026 14:00:00 +0800
+Subject: [PATCH] ufs: core: add probe-stage restart watchdog
+
+The SM8250 UFS platform probe can remain blocked for several minutes with
+no usable console or persistent log. Add temporary, deliberately intrusive
+instrumentation that records coarse probe progress and monitors it from a
+dedicated kthread.
+
+After 30 seconds without a stage change, the watchdog waits a further
+stage * 3 seconds before restarting. The total delay from the last stage
+change therefore identifies the last completed stage without relying on
+userspace, pstore, a console, or a shared workqueue.
+
+This is a diagnostic patch and must be dropped after the failing stage has
+been identified.
+
+Signed-off-by: debug <debug@debug>
+---
+ drivers/ufs/core/ufshcd.c | 127 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 127 insertions(+)
+
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+index 5f4f3ca51..d3f244120 100644
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -18,10 +18,13 @@
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/interrupt.h>
++#include <linux/kthread.h>
+ #include <linux/module.h>
+ #include <linux/pm_opp.h>
++#include <linux/reboot.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/sched/clock.h>
++#include <linux/wait.h>
+ #include <linux/iopoll.h>
+ #include <scsi/scsi_cmnd.h>
+ #include <scsi/scsi_dbg.h>
+@@ -103,6 +106,111 @@ enum {
+ /* Default RTC update every 10 seconds */
+ #define UFS_RTC_UPDATE_INTERVAL_MS (10 * MSEC_PER_SEC)
+ 
++/* Temporary no-console probe instrumentation for the SM8250 bring-up. */
++#define UFS_PROBE_WATCHDOG_STALL_MS	30000
++#define UFS_PROBE_WATCHDOG_STAGE_MS	10000
++
++enum ufs_probe_watchdog_stage {
++	UFS_PROBE_STAGE_INACTIVE,
++	UFS_PROBE_STAGE_INIT_ENTER,
++	UFS_PROBE_STAGE_RESOURCES_ON,
++	UFS_PROBE_STAGE_VARIANT_READY,
++	UFS_PROBE_STAGE_IRQ_READY,
++	UFS_PROBE_STAGE_HCE_BEGIN,
++	UFS_PROBE_STAGE_HCE_DONE,
++	UFS_PROBE_STAGE_LINK_BEGIN,
++	UFS_PROBE_STAGE_LINK_DONE,
++	UFS_PROBE_STAGE_NOP_DONE,
++	UFS_PROBE_STAGE_DEVICE_INIT_DONE,
++	UFS_PROBE_STAGE_DESCRIPTORS_DONE,
++	UFS_PROBE_STAGE_POWER_MODE_DONE,
++	UFS_PROBE_STAGE_COMPLETE,
++};
++
++static atomic_t ufs_probe_watchdog_stage = ATOMIC_INIT(UFS_PROBE_STAGE_INACTIVE);
++static DECLARE_WAIT_QUEUE_HEAD(ufs_probe_watchdog_waitq);
++static DEFINE_MUTEX(ufs_probe_watchdog_lock);
++static struct task_struct *ufs_probe_watchdog_task;
++
++static void ufshcd_probe_watchdog_set_stage(enum ufs_probe_watchdog_stage stage)
++{
++	atomic_set(&ufs_probe_watchdog_stage, stage);
++	wake_up(&ufs_probe_watchdog_waitq);
++}
++
++static bool ufshcd_probe_watchdog_changed(int stage)
++{
++	return kthread_should_stop() ||
++		atomic_read(&ufs_probe_watchdog_stage) != stage;
++}
++
++static int ufshcd_probe_watchdog_thread(void *unused)
++{
++	int stage = atomic_read(&ufs_probe_watchdog_stage);
++	long ret, timeout;
++
++	for (;;) {
++		timeout = msecs_to_jiffies(UFS_PROBE_WATCHDOG_STALL_MS);
++		ret = wait_event_interruptible_timeout(ufs_probe_watchdog_waitq,
++						       ufshcd_probe_watchdog_changed(stage),
++						       timeout);
++		if (kthread_should_stop())
++			return 0;
++		if (ret) {
++			stage = atomic_read(&ufs_probe_watchdog_stage);
++			continue;
++		}
++
++		/* Encode the stalled stage in the extra delay before restart. */
++		timeout = msecs_to_jiffies(stage *
++					    UFS_PROBE_WATCHDOG_STAGE_MS);
++		ret = wait_event_interruptible_timeout(ufs_probe_watchdog_waitq,
++						       ufshcd_probe_watchdog_changed(stage),
++						       timeout);
++		if (kthread_should_stop())
++			return 0;
++		if (ret) {
++			stage = atomic_read(&ufs_probe_watchdog_stage);
++			continue;
++		}
++
++		kernel_restart(NULL);
++		return 0;
++	}
++}
++
++static void ufshcd_probe_watchdog_start(struct device *dev)
++{
++	mutex_lock(&ufs_probe_watchdog_lock);
++	if (!ufs_probe_watchdog_task) {
++		ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_INIT_ENTER);
++		ufs_probe_watchdog_task = kthread_run(ufshcd_probe_watchdog_thread,
++						      NULL, "ufs_probe_watchdog");
++		if (IS_ERR(ufs_probe_watchdog_task)) {
++			dev_err(dev, "failed to start UFS probe watchdog: %ld\n",
++				PTR_ERR(ufs_probe_watchdog_task));
++			ufs_probe_watchdog_task = NULL;
++		}
++	}
++	mutex_unlock(&ufs_probe_watchdog_lock);
++}
++
++static void ufshcd_probe_watchdog_stop(void)
++{
++	struct task_struct *task;
++
++	mutex_lock(&ufs_probe_watchdog_lock);
++	task = ufs_probe_watchdog_task;
++	ufs_probe_watchdog_task = NULL;
++	mutex_unlock(&ufs_probe_watchdog_lock);
++
++	if (task) {
++		wake_up(&ufs_probe_watchdog_waitq);
++		kthread_stop(task);
++	}
++	atomic_set(&ufs_probe_watchdog_stage, UFS_PROBE_STAGE_INACTIVE);
++}
++
+ /* bMaxNumOfRTT is equal to two after device manufacturing */
+ #define DEFAULT_MAX_NUM_RTT 2
+ 
+@@ -9539,10 +9647,14 @@ static int ufshcd_hba_init(struct ufs_hba *hba)
+ 	if (err)
+ 		goto out_disable_clks;
+ 
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_RESOURCES_ON);
++
+ 	err = ufshcd_variant_hba_init(hba);
+ 	if (err)
+ 		goto out_disable_vreg;
+ 
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_VARIANT_READY);
++
+ 	ufs_debugfs_hba_init(hba);
+ 	ufs_fault_inject_hba_init(hba);
+ 
+@@ -10682,6 +10794,8 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
+ 		goto out_error;
+ 	}
+ 
++	ufshcd_probe_watchdog_start(dev);
++
+ 	hba->mmio_base = mmio_base;
+ 	hba->irq = irq;
+ 	hba->vps = &ufs_hba_vps;
+@@ -10811,13 +10925,16 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
+ 	} else {
+ 		hba->is_irq_enabled = true;
+ 	}
+ 
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_IRQ_READY);
++
+ 	/* Reset the attached device */
+ 	ufshcd_device_reset(hba);
+ 
+ 	ufshcd_init_crypto(hba);
+ 
+ 	/* Host controller enable */
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_HCE_BEGIN);
+ 	err = ufshcd_hba_enable(hba);
+ 	if (err) {
+ 		dev_err(hba->dev, "Host controller enable failed\n");
+@@ -10825,6 +10942,7 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
+ 		ufshcd_print_host_state(hba);
+ 		goto out_disable;
+ 	}
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_HCE_DONE);
+ 
+ 	INIT_DELAYED_WORK(&hba->rpm_dev_flush_recheck_work, ufshcd_rpm_dev_flush_recheck_work);
+ 	INIT_DELAYED_WORK(&hba->ufs_rtc_update_work, ufshcd_rtc_work);
+@@ -10851,9 +10969,11 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
+ 
+ 	hba->ufshcd_state = UFSHCD_STATE_RESET;
+ 
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_LINK_BEGIN);
+ 	err = ufshcd_link_startup(hba);
+ 	if (err)
+ 		goto out_disable;
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_LINK_DONE);
+ 
+ 	if (hba->quirks & UFSHCD_QUIRK_SKIP_PH_CONFIGURATION)
+ 		goto initialized;
+@@ -10868,17 +10988,21 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
+ 	err = ufshcd_verify_dev_init(hba);
+ 	if (err)
+ 		goto out_disable;
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_NOP_DONE);
+ 
+ 	/* Initiate UFS initialization, and waiting until completion */
+ 	err = ufshcd_complete_dev_init(hba);
+ 	if (err)
+ 		goto out_disable;
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_DEVICE_INIT_DONE);
+ 
+ 	err = ufshcd_device_params_init(hba);
+ 	if (err)
+ 		goto out_disable;
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_DESCRIPTORS_DONE);
+ 
+ 	err = ufshcd_post_device_init(hba);
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_POWER_MODE_DONE);
+ 
+ initialized:
+ 	ufshcd_process_probe_result(hba, probe_start, err);
+@@ -10894,12 +11018,15 @@ initialized:
+ 
+ 	device_enable_async_suspend(dev);
+ 	ufshcd_pm_qos_init(hba);
++	ufshcd_probe_watchdog_set_stage(UFS_PROBE_STAGE_COMPLETE);
++	ufshcd_probe_watchdog_stop();
+ 	return 0;
+ 
+ out_disable:
+ 	hba->is_irq_enabled = false;
+ 	ufshcd_hba_exit(hba);
+ out_error:
++	ufshcd_probe_watchdog_stop();
+ 	return err > 0 ? -EIO : err;
+ }
+ EXPORT_SYMBOL_GPL(ufshcd_init);
+-- 
+2.47.3

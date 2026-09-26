@@ -1,0 +1,39 @@
+From dab16c8b70da141aa447213f9539181839420862 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Wed, 16 Sep 2026 22:24:45 +0800
+Subject: [PATCH] arm64: dts: qcom: sm8250-oneplus-kebab: enable ramoops
+
+---
+ .../arm64/boot/dts/qcom/sm8250-oneplus-kebab.dts | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-oneplus-kebab.dts b/arch/arm64/boot/dts/qcom/sm8250-oneplus-kebab.dts
+index 120632be9..869dde53c 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-oneplus-kebab.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-oneplus-kebab.dts
+@@ -155,14 +155,14 @@ cont_splash_mem: memory@9c000000 {
+ 			no-map;
+ 		};
+ 
+-		// ramoops@b0000000 {
+-		// 	compatible = "ramoops";
+-		// 	reg = <0x00 0xb0000000 0x00 0x400000>;
+-		// 	record-size = <0x40000>;
+-		// 	console-size = <0x40000>;
+-		// 	ecc-size = <0x00>;
+-		// 	no-map;
+-		// };
++		ramoops@b0000000 {
++			compatible = "ramoops";
++			reg = <0x00 0xb0000000 0x00 0x400000>;
++			record-size = <0x40000>;
++			console-size = <0x40000>;
++			ecc-size = <0x00>;
++			no-map;
++		};
+ 	};
+ 
+ 	vph_pwr: vph-pwr-regulator {
+-- 
+2.47.3
+

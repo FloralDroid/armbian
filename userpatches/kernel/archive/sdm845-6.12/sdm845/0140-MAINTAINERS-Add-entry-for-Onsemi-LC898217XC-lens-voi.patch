@@ -1,0 +1,30 @@
+From: Vasiliy Doylov <nekocwd@mainlining.org>
+Date: Tue, 4 Mar 2025 04:17:44 +0300
+Subject: MAINTAINERS: Add entry for Onsemi LC898217XC lens voice coil driver
+
+Add entry for Onsemi LC898217XC lens voice coil driver
+
+Signed-off-by: Vasiliy Doylov <nekocwd@mainlining.org>
+---
+ MAINTAINERS | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 4f7d508..b3707673 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -17254,6 +17254,14 @@ S:	Supported
+ W:	http://www.onsemi.com
+ F:	drivers/net/phy/ncn*
+ 
++ONSEMI LC898217XC LENS VOICE COIL DRIVER
++M:	Vasiliy Doylov <nekocwd@mainlining.org>
++L:	linux-media@vger.kernel.org
++S:	Maintained
++T:	git git://linuxtv.org/media.git
++F:	Documentation/devicetree/bindings/media/i2c/onnn,lc898217xc.yaml
++F:	drivers/media/i2c/lc898217xc.c
++
+ OP-TEE DRIVER
+ M:	Jens Wiklander <jens.wiklander@linaro.org>
+ L:	op-tee@lists.trustedfirmware.org

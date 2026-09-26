@@ -1,0 +1,35 @@
+From: Vasiliy Doylov <nekodevelopper@gmail.com>
+Date: Thu, 20 Feb 2025 13:42:19 +0300
+Subject: arm64: dts: qcom: sdm845-oneplus: add rear camera actuator
+
+Signed-off-by: Vasiliy Doylov <nekodevelopper@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+index e182312..531407fc 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+@@ -618,6 +618,12 @@ imx371_ep: endpoint {
+ };
+ 
+ &cci_i2c1 {
++	sub_cam_actuator: actuator@74 {
++		compatible = "onnn,lc898217xc";
++		reg = <0x74>;
++		vcc-supply = <&sub_cam_vaf>;
++	};
++
+ 	sub_cam: camera@10 {
+ 		compatible = "sony,imx376k";
+ 		reg = <0x10>;
+@@ -640,6 +646,8 @@ sub_cam: camera@10 {
+ 		orientation = <1>; /* Rear camera */
+ 		rotation = <270>;
+ 
++		lens-focus = <&sub_cam_actuator>;
++
+ 		status = "okay";
+ 
+ 		port {

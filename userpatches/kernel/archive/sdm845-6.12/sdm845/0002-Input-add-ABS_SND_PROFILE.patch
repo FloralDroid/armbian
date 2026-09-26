@@ -1,0 +1,72 @@
+From: Gergo Koteles <soyer@irl.hu>
+Date: Wed, 22 Feb 2023 01:10:33 +0100
+Subject: Input: add ABS_SND_PROFILE
+
+ABS_SND_PROFILE used to describe the state of a multi-value sound profile
+switch. This will be used for the alert-slider on OnePlus phones or other
+phones.
+
+Profile values added as SND_PROFLE_(SILENT|VIBRATE|RING) identifiers
+to input-event-codes.h so they can be used from DTS.
+
+Signed-off-by: Gergo Koteles <soyer@irl.hu>
+---
+ Documentation/input/event-codes.rst    | 6 ++++++
+ drivers/hid/hid-debug.c                | 1 +
+ include/uapi/linux/input-event-codes.h | 9 +++++++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/Documentation/input/event-codes.rst b/Documentation/input/event-codes.rst
+index b455746..d43336e 100644
+--- a/Documentation/input/event-codes.rst
++++ b/Documentation/input/event-codes.rst
+@@ -241,6 +241,12 @@ A few EV_ABS codes have special meanings:
+     emitted only when the selected profile changes, indicating the newly
+     selected profile value.
+ 
++* ABS_SND_PROFILE:
++
++  - Used to describe the state of a multi-value sound profile switch.
++    An event is emitted only when the selected profile changes,
++    indicating the newly selected profile value.
++
+ * ABS_MT_<name>:
+ 
+   - Used to describe multitouch input events. Please see
+diff --git a/drivers/hid/hid-debug.c b/drivers/hid/hid-debug.c
+index d5abfe6..352fbb7 100644
+--- a/drivers/hid/hid-debug.c
++++ b/drivers/hid/hid-debug.c
+@@ -3512,6 +3512,7 @@ static const char *absolutes[ABS_CNT] = {
+ 	[ABS_DISTANCE] = "Distance",	[ABS_TILT_X] = "XTilt",
+ 	[ABS_TILT_Y] = "YTilt",		[ABS_TOOL_WIDTH] = "ToolWidth",
+ 	[ABS_VOLUME] = "Volume",	[ABS_PROFILE] = "Profile",
++	[ABS_SND_PROFILE] = "SoundProfile",
+ 	[ABS_MISC] = "Misc",
+ 	[ABS_MT_SLOT] = "MTSlot",
+ 	[ABS_MT_TOUCH_MAJOR] = "MTMajor",
+diff --git a/include/uapi/linux/input-event-codes.h b/include/uapi/linux/input-event-codes.h
+index 5a199f3..9aa3910 100644
+--- a/include/uapi/linux/input-event-codes.h
++++ b/include/uapi/linux/input-event-codes.h
+@@ -870,6 +870,7 @@
+ 
+ #define ABS_VOLUME		0x20
+ #define ABS_PROFILE		0x21
++#define ABS_SND_PROFILE		0x22
+ 
+ #define ABS_MISC		0x28
+ 
+@@ -978,4 +979,12 @@
+ #define SND_MAX			0x07
+ #define SND_CNT			(SND_MAX+1)
+ 
++/*
++ * ABS_SND_PROFILE values
++ */
++
++#define SND_PROFILE_SILENT	0x00
++#define SND_PROFILE_VIBRATE	0x01
++#define SND_PROFILE_RING	0x02
++
+ #endif

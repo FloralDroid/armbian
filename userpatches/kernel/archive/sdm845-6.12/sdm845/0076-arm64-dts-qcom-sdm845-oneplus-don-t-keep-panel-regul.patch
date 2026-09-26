@@ -1,0 +1,25 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Tue, 21 Nov 2023 05:17:43 +0000
+Subject: arm64: dts: qcom: sdm845-oneplus: don't keep panel regulator always
+ on
+
+the panel regulator doesn't need to be always on, so remove this
+property.
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+index 910eb9b..5828d95 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+@@ -288,7 +288,6 @@ vreg_l14a_1p88: ldo14 {
+ 			regulator-min-microvolt = <1800000>;
+ 			regulator-max-microvolt = <1800000>;
+ 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+-			regulator-always-on;
+ 		};
+ 
+ 		vreg_l17a_1p3: ldo17 {

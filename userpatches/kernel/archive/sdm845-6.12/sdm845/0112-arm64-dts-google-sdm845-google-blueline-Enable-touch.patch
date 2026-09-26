@@ -1,0 +1,29 @@
+From: Victoria Brekenfeld <github@drakulix.de>
+Date: Sun, 28 Apr 2024 16:15:12 +0200
+Subject: arm64: dts: google: sdm845-google-blueline: Enable touchscreen
+
+---
+ arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts b/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
+index 1048a7d..4133c3b 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
+@@ -386,7 +386,7 @@ zap-shader {
+ };
+ 
+ &i2c2 {
+-	status = "disabled";
++	status = "okay";
+ 	#dma-cells = <3>;
+ 
+ 	dmas =  <&gpi_dma0 0 2 QCOM_GPI_I2C>,
+@@ -394,6 +394,7 @@ &i2c2 {
+ 	dma-names = "tx", "rx";
+ 
+ 	touchscreen@49 {
++		status = "okay";
+ 		compatible = "st,fts";
+ 		reg = <0x49>;
+ 		pinctrl-names = "default";

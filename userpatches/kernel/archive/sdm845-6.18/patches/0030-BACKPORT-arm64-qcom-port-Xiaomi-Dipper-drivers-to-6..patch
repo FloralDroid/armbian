@@ -1,0 +1,148 @@
+From 3653e6f8599c78191dad12d5ad0223a61143dd34 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Tue, 22 Sep 2026 16:03:00 +0800
+Subject: [PATCH 30/30] BACKPORT: arm64: qcom: port Xiaomi Dipper drivers to
+ 6.18 APIs
+
+Update the downstream Dipper drivers for APIs removed or replaced in Linux 6.18: fwnode power-supply references, hrtimer_setup(), MIPI DSI multi-context writes, and strscpy().
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/gpu/drm/panel/panel-samsung-ea8074.c | 55 +++++++++++---------
+ drivers/input/touchscreen/stm/fts.c          |  4 +-
+ drivers/power/supply/qcom_fg.c               |  6 +--
+ sound/soc/qcom/qdsp6/q6mvm.c                 |  2 +-
+ 4 files changed, 36 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/gpu/drm/panel/panel-samsung-ea8074.c b/drivers/gpu/drm/panel/panel-samsung-ea8074.c
+index ff5c8b1de..43bb226c3 100644
+--- a/drivers/gpu/drm/panel/panel-samsung-ea8074.c
++++ b/drivers/gpu/drm/panel/panel-samsung-ea8074.c
+@@ -59,6 +59,7 @@ static void ss_notch_fhd_ea8074_reset(struct ss_notch_fhd_ea8074 *ctx)
+ static int ss_notch_fhd_ea8074_on(struct ss_notch_fhd_ea8074 *ctx)
+ {
+ 	struct mipi_dsi_device *dsi = ctx->dsi;
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
+ 	struct device *dev = &dsi->dev;
+ 	int ret;
+ 
+@@ -77,29 +78,31 @@ static int ss_notch_fhd_ea8074_on(struct ss_notch_fhd_ea8074 *ctx)
+ 		return ret;
+ 	}
+ 
+-	mipi_dsi_dcs_write_seq(dsi, 0xf0, 0x5a, 0x5a);
+-	mipi_dsi_dcs_write_seq(dsi, 0xef, 0xf0, 0x31, 0x00, 0x33, 0x31, 0x14, 0x35);
+-	mipi_dsi_dcs_write_seq(dsi, 0xb0, 0x01);
+-	mipi_dsi_dcs_write_seq(dsi, 0xbb, 0x03);
+-	mipi_dsi_dcs_write_seq(dsi, 0xb0, 0x4f);
+-	mipi_dsi_dcs_write_seq(dsi, 0xcb, 0x00);
+-	mipi_dsi_dcs_write_seq(dsi, 0xb0, 0x6b);
+-	mipi_dsi_dcs_write_seq(dsi, 0xcb, 0x00);
+-	mipi_dsi_dcs_write_seq(dsi, 0xf7, 0x03);
+-	mipi_dsi_dcs_write_seq(dsi, 0xb0, 0x05);
+-	mipi_dsi_dcs_write_seq(dsi, 0xb1, 0x10);
+-	mipi_dsi_dcs_write_seq(dsi, 0xb0, 0x02);
+-	mipi_dsi_dcs_write_seq(dsi, 0xd5, 0x02, 0x17, 0x54, 0x14);
+-	mipi_dsi_dcs_write_seq(dsi, 0xf0, 0xa5, 0xa5);
+-	mipi_dsi_dcs_write_seq(dsi, 0xf0, 0x5a, 0x5a);
+-	mipi_dsi_dcs_write_seq(dsi, 0xfc, 0x5a, 0x5a);
+-	mipi_dsi_dcs_write_seq(dsi, 0xd2, 0x9f, 0xf0);
+-	mipi_dsi_dcs_write_seq(dsi, 0xb0, 0x0e);
+-	mipi_dsi_dcs_write_seq(dsi, 0xd2, 0x70);
+-	mipi_dsi_dcs_write_seq(dsi, 0xb0, 0x04);
+-	mipi_dsi_dcs_write_seq(dsi, 0xd2, 0x20);
+-	mipi_dsi_dcs_write_seq(dsi, 0xf0, 0xa5, 0xa5);
+-	mipi_dsi_dcs_write_seq(dsi, 0xfc, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xef, 0xf0, 0x31, 0x00, 0x33, 0x31, 0x14, 0x35);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbb, 0x03);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x4f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xcb, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x6b);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xcb, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x03);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x05);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1, 0x10);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x02);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd5, 0x02, 0x17, 0x54, 0x14);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd2, 0x9f, 0xf0);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0e);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd2, 0x70);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x04);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd2, 0x20);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0xa5, 0xa5);
++	if (dsi_ctx.accum_err)
++		return dsi_ctx.accum_err;
+ 
+ 	ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
+ 	if (ret < 0) {
+@@ -113,8 +116,10 @@ static int ss_notch_fhd_ea8074_on(struct ss_notch_fhd_ea8074 *ctx)
+ 		return ret;
+ 	}
+ 
+-	mipi_dsi_dcs_write_seq(dsi, MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x20);
+-	mipi_dsi_dcs_write_seq(dsi, MIPI_DCS_WRITE_POWER_SAVE, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x20);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_POWER_SAVE, 0x00);
++	if (dsi_ctx.accum_err)
++		return dsi_ctx.accum_err;
+ 	msleep(110);
+ 
+ 	ret = mipi_dsi_dcs_set_display_on(dsi);
+diff --git a/drivers/input/touchscreen/stm/fts.c b/drivers/input/touchscreen/stm/fts.c
+index 714946a47..135647660 100644
+--- a/drivers/input/touchscreen/stm/fts.c
++++ b/drivers/input/touchscreen/stm/fts.c
+@@ -1547,8 +1547,8 @@ static int touchsim_start(struct fts_touchsim *touchsim)
+ 	release_all_touches(info);
+ 
+ 	/* setup and start a hr timer to be fired every 120Hz(~8.333333ms) */
+-	hrtimer_init(&touchsim->hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+-	touchsim->hr_timer.function = touchsim_timer_cb;
++	hrtimer_setup(&touchsim->hr_timer, touchsim_timer_cb,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+ 	hrtimer_start(&touchsim->hr_timer,
+ 			ns_to_ktime(TOUCHSIM_TIMER_INTERVAL_NS),
+ 			HRTIMER_MODE_ABS);
+diff --git a/drivers/power/supply/qcom_fg.c b/drivers/power/supply/qcom_fg.c
+index 271a0fc67..3d54c46e1 100644
+--- a/drivers/power/supply/qcom_fg.c
++++ b/drivers/power/supply/qcom_fg.c
+@@ -1156,7 +1156,7 @@ static int qcom_fg_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	supply_config.drv_data = chip;
+-	supply_config.of_node = pdev->dev.of_node;
++	supply_config.fwnode = dev_fwnode(&pdev->dev);
+ 
+ 	chip->batt_psy = devm_power_supply_register(chip->dev,
+ 			&batt_psy_desc, &supply_config);
+@@ -1259,8 +1259,8 @@ static int qcom_fg_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	/* Optional: Get charger power supply for status checking */
+-	chip->chg_psy = power_supply_get_by_phandle(chip->dev->of_node,
+-							"power-supplies");
++	chip->chg_psy = devm_power_supply_get_by_reference(chip->dev,
++							   "power-supplies");
+ 	if (IS_ERR(chip->chg_psy)) {
+ 		ret = PTR_ERR(chip->chg_psy);
+ 		dev_warn(chip->dev, "Failed to get charger supply: %d\n", ret);
+diff --git a/sound/soc/qcom/qdsp6/q6mvm.c b/sound/soc/qcom/qdsp6/q6mvm.c
+index 9c29abab0..ac8408b34 100644
+--- a/sound/soc/qcom/qdsp6/q6mvm.c
++++ b/sound/soc/qcom/qdsp6/q6mvm.c
+@@ -82,7 +82,7 @@ struct q6voice_session *q6mvm_session_create(enum q6voice_path_type path)
+ 
+ 	session_name = q6mvm_session_name(path);
+ 	if (session_name)
+-		strlcpy(cmd.name, session_name, sizeof(cmd.name));
++		strscpy(cmd.name, session_name, sizeof(cmd.name));
+ 
+ 	mvm = q6voice_session_create(Q6VOICE_SERVICE_MVM, path, &cmd.hdr);
+ 	if (IS_ERR(mvm))

@@ -1,0 +1,39 @@
+From: Joel Selvaraj <jo@jsfamily.in>
+Date: Mon, 6 Dec 2021 12:46:30 +0530
+Subject: arm64: dts: qcom: sdm845-xiaomi-beryllium-tianma: introduce support
+ for touchscreen
+
+The Tianma variant uses the Novatek NT36xxx touchscreen driver.
+---
+ .../dts/qcom/sdm845-xiaomi-beryllium-tianma.dts     | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-tianma.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-tianma.dts
+index e942785..0ca1997 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-tianma.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-tianma.dts
+@@ -13,3 +13,24 @@ &display_panel {
+ 	compatible = "tianma,fhd-video", "novatek,nt36672a";
+ 	status = "okay";
+ };
++
++&i2c14 {
++	status = "okay";
++
++	touchscreen@1 {
++		compatible = "novatek,nvt-ts";
++		reg = <0x01>;
++
++		interrupts-extended = <&tlmm 31 IRQ_TYPE_EDGE_RISING>;
++		reset-gpios = <&tlmm 32 GPIO_ACTIVE_LOW>;
++
++		iovcc-supply = <&vreg_l14a_1p8>;
++
++		pinctrl-0 = <&ts_int_default &ts_reset_default>;
++		pinctrl-1 = <&ts_int_sleep &ts_reset_sleep>;
++		pinctrl-names = "default", "sleep";
++
++		touchscreen-size-x = <1080>;
++		touchscreen-size-y = <2246>;
++	};
++};

@@ -1,0 +1,25 @@
+#!/bin/sh
+
+[ "$1" = "poweroff" ] || [ "$1" = "halt" ] || exit 0
+
+# Stop fbcon from repainting after the framebuffer has been cleared.
+for vtconsole in /sys/class/vtconsole/vtcon*; do
+	[ -r "$vtconsole/name" ] || continue
+	case "$(cat "$vtconsole/name")" in
+		*"frame buffer device"*) printf '0' > "$vtconsole/bind" 2>/dev/null || true ;;
+	esac
+done
+
+for framebuffer in /dev/fb[0-9]*; do
+	[ -c "$framebuffer" ] || continue
+	name="${framebuffer##*/}"
+	stride="$(cat "/sys/class/graphics/$name/stride" 2>/dev/null)"
+	virtual_size="$(cat "/sys/class/graphics/$name/virtual_size" 2>/dev/null)"
+	height="${virtual_size#*,}"
+
+	case "$stride:$height" in
+		*[!0-9:]*) continue ;;
+	esac
+	[ -n "$stride" ] && [ -n "$height" ] || continue
+	dd if=/dev/zero of="$framebuffer" bs="$stride" count="$height" conv=notrunc status=none 2>/dev/null || true
+done

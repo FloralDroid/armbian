@@ -1,0 +1,36 @@
+From 908766a860263d3dd85dafc58d4ab546fa3d15a5 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Mon, 21 Sep 2026 18:15:28 +0800
+Subject: [PATCH 29/30] arm64: dts: qcom: xiaomi-dipper: use extracted GPU and
+ Venus firmware
+
+Use the MDT firmware files extracted from the stock vendor image for the A630 zap shader and Venus codec. Enable Venus now that its firmware path is described.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
+index 8e1b568f1..4a2ef201c 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
+@@ -580,7 +580,7 @@ &gpu {
+ 
+ 	zap-shader {
+ 		memory-region = <&gpu_mem>;
+-		firmware-name = "qcom/sdm845/dipper/a630_zap.mbn";
++		firmware-name = "qcom/sdm845/dipper/a630_zap.mdt";
+ 	};
+ };
+ 
+@@ -1113,7 +1113,8 @@ bluetooth {
+ };
+ 
+ &venus {
+-	status = "disabled";
++	firmware-name = "qcom/sdm845/dipper/venus.mdt";
++	status = "okay";
+ };
+ 
+ &wcd9340 {

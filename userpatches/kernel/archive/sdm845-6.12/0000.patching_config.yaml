@@ -1,0 +1,10 @@
+config:
+  name: sdm845-6.12
+  kind: kernel
+  type: mainline
+  branch: mobian-sdm845-6.12
+  maintainers:
+    - { github: "", name: "", email: "" }
+
+  # The DTS and driver patches are kept in the ordered series.conf below.
+  # Device firmware is extracted from the target device and is not stored here.

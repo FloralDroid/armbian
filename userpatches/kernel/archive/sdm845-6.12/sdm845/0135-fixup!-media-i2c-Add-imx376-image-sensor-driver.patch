@@ -1,0 +1,31 @@
+From: David Heidelberg <david@ixit.cz>
+Date: Sun, 9 Feb 2025 16:23:03 +0100
+Subject: [PATCH] fixup! media: i2c: Add imx376 image sensor driver
+
+Signed-off-by: David Heidelberg <david@ixit.cz>
+---
+ drivers/media/i2c/imx376.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/i2c/imx376.c b/drivers/media/i2c/imx376.c
+index e097595..9352e746 100644
+--- a/drivers/media/i2c/imx376.c
++++ b/drivers/media/i2c/imx376.c
+@@ -1095,7 +1095,7 @@ static int imx376_power_on(struct device *dev)
+ 
+ 	usleep_range(400, 600);
+ 
+-	gpiod_set_value_cansleep(imx376->reset_gpio, 1);
++	gpiod_set_value_cansleep(imx376->reset_gpio, 0);
+ 
+ 	ret = clk_prepare_enable(imx376->clk);
+ 	if (ret) {
+@@ -1115,7 +1115,7 @@ static int imx376_power_off(struct device *dev)
+ 
+ 	clk_disable_unprepare(imx376->clk);
+ 
+-	gpiod_set_value_cansleep(imx376->reset_gpio, 0);
++	gpiod_set_value_cansleep(imx376->reset_gpio, 1);
+ 
+ 	regulator_bulk_disable(IMX376_NUM_SUPPLIES, imx376->supplies);
+ 

@@ -1,0 +1,49 @@
+From 99f373c6e5b828337cfdcbe03fbaaaff8e268459 Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Date: Sun, 21 Sep 2025 10:09:24 +0300
+Subject: [PATCH 20/30] arm64: dts: qcom: sdm845: add refgen regulator and use
+ it for DSI
+
+Add the refgen regulator block and use it for the DSI controllers.
+
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Link: https://lore.kernel.org/r/20250921-refgen-v1-8-9d93e64133ea@oss.qualcomm.com
+Signed-off-by: Bjorn Andersson <andersson@kernel.org>
+---
+ arch/arm64/boot/dts/qcom/sdm845.dtsi | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845.dtsi b/arch/arm64/boot/dts/qcom/sdm845.dtsi
+index ab9923ae3..2d8c198f5 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845.dtsi
+@@ -2244,6 +2244,11 @@ uart15: serial@a9c000 {
+ 			};
+ 		};
+ 
++		refgen: regulator@ff1000 {
++			compatible = "qcom,sdm845-refgen-regulator";
++			reg = <0x0 0x00ff1000 0x0 0x60>;
++		};
++
+ 		llcc: system-cache-controller@1100000 {
+ 			compatible = "qcom,sdm845-llcc";
+ 			reg = <0 0x01100000 0 0x45000>, <0 0x01180000 0 0x50000>,
+@@ -4776,6 +4781,8 @@ mdss_dsi0: dsi@ae94000 {
+ 
+ 				phys = <&mdss_dsi0_phy>;
+ 
++				refgen-supply = <&refgen>;
++
+ 				status = "disabled";
+ 
+ 				#address-cells = <1>;
+@@ -4850,6 +4857,8 @@ mdss_dsi1: dsi@ae96000 {
+ 
+ 				phys = <&mdss_dsi1_phy>;
+ 
++				refgen-supply = <&refgen>;
++
+ 				status = "disabled";
+ 
+ 				#address-cells = <1>;

@@ -1,0 +1,59 @@
+From d4ba7ce6691cffdc2c551fe1d36d97cff6176a56 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Wed, 23 Sep 2026 10:42:52 +0800
+Subject: [PATCH] media: venus: size SDM845 v2 encoder buffers for firmware
+
+The SDM845 v2 Venus firmware requires a luma-sized minimum for
+compressed encoder output buffers. Advertise that resource requirement
+and use it when negotiating capture formats.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/media/platform/qcom/venus/core.c | 1 +
+ drivers/media/platform/qcom/venus/core.h | 2 ++
+ drivers/media/platform/qcom/venus/venc.c | 4 ++++
+ 3 files changed, 7 insertions(+)
+
+diff --git a/drivers/media/platform/qcom/venus/core.c b/drivers/media/platform/qcom/venus/core.c
+index 66a750ed1..08e1e853e 100644
+--- a/drivers/media/platform/qcom/venus/core.c
++++ b/drivers/media/platform/qcom/venus/core.c
+@@ -898,6 +898,7 @@ static const struct venus_resources sdm845_res_v2 = {
+ 	.fwname = "qcom/venus-5.2/venus.mbn",
+ 	.dec_nodename = "video-core0",
+ 	.enc_nodename = "video-core1",
++	.min_compressed_buf_size_luma = true,
+ };
+ 
+ static const struct freq_tbl sc7180_freq_table[] = {
+diff --git a/drivers/media/platform/qcom/venus/core.h b/drivers/media/platform/qcom/venus/core.h
+index 70e7b40af..f2174bb6e 100644
+--- a/drivers/media/platform/qcom/venus/core.h
++++ b/drivers/media/platform/qcom/venus/core.h
+@@ -101,6 +101,8 @@ struct venus_resources {
+ 	const char *fwname;
+ 	const char *enc_nodename;
+ 	const char *dec_nodename;
++	/* SDM845 v2 firmware needs a luma-sized compressed output buffer. */
++	bool min_compressed_buf_size_luma;
+ 	const struct firmware_version *min_fw;
+ };
+ 
+diff --git a/drivers/media/platform/qcom/venus/venc.c b/drivers/media/platform/qcom/venus/venc.c
+index fba07557a..4c88b5d36 100644
+--- a/drivers/media/platform/qcom/venus/venc.c
++++ b/drivers/media/platform/qcom/venus/venc.c
+@@ -211,6 +211,10 @@ venc_try_fmt_common(struct venus_inst *inst, struct v4l2_format *f)
+ 	sizeimage = venus_helper_get_framesz(pixmp->pixelformat,
+ 					     pixmp->width,
+ 					     pixmp->height);
++	if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    inst->core->res->min_compressed_buf_size_luma)
++		sizeimage = max(sizeimage,
++				ALIGN(pixmp->width, 32) * ALIGN(pixmp->height, 32));
+ 	pfmt[0].sizeimage = max(ALIGN(pfmt[0].sizeimage, SZ_4K), sizeimage);
+ 
+ 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+-- 
+2.47.3
+

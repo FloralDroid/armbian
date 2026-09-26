@@ -1,0 +1,37 @@
+From: Joel Selvaraj <joelselvaraj.oss@gmail.com>
+Date: Sun, 4 Dec 2022 16:34:43 -0600
+Subject: ASoC: codecs: wcd934x: fix wcd->micb2_mv being read before assigned
+
+---
+ sound/soc/codecs/wcd934x.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/sound/soc/codecs/wcd934x.c b/sound/soc/codecs/wcd934x.c
+index 01f8d12..9b356b5 100644
+--- a/sound/soc/codecs/wcd934x.c
++++ b/sound/soc/codecs/wcd934x.c
+@@ -3006,6 +3006,7 @@ static int wcd934x_mbhc_init(struct snd_soc_component *component)
+ {
+ 	struct wcd934x_ddata *data = dev_get_drvdata(component->dev->parent);
+ 	struct wcd934x_codec *wcd = snd_soc_component_get_drvdata(component);
++	struct wcd_mbhc_config *cfg = &wcd->mbhc_cfg;
+ 	struct wcd_mbhc_intr *intr_ids = &wcd->intr_ids;
+ 
+ 	intr_ids->mbhc_sw_intr = regmap_irq_get_virq(data->irq_data,
+@@ -3029,6 +3030,8 @@ static int wcd934x_mbhc_init(struct snd_soc_component *component)
+ 		return -EINVAL;
+ 	}
+ 
++	cfg->micb_mv = wcd->micb2_mv;
++
+ 	snd_soc_add_component_controls(component, impedance_detect_controls,
+ 				       ARRAY_SIZE(impedance_detect_controls));
+ 	snd_soc_add_component_controls(component, hph_type_detect_controls,
+@@ -5883,7 +5886,6 @@ static int wcd934x_codec_parse_data(struct wcd934x_codec *wcd)
+ 	cfg->anc_micbias = MIC_BIAS_2;
+ 	cfg->v_hs_max = WCD_MBHC_HS_V_MAX;
+ 	cfg->num_btn = WCD934X_MBHC_MAX_BUTTONS;
+-	cfg->micb_mv = wcd->micb2_mv;
+ 	cfg->linein_th = 5000;
+ 	cfg->hs_thr = 1700;
+ 	cfg->hph_thr = 50;
