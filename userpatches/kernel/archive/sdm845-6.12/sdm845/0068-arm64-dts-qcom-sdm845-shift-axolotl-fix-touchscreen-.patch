@@ -1,0 +1,49 @@
+From: Joel Selvaraj <joelselvaraj.oss@gmail.com>
+Date: Sat, 11 Mar 2023 03:46:55 -0600
+Subject: arm64: dts: qcom: sdm845-shift-axolotl: fix touchscreen properties
+
+Update the touchscreen properties to match with the upstream
+focaltech driver. Also, the touchscreen used in axolotl is ft5452 and not
+fts8719. Fix it.
+
+Signed-off-by: Joel Selvaraj <joelselvaraj.oss@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
+index b2ad491..181559a 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
+@@ -441,23 +441,21 @@ &i2c5 {
+ 	clock-frequency = <400000>;
+ 
+ 	touchscreen@38 {
+-		compatible = "focaltech,fts8719";
++		compatible = "focaltech,ft5452";
+ 		reg = <0x38>;
+-		wakeup-source;
+-		interrupt-parent = <&tlmm>;
+-		interrupts = <125 0x2>;
+-		vdd-supply = <&vreg_l28a_3p0>;
+-		vcc-i2c-supply = <&vreg_l14a_1p88>;
+ 
+-		pinctrl-names = "default", "suspend";
++		interrupts-extended = <&tlmm 125 IRQ_TYPE_EDGE_FALLING>;
++		reset-gpios = <&tlmm 99 GPIO_ACTIVE_LOW>;
++
++		vcc-supply = <&vreg_l28a_3p0>;
++		iovcc-supply = <&vreg_l14a_1p88>;
++
+ 		pinctrl-0 = <&ts_int_active &ts_reset_active>;
+ 		pinctrl-1 = <&ts_int_suspend &ts_reset_suspend>;
++		pinctrl-names = "default", "suspend";
+ 
+-		reset-gpio = <&tlmm 99 GPIO_ACTIVE_HIGH>;
+-		irq-gpio = <&tlmm 125 GPIO_TRANSITORY>;
+ 		touchscreen-size-x = <1080>;
+ 		touchscreen-size-y = <2160>;
+-		focaltech,max-touch-number = <5>;
+ 	};
+ };
+ 

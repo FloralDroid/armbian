@@ -1,0 +1,47 @@
+From: "Dr. Git" <drgitx@gmail.com>
+Date: Mon, 24 Jun 2024 11:22:29 -0400
+Subject: [PATCH] arm64: dts: qcom: sdm845-oneplus: use guard pages
+
+---
+ arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi | 18 +++---------------
+ 1 file changed, 3 insertions(+), 15 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+index 2b59abc..3fc9202 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+@@ -108,31 +108,19 @@ key-vol-up {
+ 	};
+ 
+ 	reserved-memory {
+-		/*
+-		 * The rmtfs_mem needs to be guarded due to "XPU limitations"
+-		 * it is otherwise possible for an allocation adjacent to the
+-		 * rmtfs_mem region to trigger an XPU violation, causing a crash.
+-		 */
+-		rmtfs_lower_guard: rmtfs-lower-guard@f5b00000 {
+-			no-map;
+-			reg = <0 0xf5b00000 0 0x1000>;
+-		};
+ 		/*
+ 		 * The rmtfs memory region in downstream is 'dynamically allocated'
+ 		 * but given the same address every time. Hard code it as this address is
+ 		 * where the modem firmware expects it to be.
+ 		 */
+-		rmtfs_mem: rmtfs-mem@f5b01000 {
++		rmtfs_mem: rmtfs-mem@f5b00000 {
+ 			compatible = "qcom,rmtfs-mem";
+-			reg = <0 0xf5b01000 0 0x200000>;
++			reg = <0 0xf5b00000 0 0x202000>;
+ 			no-map;
+ 
+ 			qcom,client-id = <1>;
+ 			qcom,vmid = <QCOM_SCM_VMID_MSS_MSA>;
+-		};
+-		rmtfs_upper_guard: rmtfs-upper-guard@f5d01000 {
+-			no-map;
+-			reg = <0 0xf5d01000 0 0x1000>;
++			qcom,use-guard-pages;
+ 		};
+ 
+ 		/*

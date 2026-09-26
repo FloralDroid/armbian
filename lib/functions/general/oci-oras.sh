@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+#
+# SPDX-License-Identifier: GPL-2.0
+#
+# Copyright (c) 2013-2026 Igor Pecovnik, igor@armbian.com
+#
+# This file is a part of the Armbian Build Framework
+# https://github.com/armbian/build/
+
+function run_tool_oras() {
+	# Default version
+	ORAS_VERSION=${ORAS_VERSION:-1.3.3} # https://github.com/oras-project/oras/releases
+	#ORAS_VERSION=${ORAS_VERSION:-"1.0.0-rc.1"} # https://github.com/oras-project/oras/releases
+
+	declare non_cache_dir="/armbian-tools/oras" # To deploy/reuse cached ORAS in a Docker image.
+
+	if [[ -z "${DIR_ORAS}" ]]; then
+		display_alert "DIR_ORAS is not set, using default" "ORAS" "debug"
+
+		if [[ "${deploy_to_non_cache_dir:-"no"}" == "yes" ]]; then
+			DIR_ORAS="${non_cache_dir}" # root directory.
+			display_alert "Deploying ORAS to non-cache dir" "DIR_ORAS: ${DIR_ORAS}" "debug"
+		else
+			if [[ -n "${SRC}" ]]; then
+				DIR_ORAS="${SRC}/cache/tools/oras"
+			else
+				display_alert "Missing DIR_ORAS, or SRC fallback" "DIR_ORAS: ${DIR_ORAS}; SRC: ${SRC}" "ORAS" "err"
+				return 1
+			fi
+		fi
+	else
+		display_alert "DIR_ORAS is set to ${DIR_ORAS}" "ORAS" "debug"
+	fi
+
+	mkdir -p "${DIR_ORAS}"
+
+	declare MACHINE="${BASH_VERSINFO[5]}" ORAS_OS ORAS_ARCH
+	display_alert "Running ORAS" "ORAS version ${ORAS_VERSION}" "debug"
+	MACHINE="${BASH_VERSINFO[5]}"
+	case "$MACHINE" in
+		*darwin*) ORAS_OS="darwin" ;;
+		*linux*) ORAS_OS="linux" ;;
+		*)
+			exit_with_error "unknown os: $MACHINE"
+			;;
+	esac
+
+	case "$MACHINE" in
+		*aarch64*) ORAS_ARCH="arm64" ;;
+		*x86_64*) ORAS_ARCH="amd64" ;;
+		*riscv64*)
+			ORAS_ARCH="riscv64"
+			ORAS_VERSION="1.2.0-beta.1" # Only v1.2.0-beta.1+ has risv64 support
+			;;
+		*loongarch64*)
+			ORAS_ARCH="loong64"
+			ORAS_VERSION="1.3.0-beta.3-loong64" # Only v1.3.0-beta.3-loong64+ has loong64 support
+			ORAS_REPO="amazingfate"             # This is my fork repo, we can delete it if oras releases official loong64 binary in the future
+			;;
+		*)
+			exit_with_error "unknown arch: $MACHINE"
+			;;
+	esac
+
+	declare ORAS_FN="oras_${ORAS_VERSION}_${ORAS_OS}_${ORAS_ARCH}"
+	declare ORAS_FN_TARXZ="${ORAS_FN}.tar.gz"
+	declare DOWN_URL="${GITHUB_SOURCE:-"https://github.com"}/${ORAS_REPO:-"oras-project"}/oras/releases/download/v${ORAS_VERSION}/${ORAS_FN_TARXZ}"
+	declare ORAS_BIN="${DIR_ORAS}/${ORAS_FN}"
+	declare ACTUAL_VERSION
+
+	# Check if we have a cached version in a Docker image, and copy it over before possibly updating it.
+	if [[ "${deploy_to_non_cache_dir:-"no"}" != "yes" && -d "${non_cache_dir}" && ! -f "${ORAS_BIN}" ]]; then
+		display_alert "Using cached ORAS from Docker image" "ORAS" "debug"
+		run_host_command_logged cp -r "${non_cache_dir}/"* "${DIR_ORAS}/"
+	fi
+
+	if [[ ! -f "${ORAS_BIN}" ]]; then
+		do_with_retries 5 try_download_oras_tooling
+	fi
+	ACTUAL_VERSION="$("${ORAS_BIN}" version | grep "^Version" | xargs echo -n)"
+	display_alert "Running ORAS ${ACTUAL_VERSION}" "ORAS" "debug"
+
+	if [[ "${deploy_to_non_cache_dir:-"no"}" == "yes" ]]; then
+		display_alert "Deployed ORAS to non-cache dir" "DIR_ORAS: ${DIR_ORAS}" "debug"
+		return 0 # don't actually execute.
+	fi
+
+	# Run oras, possibly with retries...
+	declare ORAS_HOME="${HOME:-"${TMPDIR}"}" # oras _requires_ a HOME to work atleast in 1.2+
+	declare -a oras_proxy_env=(
+		"http_proxy=${http_proxy:-${HTTP_PROXY:-}}"
+		"https_proxy=${https_proxy:-${HTTPS_PROXY:-}}"
+		"HTTP_PROXY=${HTTP_PROXY:-${http_proxy:-}}"
+		"HTTPS_PROXY=${HTTPS_PROXY:-${https_proxy:-}}"
+		"ftp_proxy=${ftp_proxy:-${FTP_PROXY:-}}"
+		"FTP_PROXY=${FTP_PROXY:-${ftp_proxy:-}}"
+		"no_proxy=${no_proxy:-${NO_PROXY:-}}"
+		"NO_PROXY=${NO_PROXY:-${no_proxy:-}}"
+		"APT_PROXY_ADDR=${APT_PROXY_ADDR:-}"
+	)
+	display_alert "Running ORAS ${ACTUAL_VERSION}" "HOME='${ORAS_HOME}'; retries='${retries:-1}'; cmdline: $*" "debug"
+	if [[ "${retries:-1}" -gt 1 ]]; then
+		display_alert "Calling ORAS with retries ${retries}" "$*" "debug"
+		sleep_seconds="30" do_with_retries "${retries}" env -i "HOME=${ORAS_HOME}" "${oras_proxy_env[@]}" "${ORAS_BIN}" "$@"
+	else
+		# If any parameters passed, call ORAS, otherwise exit. We call it this way (sans-parameters) early to prepare ORAS tooling.
+		if [[ $# -eq 0 ]]; then
+			display_alert "No parameters passed to ORAS" "ORAS" "debug"
+			return 0
+		fi
+
+		display_alert "Calling ORAS" "$*" "debug"
+		env -i "HOME=${ORAS_HOME}" "${oras_proxy_env[@]}" "${ORAS_BIN}" "$@"
+	fi
+}
+
+function try_download_oras_tooling() {
+	display_alert "MACHINE: ${MACHINE}" "ORAS" "debug"
+	display_alert "Down URL: ${DOWN_URL}" "ORAS" "debug"
+	display_alert "ORAS_BIN: ${ORAS_BIN}" "ORAS" "debug"
+
+	display_alert "Downloading required" "ORAS tooling${RETRY_FMT_MORE_THAN_ONCE}" "info"
+	run_host_command_logged curl -fL#o "${ORAS_BIN}.tar.gz.tmp" "${DOWN_URL}" || {
+		return 1
+	}
+	run_host_command_logged mv "${ORAS_BIN}.tar.gz.tmp" "${ORAS_BIN}.tar.gz"
+	run_host_command_logged tar -xf "${ORAS_BIN}.tar.gz" -C "${DIR_ORAS}" "oras"
+	run_host_command_logged rm -rf "${ORAS_BIN}.tar.gz"
+	run_host_command_logged mv "${DIR_ORAS}/oras" "${ORAS_BIN}"
+	run_host_command_logged chmod +x "${ORAS_BIN}"
+}
+
+# Derive "https://github.com/<owner>/<repo>" from OCI coordinates shaped like
+# "ghcr.io/<owner>/<repo>/<package>[:<tag>]". Echoes nothing for anything else.
+#
+# Only ghcr.io: the org.opencontainers.image.source link is a GitHub Container
+# Registry feature, and other registries ignore it.
+#
+# At least three path segments are required. A flat "ghcr.io/<owner>/<package>"
+# would otherwise resolve to a repository that does not exist, so it is skipped
+# rather than pointed somewhere wrong.
+function oci_derive_source_url() {
+	declare coords="${1}"
+	[[ "${coords}" != "ghcr.io/"* ]] && return 0
+	coords="${coords%:*}" # drop the :tag, if any
+	declare -a seg
+	IFS='/' read -r -a seg <<< "${coords#ghcr.io/}"
+	[[ ${#seg[@]} -lt 3 ]] && return 0
+	echo "https://github.com/${seg[0]}/${seg[1]}"
+}
+
+function oras_push_artifact_file() {
+	declare image_full_oci="${1}" # Something like "ghcr.io/rpardini/armbian-git-shallow/kernel-git:latest"
+	declare upload_file="${2}"    # Absolute path to the file to upload including the path and name
+	declare description="${3:-"missing description"}"
+	declare upload_file_base_path upload_file_name
+	display_alert "Pushing ${upload_file}" "ORAS to ${image_full_oci}" "info"
+
+	declare extra_params=()
+	oras_add_param_plain_http
+	oras_add_param_insecure
+	extra_params+=("--annotation" "org.opencontainers.image.description=${description}")
+
+	# Connect the package to its GitHub repository. GHCR links a package to a repo
+	# automatically ONLY when it is pushed with GITHUB_TOKEN; Armbian's CI pushes
+	# with a PAT (the builtin token cannot write org packages), so nothing links
+	# these and each package inherits no repository access permissions at all.
+	# This annotation does the linking explicitly.
+	#
+	# It does NOT make packages public: GitHub publishes every new package as
+	# private and offers no API to change that -- visibility is a web-UI action.
+	# This only fixes the permissions half.
+	#
+	# OCI_SOURCE_URL overrides the derived value; set it to the empty string to
+	# skip the annotation entirely.
+	declare oci_source_url="${OCI_SOURCE_URL-$(oci_derive_source_url "${image_full_oci}")}"
+	if [[ -n "${oci_source_url}" ]]; then
+		extra_params+=("--annotation" "org.opencontainers.image.source=${oci_source_url}")
+	fi
+
+	# make sure file exists
+	if [[ ! -f "${upload_file}" ]]; then
+		display_alert "File not found: ${upload_file}" "ORAS upload" "err"
+		return 1
+	fi
+
+	# split the path and the filename
+	upload_file_base_path="$(dirname "${upload_file}")"
+	upload_file_name="$(basename "${upload_file}")"
+	display_alert "upload_file_base_path: ${upload_file_base_path}" "ORAS upload" "debug"
+	display_alert "upload_file_name: ${upload_file_name}" "ORAS upload" "debug"
+
+	pushd "${upload_file_base_path}" &> /dev/null || exit_with_error "Failed to pushd to ${upload_file_base_path} - ORAS upload"
+	retries=10 run_tool_oras push "${extra_params[@]}" "${image_full_oci}" "${upload_file_name}:application/vnd.unknown.layer.v1+tar"
+	popd &> /dev/null || exit_with_error "Failed to popd" "ORAS upload"
+	return 0
+}
+
+# Outer scope: oras_has_manifest (yes/no) and oras_manifest_json (json)
+function oras_get_artifact_manifest() {
+	declare image_full_oci="${1}" # Something like "ghcr.io/rpardini/armbian-git-shallow/kernel-git:latest"
+	display_alert "Getting ORAS manifest" "ORAS manifest from ${image_full_oci}" "info"
+
+	declare extra_params=()
+	oras_add_param_plain_http
+	oras_add_param_insecure
+
+	oras_has_manifest="no"
+	# Gotta capture the output & if it failed...
+	# Capture stderr: a 404 (cache miss) is normal for fresh artifacts —
+	# suppress oras's "Error response from registry: failed to fetch"
+	# dump. The caller (artifacts-obtain.sh) already reports the miss
+	# with a clean display_alert. Any OTHER error (auth, network) is
+	# still printed so real problems aren't hidden.
+	local oras_stderr_file
+	oras_stderr_file=$(mktemp)
+	oras_manifest_json="$(run_tool_oras manifest fetch "${extra_params[@]}" "${image_full_oci}" 2> "${oras_stderr_file}")" && oras_has_manifest="yes" || oras_has_manifest="no"
+	local oras_stderr
+	oras_stderr=$(< "${oras_stderr_file}")
+	rm -f "${oras_stderr_file}"
+	if [[ "${oras_has_manifest}" == "no" && -n "${oras_stderr}" && "${oras_stderr}" != *"not found"* ]]; then
+		display_alert "ORAS manifest fetch error" "${oras_stderr}" "wrn"
+	fi
+	display_alert "oras_has_manifest after: ${oras_has_manifest}" "ORAS manifest yes/no" "debug"
+	display_alert "oras_manifest_json after: ${oras_manifest_json}" "ORAS manifest json" "debug"
+
+	# if it worked, parse some basic info using jq
+	if [[ "${oras_has_manifest}" == "yes" ]]; then
+		oras_manifest_description="$(echo "${oras_manifest_json}" | jq -r '.annotations."org.opencontainers.image.description"')"
+		display_alert "oras_manifest_description: ${oras_manifest_description}" "ORAS oras_manifest_description" "debug"
+	fi
+
+	return 0
+}
+
+# oras pull is very hard to work with, since we don't determine the filename until after the download.
+function oras_pull_artifact_file() {
+	declare image_full_oci="${1}" # Something like "ghcr.io/rpardini/armbian-git-shallow/kernel-git:latest"
+	declare target_dir="${2}"     # temporary directory we'll use for the download to workaround oras being maniac
+	declare target_fn="${3}"
+
+	# GHCR supports ranged blob requests. Use aria2 when available so interrupted
+	# downloads keep their partial data and can resume on the next build.
+	if [[ "${image_full_oci}" == ghcr.io/* ]] && command -v aria2c > /dev/null 2>&1; then
+		oras_pull_artifact_file_with_aria2 "${image_full_oci}" "${target_dir}" "${target_fn}"
+		return 0
+	fi
+
+	declare extra_params=()
+	oras_add_param_plain_http
+	oras_add_param_insecure
+
+	declare full_temp_dir="${target_dir}/${target_fn}.oras.pull.tmp"
+	declare full_tmp_file_path="${full_temp_dir}/${target_fn}"
+	run_host_command_logged mkdir -p "${full_temp_dir}"
+
+	# @TODO: this needs retries...
+	pushd "${full_temp_dir}" &> /dev/null || exit_with_error "Failed to pushd to ${full_temp_dir} - ORAS download"
+	retries=3 run_tool_oras pull "${extra_params[@]}" "${image_full_oci}"
+	popd &> /dev/null || exit_with_error "Failed to popd - ORAS download"
+
+	# sanity check; did we get the file we expected?
+	if [[ ! -f "${full_tmp_file_path}" ]]; then
+		exit_with_error "File not found after ORAS pull: ${full_tmp_file_path} - ORAS download"
+		return 1
+	fi
+
+	# move the file to the target directory
+	run_host_command_logged mv "${full_tmp_file_path}" "${target_dir}"
+
+	# remove the temp directory
+	run_host_command_logged rm -rf "${full_temp_dir}"
+}
+
+# Download the single file layer from a GHCR OCI artifact with HTTP Range
+# requests and a persistent aria2 state file.
+function oras_pull_artifact_file_with_aria2() {
+	declare image_full_oci="${1:?image reference is required}"
+	declare target_dir="${2:?target directory is required}"
+	declare target_fn="${3:?target filename is required}"
+	declare registry="${image_full_oci%%/*}"
+	declare image_ref="${image_full_oci#*/}"
+	declare repository reference
+	if [[ "${image_ref}" == *@* ]]; then
+		repository="${image_ref%@*}"
+		reference="${image_ref#*@}"
+	else
+		repository="${image_ref%:*}"
+		reference="${image_ref##*:}"
+	fi
+	[[ -n "${repository}" && -n "${reference}" && "${repository}" != "${image_ref}" ]] ||
+		exit_with_error "Invalid OCI reference for aria2 download '${image_full_oci}'"
+
+	declare manifest_url="https://${registry}/v2/${repository}/manifests/${reference}"
+	declare challenge realm service scope token
+	challenge="$(curl -sS --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 120 \
+		-D - -o /dev/null "${manifest_url}" | sed -n 's/^www-authenticate: //Ip')"
+	realm="$(printf '%s\n' "${challenge}" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')"
+	service="$(printf '%s\n' "${challenge}" | sed -n 's/.*service="\([^"]*\)".*/\1/p')"
+	scope="$(printf '%s\n' "${challenge}" | sed -n 's/.*scope="\([^"]*\)".*/\1/p')"
+	token=""
+	if [[ -n "${realm}" ]]; then
+		[[ -n "${service}" && -n "${scope}" ]] || exit_with_error "Incomplete OCI authentication challenge for '${image_full_oci}'"
+		token="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 120 \
+			--get --data-urlencode "service=${service}" --data-urlencode "scope=${scope}" "${realm}" | jq -r '.token // .access_token // empty')"
+		[[ -n "${token}" ]] || exit_with_error "OCI registry returned no bearer token for '${image_full_oci}'"
+	fi
+
+	declare -a auth_header=()
+	[[ -n "${token}" ]] && auth_header=(-H "Authorization: Bearer ${token}")
+	declare manifest
+	manifest="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 120 \
+		-H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+		"${auth_header[@]}" "${manifest_url}")"
+
+	declare descriptor digest expected_size expected_sha256
+	descriptor="$(printf '%s' "${manifest}" | jq -c --arg title "${target_fn}" '[.layers[] | select(.annotations["org.opencontainers.image.title"] == $title)][0] // empty')"
+	[[ -n "${descriptor}" ]] || exit_with_error "OCI layer '${target_fn}' not found in '${image_full_oci}'"
+	digest="$(printf '%s' "${descriptor}" | jq -r '.digest')"
+	expected_size="$(printf '%s' "${descriptor}" | jq -r '.size')"
+	expected_sha256="${digest#sha256:}"
+	[[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ && "${expected_size}" =~ ^[0-9]+$ ]] ||
+		exit_with_error "Invalid OCI layer descriptor for '${target_fn}'"
+
+	declare blob_url="https://${registry}/v2/${repository}/blobs/${digest}"
+	declare blob_headers download_url
+	blob_headers="$(curl -sS --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 120 \
+		-D - -o /dev/null -H 'Range: bytes=0-0' "${auth_header[@]}" "${blob_url}")"
+	download_url="$(printf '%s\n' "${blob_headers}" | sed -n 's/^location: //Ip' | tr -d '\r' | head -n 1)"
+	download_url="${download_url:-${blob_url}}"
+
+	declare download_dir="${target_dir}/${target_fn}.aria2"
+	declare part_file="${download_dir}/${target_fn}.part"
+	declare final_file="${target_dir}/${target_fn}"
+	run_host_command_logged mkdir -p "${download_dir}"
+	display_alert "Downloading OCI artifact with aria2" "${target_fn}; ${expected_size} bytes; resumable" "info"
+
+	run_host_command_logged_raw aria2c \
+		--allow-overwrite=true \
+		--auto-file-renaming=false \
+		--check-integrity=true \
+		--checksum="sha-256=${expected_sha256}" \
+		--continue=true \
+		--file-allocation=none \
+		--max-connection-per-server=8 \
+		--min-split-size=16M \
+		--out="${target_fn}.part" \
+		--split=8 \
+		--dir="${download_dir}" \
+		"${download_url}"
+
+	declare actual_sha256
+	actual_sha256="$(sha256sum "${part_file}" | awk '{print $1}')"
+	[[ "${actual_sha256}" == "${expected_sha256}" ]] ||
+		exit_with_error "SHA-256 mismatch for OCI artifact '${target_fn}'"
+	[[ "$(stat -c '%s' "${part_file}")" == "${expected_size}" ]] ||
+		exit_with_error "Size mismatch for OCI artifact '${target_fn}'"
+
+	run_host_command_logged mv -f "${part_file}" "${final_file}"
+	run_host_command_logged rm -rf "${download_dir}"
+}
+
+function oras_add_param_plain_http() {
+	# if image_full_oci contains ":5000/", add --plain-http; to make easy to run self-hosted registry
+	if [[ "${image_full_oci}" == *":5000/"* ]]; then
+		display_alert "Adding --plain-http to ORAS" "ORAS to insecure registry" "warn"
+		extra_params+=("--plain-http")
+	fi
+}
+
+function oras_add_param_insecure() {
+	if [[ ${IS_A_RETRY} -gt 0 ]]; then
+		display_alert "Retrying, adding --insecure to ORAS" "ORAS to insecure registry on retry" "warn"
+		extra_params+=("--insecure")
+	fi
+}

@@ -1,0 +1,53 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Tue, 31 Jan 2023 12:19:19 +0000
+Subject: arm64: dts: qcom: sdm850: commonise framebuffer memory
+
+Both the Galaxy Book2 and C630 use the same address and size for the
+framebuffer reserved memory region. Move the definition to sdm850.dtsi.
+
+This also enables it on the C630 which doesn't currently reserve it but
+does have it specified in its bootloader memory mappings.
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ arch/arm64/boot/dts/qcom/sdm850-samsung-w737.dts | 6 ------
+ arch/arm64/boot/dts/qcom/sdm850.dtsi             | 9 +++++++++
+ 2 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm850-samsung-w737.dts b/arch/arm64/boot/dts/qcom/sdm850-samsung-w737.dts
+index 2621783..bec0033 100644
+--- a/arch/arm64/boot/dts/qcom/sdm850-samsung-w737.dts
++++ b/arch/arm64/boot/dts/qcom/sdm850-samsung-w737.dts
+@@ -61,12 +61,6 @@ aliases {
+ 
+ 	/* Reserved memory changes */
+ 	reserved-memory {
+-		/* Bootloader display framebuffer region */
+-		cont_splash_mem: memory@80400000 {
+-			reg = <0x0 0x80400000 0x0 0x960000>;
+-			no-map;
+-		};
+-
+ 		qseecom_mem: memory@8b500000 {
+ 			reg = <0 0x8b500000 0 0xa00000>;
+ 			no-map;
+diff --git a/arch/arm64/boot/dts/qcom/sdm850.dtsi b/arch/arm64/boot/dts/qcom/sdm850.dtsi
+index b787575..89eda97 100644
+--- a/arch/arm64/boot/dts/qcom/sdm850.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm850.dtsi
+@@ -9,6 +9,15 @@
+ 
+ /delete-node/ &cont_splash_mem;
+ 
++/ {
++	reserved-memory {
++		cont_splash_mem: framebuffer@80400000 {
++			reg = <0x0 0x80400000 0x0 0x960000>;
++			no-map;
++		};
++	};
++};
++
+ &cpu4_opp_table {
+ 	cpu4_opp33: opp-2841600000 {
+ 		opp-hz = /bits/ 64 <2841600000>;

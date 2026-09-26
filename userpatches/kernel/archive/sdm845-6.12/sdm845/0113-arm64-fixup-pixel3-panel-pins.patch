@@ -1,0 +1,85 @@
+From: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Date: Sat, 6 Apr 2024 18:32:19 +0300
+Subject: arm64: fixup pixel3 panel pins
+
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+---
+ .../arm64/boot/dts/qcom/sdm845-google-blueline.dts | 47 ++++++++--------------
+ 1 file changed, 16 insertions(+), 31 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts b/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
+index 4133c3b..5196ed3 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
+@@ -336,7 +336,7 @@ panel {
+ 		reset-gpios = <&tlmm 6 GPIO_ACTIVE_LOW>;
+ 
+ 		pinctrl-names = "default";
+-		pinctrl-0 = <&panel_reset_pins &panel_te_pin &panel_pmgpio_pins>;
++		pinctrl-0 = <&panel_reset_pins &panel_te_pin>;
+ 
+ 		ports {
+ 			#address-cells = <1>;
+@@ -443,14 +443,6 @@ volume_up_gpio: vol-up-active {
+ 		bias-pull-up;
+ 		qcom,drive-strength = <0>;
+ 	};
+-
+-	panel_pmgpio_pins: panel-pmgpio-active {
+-		pins = "gpio2", "gpio5";
+-		function = "normal";
+-		input-enable;
+-		bias-disable;
+-		power-source = <0>;
+-	};
+ };
+ 
+ &pm8998_pon {
+@@ -526,32 +518,25 @@ pinconf-rx {
+ &tlmm {
+ 	gpio-reserved-ranges = <0 4>, <81 4>;
+ 
+-	panel_te_pin: panel-te {
+-		mux {
+-			pins = "gpio12";
+-			function = "mdp_vsync";
+-			drive-strength = <2>;
+-			bias-disable;
+-			input-enable;
+-		};
++	panel_te_pin: panel-te-state {
++		pins = "gpio12";
++		function = "mdp_vsync";
++		drive-strength = <2>;
++		bias-pull-down;
+ 	};
+ 
+-	panel_reset_pins: panel-active {
+-		mux {
+-			pins = "gpio6", "gpio52";
+-			function = "gpio";
+-			drive-strength = <8>;
+-			bias-disable = <0>;
+-		};
++	panel_reset_pins: panel-active-state {
++		pins = "gpio6";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-disable;
+ 	};
+ 
+-	panel_suspend: panel-suspend {
+-		mux {
+-			pins = "gpio6", "gpio52";
+-			function = "gpio";
+-			drive-strength = <2>;
+-			bias-pull-down;
+-		};
++	panel_suspend: panel-suspend-state {
++		pins = "gpio6";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
+ 	};
+ 
+ 	touchscreen_reset: ts-reset {

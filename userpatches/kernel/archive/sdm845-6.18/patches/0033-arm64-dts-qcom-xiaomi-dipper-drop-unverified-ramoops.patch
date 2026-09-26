@@ -1,0 +1,35 @@
+From aff2f7ba92f281f8b03fd5e0b3d26d6d6ee8d3a0 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Thu, 24 Sep 2026 11:12:22 +0800
+Subject: [PATCH] arm64: dts: qcom: xiaomi-dipper: drop unverified ramoops
+ reserve
+
+The downstream Dipper device tree does not reserve this 4 MiB range, and a controlled panic left no pstore record after reboot on the tested Mi 8. Stop reserving this memory in the production device tree until a persistent region has been validated.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
+index 4a2ef201c..f75ecc681 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
+@@ -246,14 +246,6 @@ removed_region: memory@88f00000 {
+ 			no-map;
+ 		};
+ 
+-		ramoops: ramoops@b0000000 {
+-			compatible = "ramoops";
+-			reg = <0 0xb0000000 0 0x00400000>;
+-			record-size = <0x40000>;
+-			console-size = <0x40000>;
+-			ftrace-size = <0x40000>;
+-			pmsg-size = <0x200000>;
+-		};
+ 	};
+ 
+ 	vph_pwr: vph-pwr-regulator {
+-- 
+2.47.3
+

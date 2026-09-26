@@ -1,0 +1,80 @@
+From: Joel Selvaraj <joelselvaraj.oss@gmail.com>
+Date: Sat, 11 Mar 2023 03:03:50 -0600
+Subject: arm64: dts: qcom: sdm845-xiaomi-beryllium-common: add touchscreen
+ related nodes
+
+Enable qupv3_id_1 and gpi_dma1 as they are required for configuring
+touchscreen. Also add pinctrl configurations needed for touchscreen.
+These are common for both the tianma and ebbg touchscreen variant.
+In the subsequent patch, we will initially enable support for the focaltech
+touchscreen used in the EBBG variant. This is done in preparation for that.
+
+Signed-off-by:: Joel Selvaraj <joelselvaraj.oss@gmail.com>
+---
+ .../dts/qcom/sdm845-xiaomi-beryllium-common.dtsi   | 39 ++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
+index c872d64..90766e2 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
+@@ -244,6 +244,10 @@ &gmu {
+ 	status = "okay";
+ };
+ 
++&gpi_dma1 {
++	status = "okay";
++};
++
+ &gpu {
+ 	status = "okay";
+ 
+@@ -409,6 +413,10 @@ &qupv3_id_0 {
+ 	status = "okay";
+ };
+ 
++&qupv3_id_1 {
++	status = "okay";
++};
++
+ &sdhc_2 {
+ 	status = "okay";
+ 
+@@ -514,6 +522,37 @@ sdc2_card_det_n: sd-card-det-n-state {
+ 		function = "gpio";
+ 		bias-pull-up;
+ 	};
++
++	ts_int_default: ts-int-default-state {
++		pins = "gpio31";
++		function = "gpio";
++		drive-strength = <16>;
++		bias-pull-down;
++		input-enable;
++	};
++
++	ts_reset_default: ts-reset-default-state {
++		pins = "gpio32";
++		function = "gpio";
++		drive-strength = <16>;
++		output-high;
++	};
++
++	ts_int_sleep: ts-int-sleep-state {
++		pins = "gpio31";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++		input-enable;
++	};
++
++	ts_reset_sleep: ts-reset-sleep-state {
++		pins = "gpio32";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++		output-low;
++	};
+ };
+ 
+ &uart6 {

@@ -1,0 +1,30 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Wed, 17 Apr 2024 15:44:45 +0100
+Subject: dt-bindings: display: panel-simple-dsi: add sofef00 supplies
+
+The sofef00 and s6e3fc2x01 panels found on the OnePlus 6 and 6T actually
+have two additional supplies, a 3.3v VCI supply, and a 1.8v POC supply.
+Document them.
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ Documentation/devicetree/bindings/display/panel/panel-simple-dsi.yaml | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/display/panel/panel-simple-dsi.yaml b/Documentation/devicetree/bindings/display/panel/panel-simple-dsi.yaml
+index 9b92a05..3c88566 100644
+--- a/Documentation/devicetree/bindings/display/panel/panel-simple-dsi.yaml
++++ b/Documentation/devicetree/bindings/display/panel/panel-simple-dsi.yaml
+@@ -85,8 +85,12 @@ allOf:
+     then:
+       properties:
+         power-supply: false
++        vci-supply: true
++        poc-supply: true
+       required:
+         - vddio-supply
++        - vci-supply
++        - poc-supply
+     else:
+       properties:
+         vddio-supply: false

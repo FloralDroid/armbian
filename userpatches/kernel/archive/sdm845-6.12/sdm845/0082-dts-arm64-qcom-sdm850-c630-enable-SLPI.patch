@@ -1,0 +1,27 @@
+From: Steev Klimaszewski <steev@kali.org>
+Date: Thu, 30 Mar 2023 13:00:01 -0500
+Subject: dts: arm64: qcom: sdm850-c630: enable SLPI
+
+Enable the SLPI DSP on the Lenovo Yoga C630 with a Qualcomm SDM850 SoC.
+
+Signed-off-by: Steev Klimaszewski <steev@kali.org>
+---
+ arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts b/arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts
+index f180508..5fc37a7 100644
+--- a/arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts
++++ b/arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts
+@@ -628,6 +628,11 @@ dai@2 {
+ 	};
+ };
+ 
++&slpi_pas {
++	firmware-name = "qcom/sdm850/LENOVO/81JL/qcslpi850.mbn";
++	status = "okay";
++};
++
+ &sound {
+ 	compatible = "lenovo,yoga-c630-sndcard", "qcom,sdm845-sndcard";
+ 	model = "Lenovo-YOGA-C630-13Q50";

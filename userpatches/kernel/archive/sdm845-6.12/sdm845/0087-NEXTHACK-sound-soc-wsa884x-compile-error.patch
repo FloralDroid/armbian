@@ -1,0 +1,24 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Thu, 25 Jan 2024 15:18:42 +0000
+Subject: NEXTHACK: sound: soc: wsa884x: compile error
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ sound/soc/codecs/wsa884x.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/codecs/wsa884x.c b/sound/soc/codecs/wsa884x.c
+index 7195041..e002a3c 100644
+--- a/sound/soc/codecs/wsa884x.c
++++ b/sound/soc/codecs/wsa884x.c
+@@ -1833,8 +1833,8 @@ static int wsa884x_set_stream(struct snd_soc_dai *dai,
+ 	struct sdw_slave *sdw = dev_to_sdw_dev(dai->dev);
+ 
+ 	/* Check if this belongs to same bus */
+-	if (sdw->bus->dev != sruntime->dev)
+-		return 0;
++	// if (sdw->bus->dev != sruntime->dev)
++	// 	return 0;
+ 
+ 	wsa884x->sruntime = stream;
+ 

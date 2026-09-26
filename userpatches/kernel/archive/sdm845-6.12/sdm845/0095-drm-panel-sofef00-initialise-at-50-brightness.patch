@@ -1,0 +1,26 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Wed, 17 Apr 2024 14:20:35 +0100
+Subject: drm/panel: sofef00: initialise at 50% brightness
+
+Initialising at max brightness is no fun during those late night hacking
+sessions. Half brightness is much more comfortable in most settings so
+go with that instead.
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ drivers/gpu/drm/panel/panel-samsung-sofef00.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/panel/panel-samsung-sofef00.c b/drivers/gpu/drm/panel/panel-samsung-sofef00.c
+index 82123a2..9d8737b 100644
+--- a/drivers/gpu/drm/panel/panel-samsung-sofef00.c
++++ b/drivers/gpu/drm/panel/panel-samsung-sofef00.c
+@@ -200,7 +200,7 @@ sofef00_create_backlight(struct mipi_dsi_device *dsi)
+ 	struct device *dev = &dsi->dev;
+ 	const struct backlight_properties props = {
+ 		.type = BACKLIGHT_PLATFORM,
+-		.brightness = 1023,
++		.brightness = 512,
+ 		.max_brightness = 1023,
+ 	};
+ 

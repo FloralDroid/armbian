@@ -1,0 +1,25 @@
+From: Robert Eckelmann <longnoserob@gmail.com>
+Date: Sun, 31 Mar 2024 14:22:17 +0900
+Subject: arm64: dts: qcom: sdm845-xiaomi-beryllium: enable SLPI
+
+Enable the SLPI dsp on the Xiaomi Pocophone F1 with Qualcom SDM845 SoC.
+
+Signed-off-by: Robert Eckelmann <longnoserob@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
+index e2864c0..bd7690a 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
+@@ -758,3 +758,9 @@ &wifi {
+ 	qcom,snoc-host-cap-skip-quirk;
+ 	qcom,ath10k-calibration-variant = "xiaomi_beryllium";
+ };
++
++
++&slpi_pas {
++	firmware-name = "qcom/sdm845/beryllium/slpi.mbn";
++        status = "okay";
++};

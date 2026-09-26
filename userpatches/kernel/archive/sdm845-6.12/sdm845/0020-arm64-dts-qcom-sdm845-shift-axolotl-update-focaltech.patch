@@ -1,0 +1,28 @@
+From: Joel Selvaraj <joelselvaraj.oss@gmail.com>
+Date: Sat, 11 Mar 2023 03:46:55 -0600
+Subject: arm64: dts: qcom: sdm845-shift-axolotl: update focaltech touchscreen
+ properties
+
+The touchscreen nodes were added before the driver patches were merged.
+Update the focaltech touchscreen properties to match with the upstreamed
+focaltech driver. Also, the touchscreen used is in axolotl is fts5452 and not
+fts8719.
+
+Signed-off-by: Joel Selvaraj <joelselvaraj.oss@gmail.com>
+---
+ arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
+index 486ce17..0f3ec22 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
+@@ -440,7 +440,7 @@ touchscreen@38 {
+ 		reg = <0x38>;
+ 		wakeup-source;
+ 		interrupt-parent = <&tlmm>;
+-		interrupts = <125 IRQ_TYPE_EDGE_FALLING>;
++		interrupts = <125 0x2>;
+ 		vdd-supply = <&vreg_l28a_3p0>;
+ 		vcc-i2c-supply = <&vreg_l14a_1p88>;
+ 

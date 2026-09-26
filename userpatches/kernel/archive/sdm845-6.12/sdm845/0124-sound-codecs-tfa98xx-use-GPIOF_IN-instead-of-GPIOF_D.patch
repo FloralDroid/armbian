@@ -1,0 +1,22 @@
+From: Joel Selvaraj <foss@joelselvaraj.com>
+Date: Mon, 30 Sep 2024 14:51:04 -0500
+Subject: sound: codecs: tfa98xx: use GPIOF_IN instead of GPIOF_DIR_IN
+
+Due to patch series: https://lore.kernel.org/lkml/20240828142554.2424189-1-andriy.shevchenko@linux.intel.com/T/#m0044cb95f05e14cb4332b01f852dbd090a28a0cb
+---
+ sound/soc/codecs/tfa98xx-downstream/tfa98xx.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sound/soc/codecs/tfa98xx-downstream/tfa98xx.c b/sound/soc/codecs/tfa98xx-downstream/tfa98xx.c
+index 06cec92..f6cf31d 100644
+--- a/sound/soc/codecs/tfa98xx-downstream/tfa98xx.c
++++ b/sound/soc/codecs/tfa98xx-downstream/tfa98xx.c
+@@ -3091,7 +3091,7 @@ static int tfa98xx_i2c_probe(struct i2c_client *i2c)
+ 
+ 	if (gpio_is_valid(tfa98xx->irq_gpio)) {
+ 		ret = devm_gpio_request_one(&i2c->dev, tfa98xx->irq_gpio,
+-			GPIOF_DIR_IN, "TFA98XX_INT");
++			GPIOF_IN, "TFA98XX_INT");
+ 		if (ret)
+ 			return ret;
+ 	}

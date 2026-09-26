@@ -1,0 +1,40 @@
+From: David Heidelberg <david@ixit.cz>
+Date: Wed, 5 Feb 2025 14:19:56 +0100
+Subject: [PATCH] fixup! arm64: dts: qcom: sdm845-oneplus: camera bringup
+
+Signed-off-by: David Heidelberg <david@ixit.cz>
+---
+ arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+index 17271b9..e182312 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+@@ -552,7 +552,7 @@ rear_cam: camera@1a {
+ 		compatible = "sony,imx519";
+ 		reg = <0x1a>;
+ 
+-		reset-gpios = <&tlmm 28 GPIO_ACTIVE_HIGH>;
++		reset-gpios = <&tlmm 28 GPIO_ACTIVE_LOW>;
+ 		pinctrl-names = "default", "sleep";
+ 		pinctrl-0 = <&main_cam_default>;
+ 		pinctrl-1 = <&main_cam_sleep>;
+@@ -587,7 +587,7 @@ front_cam: camera@10 {
+ 		compatible = "sony,imx371";
+ 		reg = <0x10>;
+ 
+-		reset-gpios = <&tlmm 9 GPIO_ACTIVE_HIGH>;
++		reset-gpios = <&tlmm 9 GPIO_ACTIVE_LOW>;
+ 		pinctrl-names = "default", "sleep";
+ 		pinctrl-0 = <&front_cam_default>;
+ 		pinctrl-1 = <&front_cam_sleep>;
+@@ -622,7 +622,7 @@ sub_cam: camera@10 {
+ 		compatible = "sony,imx376k";
+ 		reg = <0x10>;
+ 
+-		reset-gpios = <&tlmm 23 GPIO_ACTIVE_HIGH>;
++		reset-gpios = <&tlmm 23 GPIO_ACTIVE_LOW>;
+ 		pinctrl-names = "default", "sleep";
+ 		pinctrl-0 = <&sub_cam_default>;
+ 		pinctrl-1 = <&sub_cam_sleep>;

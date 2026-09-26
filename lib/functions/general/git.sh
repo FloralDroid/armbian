@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+#
+# SPDX-License-Identifier: GPL-2.0
+#
+# Copyright (c) 2013-2026 Igor Pecovnik, igor@armbian.com
+#
+# This file is a part of the Armbian Build Framework
+# https://github.com/armbian/build/
+
+# defines the format for KERNELBRANCH, BOOTBRANCH, and arguments to fetch_from_repo.
+# branch:xxx, tag:yyyy, commit:zzzz, head.
+# sets: ref_type=branch|tag|commit, ref_name=xxx|yyyy|zzzz|HEAD
+function git_parse_ref() {
+	declare ref="$1"
+	[[ -z $ref || ($ref != tag:* && $ref != branch:* && $ref != head && $ref != commit:*) ]] && exit_with_error "Error in configuration; git_ref '${ref}' is not valid"
+	ref_type=${ref%%:*} # outer scope
+	ref_name=${ref##*:} # outer scope
+	if [[ $ref_type == head ]]; then
+		ref_name=HEAD
+	fi
+}
+
+#
+# This function retries Git operations to avoid failure in case remote is borked
+#
+function improved_git() {
+	local real_git
+	real_git="$(command -v git)"
+	local retries=3
+	local delay=10
+	local count=0
+	while [ $count -lt $retries ]; do
+		run_host_command_logged_raw "$real_git" --no-pager "$@" && return 0 # this gobbles up errors, but returns if OK, so everything after is error
+		count=$((count + 1))
+		display_alert "improved_git try $count failed, retrying in ${delay} seconds" "git $*" "warn"
+		sleep $delay
+	done
+	display_alert "improved_git, too many retries" "git $*" "err"
+	return 17 # explode with error if this is reached, "too many retries"
+}
+
+# Not improved, just regular, but logged "correctly".
+function regular_git() {
+	run_host_command_logged_raw git --no-pager "$@"
+}
+
+# avoid repeating myself too much
+function improved_git_fetch() {
+	declare -a verbose_params=() && if_user_on_terminal_and_not_logging_add verbose_params "--verbose" "--progress"
+	# --no-auto-maintenance requires a recent git version, not available on focal-like host OSs
+	improved_git fetch "${verbose_params[@]}" --recurse-submodules=no "$@"
+}
+
+# Every 'git ls-remote' is a hit to the remote: it is slow, and it might hang; let the user know before we do it.
+# <what: human description of what we are asking the remote> <ls-remote args...>
+function git_ls_remote_logged() {
+	declare what="${1}" && shift
+	display_alert "Querying git remote for ${what}" "${*}" "info" # display_alert writes to stderr, so this is safe inside $(...)
+	git ls-remote "$@"
+}
+
+# Resolve a tag to the COMMIT it points at, in a single hit to the remote.
+# Annotated tags advertise both 'refs/tags/X' (the tag object) and 'refs/tags/X^{}' (the commit);
+# lightweight tags advertise only 'refs/tags/X', which already is the commit. ls-remote takes more
+# than one pattern at a time, so ask for both and prefer the peeled one -- one round-trip, correct
+# for either kind of tag. Echoes the sha1, or nothing if the remote does not have the tag.
+# <url> <tag_name>
+function git_ls_remote_tag_commit_sha1() {
+	declare url="${1}" tag_name="${2}"
+	declare ls_remote_output peeled="" plain="" one_sha1 one_ref
+	# '|| true': not finding the tag is a normal answer here, not an error; the caller decides what to do.
+	ls_remote_output="$(git_ls_remote_logged "tag '${tag_name}' (annotated or not)" --tags "${url}" "${tag_name}" "${tag_name}^{}" || true)"
+	# Match the full ref name: ls-remote patterns match the tail on a slash boundary, so asking for
+	# 'v2026.07' also matches a 'refs/tags/vendor/v2026.07', which is not the tag we asked for.
+	while read -r one_sha1 one_ref; do
+		case "${one_ref}" in
+			"refs/tags/${tag_name}^{}") peeled="${one_sha1}" ;;
+			"refs/tags/${tag_name}") plain="${one_sha1}" ;;
+		esac
+	done <<< "${ls_remote_output}"
+	echo -n "${peeled:-${plain}}"
+}
+
+# workaround new limitations imposed by CVE-2022-24765 fix in git, otherwise  "fatal: unsafe repository"
+function git_ensure_safe_directory() {
+	if [[ -n "$(command -v git)" ]]; then
+		local git_dir="$1"
+		if [[ -e "$1/.git" ]]; then
+			display_alert "git: Marking all directories as safe, which should include" "$git_dir" "debug"
+			# NB: 'git config --get safe.directory <path>' treats <path> as a
+			# regex, so a shorter path (…/amlogic-boot-fip) spuriously matches an
+			# already-added longer one (…/amlogic-boot-fip-jethub) and we skip
+			# adding it -> later "dubious ownership". Compare values literally.
+			local existing found=no
+			# Suppress only the two benign exit codes from --get-all: 1 when the key is
+			# unset (first run) and 141 (SIGPIPE) when the loop's 'break' closes the pipe
+			# early. Both are the last command in this '<(…)' process-substitution
+			# subshell, which inherits the framework's errtrace ERR trap and would
+			# otherwise emit a spurious "Error occurred in SUBSHELL git.sh" annotation.
+			# Any other exit code is a real git config failure and is deliberately left
+			# to trip the ERR trap (unlike a blanket '|| true', which would hide it).
+			while IFS= read -r existing; do
+				[[ "$existing" == "$git_dir" ]] && { found=yes; break; }
+			done < <(git config --global --get-all safe.directory 2> /dev/null \
+				|| { rc=$?; [[ "$rc" == 1 || "$rc" == 141 ]]; })
+			[[ "$found" == yes ]] || regular_git config --global --add safe.directory "$git_dir"
+		fi
+	else
+		display_alert "git not installed" "a true wonder how you got this far without git - it will be installed for you" "warn"
+	fi
+}
+
+# fetch_from_repo <url> <directory> <ref> <ref_subdir>
+# <url>: remote repository URL
+# <directory>: local directory; subdir for branch/tag will be created
+# <ref>:
+#	branch:name
+#	tag:name
+#	head(*)
+#	commit:hash
+#
+# *: Implies ref_subdir=no
+#
+# <ref_subdir>: "yes" to create subdirectory for tag or branch name
+#
+function fetch_from_repo() {
+	display_alert "fetch_from_repo" "$*" "git"
+	local url=$1
+	local dir=$2
+	local ref=$3
+	local ref_subdir=$4
+	local git_work_dir
+
+	# Set GitHub mirror before anything else touches $url
+	if [[ "${url}" == https://github.com/* ]]; then
+		url="${GITHUB_SOURCE}/${url#https://github.com/}"
+	fi
+
+	# The 'offline' variable must always be set to 'true' or 'false'
+	local offline=false
+	if [[ "${OFFLINE_WORK}" == "yes" ]]; then
+		offline=true
+	fi
+
+	declare ref_type ref_name
+	git_parse_ref "$ref"
+
+	display_alert "Getting sources from Git" "$dir $ref_name" "info"
+
+	local workdir=$dir
+	if [[ $ref_subdir == yes ]]; then
+		workdir=$dir/$ref_name
+	fi
+
+	git_work_dir="${SRC}/cache/sources/${workdir}"
+
+	# if GIT_FIXED_WORKDIR has something, ignore above logic and use that directly.
+	if [[ "${GIT_FIXED_WORKDIR}" != "" ]]; then
+		display_alert "GIT_FIXED_WORKDIR is set to" "${GIT_FIXED_WORKDIR}" "git"
+		git_work_dir="${SRC}/cache/sources/${GIT_FIXED_WORKDIR}"
+	fi
+
+	display_alert "Git working dir" "${git_work_dir}" "git"
+
+	# Support using worktrees; needs GIT_BARE_REPO_FOR_WORKTREE set
+	if [[ "x${GIT_BARE_REPO_FOR_WORKTREE}x" != "xx" ]]; then
+		# If it is already a worktree...
+		if [[ -f "${git_work_dir}/.git" ]]; then
+			display_alert "Using existing worktree" "${git_work_dir}" "git"
+		else
+			if [[ -d "${git_work_dir}" ]]; then
+				display_alert "Removing previously half-checked-out tree" "${git_work_dir}" "warn"
+				cd "${SRC}" || exit_with_error "Could not cd to ${SRC}"
+				rm -rf "${git_work_dir}"
+			fi
+			display_alert "Creating new worktree" "${git_work_dir}" "git"
+			run_host_command_logged git -C "${GIT_BARE_REPO_FOR_WORKTREE}" worktree add "${git_work_dir}" "${GIT_BARE_REPO_INITIAL_BRANCH}" --no-checkout --force
+			cd "${git_work_dir}" || exit
+		fi
+		cd "${git_work_dir}" || exit
+
+		# Fix the reference to the bare repo; this avoids errors when the bare repo is moved.
+		display_alert "Original gitdir: " "$(cat "${git_work_dir}/.git")" "git"
+		local git_work_dir_basename
+		git_work_dir_basename="$(basename "${git_work_dir}")"
+		echo "gitdir: $(realpath --relative-to=${git_work_dir} ${GIT_BARE_REPO_FOR_WORKTREE}/.git/worktrees/${git_work_dir_basename})" > "${git_work_dir}/.git"
+		display_alert "Modified gitdir: " "$(cat "${git_work_dir}/.git")" "git"
+
+		# Fix the bare repo's reference to the working tree; this avoids errors when the working tree is moved.
+		local bare_repo_wt_path="${GIT_BARE_REPO_FOR_WORKTREE}/.git/worktrees/${git_work_dir_basename}"
+		local bare_repo_wt_gitdir="${bare_repo_wt_path}/gitdir"
+		if [[ -f "${bare_repo_wt_gitdir}" ]]; then
+			display_alert "Original bare repo gitdir: " "$(cat "${bare_repo_wt_gitdir}")" "git"
+			run_host_command_logged echo "${git_work_dir}/.git" ">" "${bare_repo_wt_gitdir}"
+			display_alert "Modified bare repo gitdir: " "$(cat "${bare_repo_wt_gitdir}")" "git"
+		else
+			display_alert "No bare repo worktree gitdir found" "${bare_repo_wt_gitdir}" "err"
+			display_alert "Did you shuffle worktrees around?" "Don't shuffle worktrees around" "err"
+			display_alert "Did you shuffle bare trees around?" "Don't shuffle bare trees around" "err"
+			display_alert "Did you NOT do anything of the sort?" "Open a bug report / reset your cache." "err"
+			exit_with_error "Bare repo worktree gitdir not found: ${bare_repo_wt_gitdir}"
+		fi
+		git_ensure_safe_directory "${git_work_dir}"
+	else
+		mkdir -p "${git_work_dir}" || exit_with_error "No path or no write permission" "${git_work_dir}"
+		cd "${git_work_dir}" || exit
+		git_ensure_safe_directory "${git_work_dir}"
+
+		if [[ ! -d ".git" || "$(git rev-parse --git-dir)" != ".git" ]]; then
+			# Dir is not a git working copy. Make it so;
+			display_alert "Initializing empty git local copy" "git init: $dir $ref_name"
+			regular_git init -q . # --initial-branch="armbian_unused_initial_branch" is not supported under focal
+			offline=false         # Force online, we'll need to fetch.
+		fi
+	fi
+
+	local changed=false
+
+	# get local hash; might fail
+	local local_hash
+	local_hash=$(git rev-parse @ 2> /dev/null || true) # Don't fail nor output anything if failure
+
+	# remote hash; will be calculated depending on ref_type below
+	local remote_hash
+
+	# when we work offline we simply return the sources to their original state
+	if ! $offline; then
+
+		case $ref_type in
+			branch)
+				# Branches are always fetched, because they are mutable; we don't want to be stuck on an old commit.
+				# No ls-remote here on purpose: its answer can't change the outcome, and it'd cost an extra remote round-trip.
+				remote_hash="(not queried)"
+				changed=true
+				;;
+			tag)
+				# One hit resolves both annotated and lightweight tags, and always yields a commit, so it is
+				# directly comparable to local_hash (which is 'git rev-parse @', also a commit). Comparing
+				# against the annotated tag's own sha1 could never match, and thus never cache-hit.
+				remote_hash="$(git_ls_remote_tag_commit_sha1 "${url}" "${ref_name}")"
+				if [[ -z $local_hash || -z $remote_hash || "${local_hash}" != "${remote_hash}" ]]; then
+					changed=true
+				else
+					display_alert "Git tag already checked out" "$dir tag:${ref_name} @ ${local_hash}" "cachehit"
+				fi
+				;;
+			head)
+				remote_hash=$(git_ls_remote_logged "HEAD" "${url}" HEAD | cut -f1)
+				if [[ -z $local_hash || "${local_hash}" != "${remote_hash}" ]]; then
+					changed=true
+				else
+					display_alert "Git already at the remote HEAD" "$dir head @ ${local_hash}" "cachehit"
+				fi
+				;;
+			commit)
+				remote_hash="${ref_name}"
+				if [[ -z $local_hash || $local_hash == "@" || "${local_hash}" != "${remote_hash}" ]]; then
+					changed=true
+				else
+					display_alert "Git commit/sha1 already checked out" "$dir commit:${ref_name}" "cachehit"
+				fi
+				;;
+		esac
+
+		display_alert "Git local_hash vs remote_hash" "${local_hash} vs ${remote_hash}" "git"
+
+	else
+		display_alert "Git offline, not checking the remote at all" "$dir ${ref_type}:${ref_name}" "cachehit"
+	fi # offline
+
+	local checkout_from="HEAD" # Probably best to use the local revision?
+
+	if [[ "${changed}" == "true" ]]; then
+
+		# Important: we might have the commit locally, even if it is not the local_hash; sha1's are immutable, so
+		# if the object is already in the local copy there is nothing to fetch -- saves us a lot of time.
+		if [[ "${ref_type}" == "commit" ]] && git cat-file -e "${ref_name}^{commit}" &> /dev/null; then
+			display_alert "Commit/sha1 already in local copy, skipping git fetch" "$dir ${ref_name}" "cachehit"
+			checkout_from="${ref_name}"
+		else
+			# remote was updated, fetch and check out updates, but not tags; tags pull their respective commits too, making it a huge fetch.
+			display_alert "Fetching updates from remote repository" "$dir $ref_name"
+			case $ref_type in
+				branch)
+					improved_git_fetch --no-tags "${url}" "${ref_name}"
+					;;
+				tag)
+					improved_git_fetch --no-tags "${url}" tags/"${ref_name}"
+					;;
+				head)
+					improved_git_fetch --no-tags "${url}" HEAD
+					;;
+				commit)
+					display_alert "Fetching a specific commit/sha1" "${ref_name}" "debug"
+					improved_git_fetch --no-tags "${url}" "${ref_name}"
+					;;
+			esac
+
+			checkout_from="FETCH_HEAD"
+		fi
+	else
+		display_alert "Local copy is up to date, skipping git fetch" "$dir ${ref_type}:${ref_name}" "cachehit"
+	fi
+
+	# if the tree is shallow and big, this first rev-parse takes a while; use info to inform about what is done
+	display_alert "git: Fetch from remote completed, rev-parsing..." "'$dir' '$ref_name' '${checkout_from}'" "info"
+
+	# should be declared in outer scope: fetched_revision fetched_revision_ts
+	# Peel to the commit: after fetching an annotated tag, FETCH_HEAD is the *tag object's* sha1, not the
+	# commit's. Without this, a cold build (fetch -> FETCH_HEAD) and a warm one (cachehit -> HEAD) would
+	# report different revisions for the exact same tree. It also matches what git-ref2info.sh resolves.
+	fetched_revision="$(git rev-parse "${checkout_from}^{commit}")"
+	fetched_revision_ts="$(git log -1 --pretty=%ct "${fetched_revision}")" # unix timestamp of the commit date
+	display_alert "Fetched revision: fetched_revision:" "${fetched_revision}" "git"
+	display_alert "Fetched revision: fetched_revision_ts:" "${fetched_revision_ts}" "git"
+
+	# if FETCH_FROM_REPO_CALLBACK_IF_REF_MUTABLE is set, and the ref is not a sha1, invoke that callback.
+	if [[ "${FETCH_FROM_REPO_CALLBACK_IF_REF_MUTABLE:-"none"}" != "none" ]]; then
+		case $ref_type in
+			tag | commit) # do nothing
+				;;
+			*) # Complain
+				display_alert "FETCH_FROM_REPO_CALLBACK_IF_REF_MUTABLE is set, and the ref is not a sha1" "${url} ${ref_type} ${ref_name} - should be commit:${fetched_revision}" "debug"
+				"${FETCH_FROM_REPO_CALLBACK_IF_REF_MUTABLE}" "${url}" "${ref_type}" "${ref_name}" "${fetched_revision}"
+				;;
+		esac
+	fi
+
+	if [[ "${ref_type}" == "branch" ]]; then
+		declare cached_revision
+		cached_revision="$(_git_sources_pinned_sha1 "${url}" "${ref_name}")"
+		if [[ "${cached_revision}" =~ ^[0-9a-f]{40}$ ]]; then
+			fetched_revision="${cached_revision}"
+		elif [[ -n "${cached_revision}" ]]; then
+			exit_with_error "Invalid pinned SHA1 '${cached_revision}' for '${url}' '${ref_name}' in config/sources/git_sources.json"
+		fi
+	fi
+
+	if [[ "${do_checkout:-"yes"}" == "yes" ]]; then
+		display_alert "git checking out revision SHA" "${fetched_revision}" "git"
+		regular_git checkout -f -q "${fetched_revision}" # Return the files that are tracked by git to the initial state.
+
+		# should be declared in outer scope: checked_out_revision checked_out_revision_ts
+		checked_out_revision="${fetched_revision}"
+		checked_out_revision_ts="${fetched_revision_ts}"
+		display_alert "Fetched revision: checked_out_revision:" "${checked_out_revision}" "git"
+		display_alert "Fetched revision: checked_out_revision_ts:" "${checked_out_revision_ts}" "git"
+
+		display_alert "git cleaning" "${checked_out_revision}" "git"
+		regular_git clean -q -d -f # Removes files that are not tracked by git. Does not remove .gitignore'd files.
+
+		if [[ -f .gitmodules ]]; then
+			if [[ "${GIT_SKIP_SUBMODULES}" == "yes" ]]; then
+				display_alert "Skipping submodules" "GIT_SKIP_SUBMODULES=yes" "debug"
+			else
+				display_alert "Updating submodules" "" "ext"
+				# FML: http://stackoverflow.com/a/17692710
+				while read -r key path; do
+					# key is like: submodule.libfoo.path
+					# extract "libfoo" from "submodule.libfoo.path"
+					local name=${key#submodule.} # -> libfoo.path
+					name=${name%.path}           # -> libfoo
+
+					cd "${git_work_dir}" || exit
+
+					local surl sref
+					surl=$(git config -f .gitmodules --get "submodule.${name}.url")
+					sref=$(git config -f .gitmodules --get "submodule.${name}.branch" || true)
+
+					if [[ -n $sref ]]; then
+						sref="branch:$sref"
+					else
+						sref="head"
+					fi
+
+					display_alert "Updating submodule" "${name} - ${surl} - ${sref}" "git"
+					git_ensure_safe_directory "$workdir/$path"
+
+					if [[ "${GIT_FIXED_WORKDIR}" != "" ]]; then
+						GIT_FIXED_WORKDIR="${GIT_FIXED_WORKDIR}/${path}" fetch_from_repo "$surl" "$workdir/$path" "$sref"
+					else
+						fetch_from_repo "$surl" "$workdir/$path" "$sref"
+					fi
+
+				done < <(git config -f .gitmodules --get-regexp 'submodule\..*\.path')
+			fi
+		fi
+	else
+		display_alert "Skipping checkout" "$dir $ref_name ${checked_out_revision}" "info"
+	fi
+
+	return 0
+}

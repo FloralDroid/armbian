@@ -1,0 +1,39 @@
+From: Joel Selvaraj <foss@joelselvaraj.com>
+Date: Fri, 16 Aug 2024 09:20:00 -0500
+Subject: HACK: drm/panel: lg-sw43408: workaround panel not turning on once
+ off
+
+I tried quite a lot of things. Not sure what is causing this. The only
+workaround that worked is to not reset and disable regulators when unprepare.
+This will most likely cause battery drain since the regulators are not
+turned off when the display is off.
+
+Signed-off-by: Joel Selvaraj <foss@joelselvaraj.com>
+---
+ drivers/gpu/drm/panel/panel-lg-sw43408.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/panel/panel-lg-sw43408.c b/drivers/gpu/drm/panel/panel-lg-sw43408.c
+index 66bac1c..0297b8d 100644
+--- a/drivers/gpu/drm/panel/panel-lg-sw43408.c
++++ b/drivers/gpu/drm/panel/panel-lg-sw43408.c
+@@ -152,8 +152,8 @@ static int sw43408_prepare(struct drm_panel *panel)
+ 	return 0;
+ 
+ poweroff:
+-	gpiod_set_value(ctx->reset_gpio, 1);
+-	regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++	// gpiod_set_value(ctx->reset_gpio, 1);
++	// regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+ 	return ret;
+ }
+ 
+@@ -217,7 +217,7 @@ static int sw43408_backlight_init(struct sw43408_panel *ctx)
+ 
+ static const struct drm_panel_funcs sw43408_funcs = {
+ 	.disable = sw43408_disable,
+-	.unprepare = sw43408_unprepare,
++	// .unprepare = sw43408_unprepare,
+ 	.prepare = sw43408_prepare,
+ 	.get_modes = sw43408_get_modes,
+ };

@@ -1,0 +1,78 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Wed, 24 Jan 2024 12:07:05 +0000
+Subject: dsi init race condition debugging
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ arch/arm64/boot/dts/qcom/sdm845.dtsi                 | 2 ++
+ arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts | 4 ++++
+ drivers/clk/qcom/dispcc-sdm845.c                     | 1 +
+ drivers/gpu/drm/msm/msm_mdss.c                       | 2 ++
+ include/dt-bindings/clock/qcom,dispcc-sdm845.h       | 1 +
+ 5 files changed, 10 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845.dtsi b/arch/arm64/boot/dts/qcom/sdm845.dtsi
+index c461a6d..824c00b 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845.dtsi
+@@ -4543,6 +4543,8 @@ mdss: display-subsystem@ae00000 {
+ 
+ 			power-domains = <&dispcc MDSS_GDSC>;
+ 
++			//resets = <&dispcc DISP_CC_MDSS_CORE_BCR>;
++
+ 			clocks = <&dispcc DISP_CC_MDSS_AHB_CLK>,
+ 				 <&dispcc DISP_CC_MDSS_MDP_CLK>;
+ 			clock-names = "iface", "core";
+diff --git a/arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts b/arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts
+index 5fc37a7..d4e0d9c 100644
+--- a/arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts
++++ b/arch/arm64/boot/dts/qcom/sdm850-lenovo-yoga-c630.dts
+@@ -37,6 +37,10 @@ aliases {
+ 		serial1 = &uart6;
+ 	};
+ 
++	chosen {
++		stdout-path = "serial0:115200n8";
++	};
++
+ 	gpio-keys {
+ 		compatible = "gpio-keys";
+ 
+diff --git a/drivers/clk/qcom/dispcc-sdm845.c b/drivers/clk/qcom/dispcc-sdm845.c
+index 1859c09..3436fdc 100644
+--- a/drivers/clk/qcom/dispcc-sdm845.c
++++ b/drivers/clk/qcom/dispcc-sdm845.c
+@@ -816,6 +816,7 @@ static struct clk_regmap *disp_cc_sdm845_clocks[] = {
+ 
+ static const struct qcom_reset_map disp_cc_sdm845_resets[] = {
+ 	[DISP_CC_MDSS_RSCC_BCR] = { 0x5000 },
++	[DISP_CC_MDSS_CORE_BCR] = { 0x2000 },
+ };
+ 
+ static struct gdsc *disp_cc_sdm845_gdscs[] = {
+diff --git a/drivers/gpu/drm/msm/msm_mdss.c b/drivers/gpu/drm/msm/msm_mdss.c
+index faa88fd..f3cb61b 100644
+--- a/drivers/gpu/drm/msm/msm_mdss.c
++++ b/drivers/gpu/drm/msm/msm_mdss.c
+@@ -384,6 +384,8 @@ static int msm_mdss_reset(struct device *dev)
+ 				     "failed to acquire mdss reset\n");
+ 	}
+ 
++	dev_info(dev, "toggle reset\n");
++
+ 	reset_control_assert(reset);
+ 	/*
+ 	 * Tests indicate that reset has to be held for some period of time,
+diff --git a/include/dt-bindings/clock/qcom,dispcc-sdm845.h b/include/dt-bindings/clock/qcom,dispcc-sdm845.h
+index 4016fd1..f3e088b 100644
+--- a/include/dt-bindings/clock/qcom,dispcc-sdm845.h
++++ b/include/dt-bindings/clock/qcom,dispcc-sdm845.h
+@@ -49,6 +49,7 @@
+ 
+ /* DISP_CC Reset */
+ #define DISP_CC_MDSS_RSCC_BCR					0
++#define DISP_CC_MDSS_CORE_BCR					1
+ 
+ /* DISP_CC GDSCR */
+ #define MDSS_GDSC						0

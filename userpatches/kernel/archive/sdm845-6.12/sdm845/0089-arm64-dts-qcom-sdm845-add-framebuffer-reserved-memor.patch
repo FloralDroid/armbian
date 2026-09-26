@@ -1,0 +1,130 @@
+From: Caleb Connolly <caleb.connolly@linaro.org>
+Date: Tue, 31 Jan 2023 10:23:42 +0000
+Subject: arm64: dts: qcom: sdm845: add framebuffer reserved memory
+
+Stick it with the other default reserved regions, all sdm845 devices
+use this address except for cheza.
+
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ arch/arm64/boot/dts/qcom/sdm845-lg-common.dtsi               | 6 ------
+ arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts      | 5 -----
+ arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts            | 5 -----
+ arch/arm64/boot/dts/qcom/sdm845-sony-xperia-tama.dtsi        | 6 ------
+ arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi | 6 ------
+ arch/arm64/boot/dts/qcom/sdm845.dtsi                         | 5 +++++
+ arch/arm64/boot/dts/qcom/sdm850.dtsi                         | 2 ++
+ 7 files changed, 7 insertions(+), 28 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-lg-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-lg-common.dtsi
+index 99dafc6..57ed447 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-lg-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-lg-common.dtsi
+@@ -93,12 +93,6 @@ spss_mem: memory@99000000 {
+ 			no-map;
+ 		};
+ 
+-		/* Framebuffer region */
+-		memory@9d400000 {
+-			reg = <0x0 0x9d400000 0x0 0x2400000>;
+-			no-map;
+-		};
+-
+ 		/* rmtfs lower guard */
+ 		memory@f0800000 {
+ 			reg = <0 0xf0800000 0 0x1000>;
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts b/arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts
+index 94a95d7e..0268020 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts
+@@ -64,11 +64,6 @@ vreg_s4a_1p8: pm8998-smps4 {
+ 	};
+ 
+ 	reserved-memory {
+-		memory@9d400000 {
+-			reg = <0x0 0x9d400000 0x0 0x02400000>;
+-			no-map;
+-		};
+-
+ 		memory@a1300000 {
+ 			compatible = "ramoops";
+ 			reg = <0x0 0xa1300000 0x0 0x100000>;
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
+index a562fa3..aaf7736 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
+@@ -64,11 +64,6 @@ key-vol-up {
+ 	};
+ 
+ 	reserved-memory {
+-		framebuffer@9d400000 {
+-			reg = <0x0 0x9d400000 0x0 (1080 * 2160 * 4)>;
+-			no-map;
+-		};
+-
+ 		ramoops: ramoops@b0000000 {
+ 			compatible = "ramoops";
+ 			reg = <0 0xb0000000 0 0x00400000>;
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-sony-xperia-tama.dtsi b/arch/arm64/boot/dts/qcom/sdm845-sony-xperia-tama.dtsi
+index b02a1dc..c4845b0 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-sony-xperia-tama.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-sony-xperia-tama.dtsi
+@@ -118,12 +118,6 @@ vreg_s4a_1p8: pm8998-smps4 {
+ 	};
+ 
+ 	reserved-memory {
+-		/* SONY was cool and didn't diverge from MTP this time, yay! */
+-		cont_splash_mem: memory@9d400000 {
+-			reg = <0x0 0x9d400000 0x0 0x2400000>;
+-			no-map;
+-		};
+-
+ 		ramoops@ffc00000 {
+ 			compatible = "ramoops";
+ 			reg = <0x0 0xffc00000 0x0 0x100000>;
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
+index d6941f0..8d266ef 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
+@@ -102,12 +102,6 @@ spss_mem: memory@97f00000 {
+ 			no-map;
+ 		};
+ 
+-		/* Cont splash region set up by the bootloader */
+-		cont_splash_mem: framebuffer@9d400000 {
+-			reg = <0 0x9d400000 0 0x2400000>;
+-			no-map;
+-		};
+-
+ 		rmtfs_mem: memory@f6301000 {
+ 			compatible = "qcom,rmtfs-mem";
+ 			reg = <0 0xf6301000 0 0x200000>;
+diff --git a/arch/arm64/boot/dts/qcom/sdm845.dtsi b/arch/arm64/boot/dts/qcom/sdm845.dtsi
+index 824c00b..1903cd3 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845.dtsi
+@@ -889,6 +889,11 @@ mdata_mem: mpss-metadata {
+ 			no-map;
+ 		};
+ 
++		cont_splash_mem: framebuffer@9d400000 {
++			reg = <0 0x9d400000 0 0x2400000>;
++			no-map;
++		};
++
+ 		fastrpc_mem: fastrpc {
+ 			compatible = "shared-dma-pool";
+ 			alloc-ranges = <0x0 0x00000000 0x0 0xffffffff>;
+diff --git a/arch/arm64/boot/dts/qcom/sdm850.dtsi b/arch/arm64/boot/dts/qcom/sdm850.dtsi
+index da9f6fbe..b787575 100644
+--- a/arch/arm64/boot/dts/qcom/sdm850.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm850.dtsi
+@@ -7,6 +7,8 @@
+ 
+ #include "sdm845.dtsi"
+ 
++/delete-node/ &cont_splash_mem;
++
+ &cpu4_opp_table {
+ 	cpu4_opp33: opp-2841600000 {
+ 		opp-hz = /bits/ 64 <2841600000>;

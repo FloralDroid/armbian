@@ -1,0 +1,22 @@
+From: Joel Selvaraj <foss@joelselvaraj.com>
+Date: Mon, 30 Sep 2024 14:50:40 -0500
+Subject: Input: touchscreen: stm: use GPIOF_IN instead of GPIOF_DIR_IN
+
+Due to patch series: https://lore.kernel.org/lkml/20240828142554.2424189-1-andriy.shevchenko@linux.intel.com/T/#m0044cb95f05e14cb4332b01f852dbd090a28a0cb
+---
+ drivers/input/touchscreen/stm/ftm4_ts.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/input/touchscreen/stm/ftm4_ts.c b/drivers/input/touchscreen/stm/ftm4_ts.c
+index 2d7f244..a0c982c 100644
+--- a/drivers/input/touchscreen/stm/ftm4_ts.c
++++ b/drivers/input/touchscreen/stm/ftm4_ts.c
+@@ -1355,7 +1355,7 @@ static int fts_parse_dt(struct i2c_client *client)
+ 	pdata->gpio = of_get_named_gpio(np, "stm,irq_gpio", 0);
+ 	if (gpio_is_valid(pdata->gpio)) {
+ 		retval = gpio_request_one(pdata->gpio,
+-					GPIOF_DIR_IN, "stm,tsp_int");
++					GPIOF_IN, "stm,tsp_int");
+ 		if (retval) {
+ 			tsp_debug_err(dev,
+ 						"Unable to request tsp_int [%d]\n",

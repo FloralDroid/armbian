@@ -1,0 +1,31 @@
+From: methanal <baclofen@tuta.io>
+Date: Wed, 14 Jun 2023 03:15:27 +0900
+Subject: Input: synaptics-rmi4 - f55: handle zero electrode count
+
+Some third party ICs claim to support f55 but report an electrode count
+of 0. Catch this and bail out early so that we don't confuse the i2c bus
+with 0 sized reads.
+
+Signed-off-by: methanal <baclofen@tuta.io>
+[simplify code, adjust wording]
+Signed-off-by: Caleb Connolly <caleb.connolly@linaro.org>
+---
+ drivers/input/rmi4/rmi_f55.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/input/rmi4/rmi_f55.c b/drivers/input/rmi4/rmi_f55.c
+index a0877d3..70d5df5 100644
+--- a/drivers/input/rmi4/rmi_f55.c
++++ b/drivers/input/rmi4/rmi_f55.c
+@@ -52,6 +52,11 @@ static int rmi_f55_detect(struct rmi_function *fn)
+ 
+ 	f55->num_rx_electrodes = f55->qry[F55_NUM_RX_OFFSET];
+ 	f55->num_tx_electrodes = f55->qry[F55_NUM_TX_OFFSET];
++	if (!f55->num_rx_electrodes || !f55->num_tx_electrodes) {
++		rmi_dbg(RMI_DEBUG_FN, &fn->dev,
++			"F55 query returned no electrodes, giving up\n");
++		return 0;
++	}
+ 
+ 	f55->cfg_num_rx_electrodes = f55->num_rx_electrodes;
+ 	f55->cfg_num_tx_electrodes = f55->num_tx_electrodes;

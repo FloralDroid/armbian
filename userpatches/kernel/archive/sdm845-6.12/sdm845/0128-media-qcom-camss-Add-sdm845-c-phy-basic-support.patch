@@ -1,0 +1,92 @@
+From: David Heidelberg <david@ixit.cz>
+Date: Sat, 7 Dec 2024 23:53:46 -0500
+Subject: [PATCH] media: qcom: camss: Add sdm845 c-phy basic support
+
+Add in functional logic throughout the code to support C-PHY on SDM845.
+
+Signed-off-by: David Heidelberg <david@ixit.cz>
+---
+ drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c | 13 ++++++++++---
+ drivers/media/platform/qcom/camss/camss-csiphy.h         |  8 ++++++++
+ drivers/media/platform/qcom/camss/camss.c                |  8 ++++++--
+ 3 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
+index 03ff2b8..d440439 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
+@@ -568,16 +568,23 @@ static void csiphy_gen1_config_lanes(struct csiphy_device *csiphy,
+ }
+ 
+ static void csiphy_gen2_config_lanes(struct csiphy_device *csiphy,
++				     struct csiphy_config *cfg,
+ 				     u8 settle_cnt)
+ {
++	struct csiphy_lanes_cfg *c = &cfg->csi2->lane_cfg;
+ 	const struct csiphy_reg_t *r;
+ 	int i, l, array_size;
+ 	u32 val;
+ 
+ 	switch (csiphy->camss->res->version) {
+ 	case CAMSS_845:
+-		r = &lane_regs_sdm845[0][0];
+-		array_size = ARRAY_SIZE(lane_regs_sdm845[0]);
++		if (c->cphy) {
++			r = &lane_regs_sdm845_3ph[0][0];
++			array_size = ARRAY_SIZE(lane_regs_sdm845_3ph[0]);
++		} else {
++			r = &lane_regs_sdm845[0][0];
++			array_size = ARRAY_SIZE(lane_regs_sdm845[0]);
++		}
+ 		break;
+ 	case CAMSS_8250:
+ 		r = &lane_regs_sm8250[0][0];
+@@ -664,7 +671,7 @@ static void csiphy_lanes_enable(struct csiphy_device *csiphy,
+ 	writel_relaxed(val, csiphy->base + CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(0));
+ 
+ 	if (csiphy_is_gen2(csiphy->camss->res->version))
+-		csiphy_gen2_config_lanes(csiphy, settle_cnt);
++		csiphy_gen2_config_lanes(csiphy, cfg, settle_cnt);
+ 	else
+ 		csiphy_gen1_config_lanes(csiphy, cfg, settle_cnt);
+ 
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.h b/drivers/media/platform/qcom/camss/camss-csiphy.h
+index 47f0b6b..7664cdb 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy.h
++++ b/drivers/media/platform/qcom/camss/camss-csiphy.h
+@@ -26,7 +26,15 @@ struct csiphy_lane {
+ 	u8 pol;
+ };
+ 
++/**
++ * struct csiphy_lanes_cfg - CSIPHY lanes configuration
++ * @cphy:     true if C-PHY is used, false if D-PHY is used
++ * @num_data: number of data lanes
++ * @data:     data lanes configuration
++ * @clk:      clock lane configuration (only for D-PHY)
++ */
+ struct csiphy_lanes_cfg {
++	bool cphy;
+ 	int num_data;
+ 	struct csiphy_lane *data;
+ 	struct csiphy_lane clk;
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index d00475d..c60b8ec 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -1704,9 +1704,13 @@ static int camss_of_parse_endpoint_node(struct device *dev,
+ 	csd->interface.csiphy_id = vep.base.port;
+ 
+ 	mipi_csi2 = &vep.bus.mipi_csi2;
+-	lncfg->clk.pos = mipi_csi2->clock_lane;
+-	lncfg->clk.pol = mipi_csi2->lane_polarities[0];
+ 	lncfg->num_data = mipi_csi2->num_data_lanes;
++	lncfg->cphy = vep.bus_type == V4L2_MBUS_CSI2_CPHY;
++
++	if (!lncfg->cphy) {
++		lncfg->clk.pos = mipi_csi2->clock_lane;
++		lncfg->clk.pol = mipi_csi2->lane_polarities[0];
++	}
+ 
+ 	lncfg->data = devm_kcalloc(dev,
+ 				   lncfg->num_data, sizeof(*lncfg->data),

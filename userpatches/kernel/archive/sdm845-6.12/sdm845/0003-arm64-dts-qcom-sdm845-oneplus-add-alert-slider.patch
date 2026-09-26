@@ -1,0 +1,64 @@
+From: Gergo Koteles <soyer@irl.hu>
+Date: Wed, 22 Feb 2023 01:10:34 +0100
+Subject: arm64: dts: qcom: sdm845-oneplus: add alert-slider
+
+The alert-slider is a tri-state sound profile switch found on the OnePlus 6,
+Android maps the states to "silent", "vibrate" and "ring". Expose them as
+ABS_SND_PROFILE events.
+The previous GPIO numbers were wrong. Update them to the correct
+ones.
+
+Co-developed-by: Caleb Connolly <caleb@connolly.tech>
+Signed-off-by: Caleb Connolly <caleb@connolly.tech>
+Signed-off-by: Gergo Koteles <soyer@irl.hu>
+Reviewed-by: Konrad Dybcio <konrad.dybcio@linaro.org>
+---
+ .../arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi | 35 ++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+index 56840b6..f2243c3 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
+@@ -21,6 +21,41 @@
+ /delete-node/ &rmtfs_mem;
+ 
+ / {
++	alert-slider {
++		compatible = "gpio-keys";
++		label = "Alert slider";
++
++		pinctrl-0 = <&alert_slider_default>;
++		pinctrl-names = "default";
++
++		switch-top {
++			label = "Silent";
++			linux,input-type = <EV_ABS>;
++			linux,code = <ABS_SND_PROFILE>;
++			linux,input-value = <SND_PROFILE_SILENT>;
++			gpios = <&tlmm 126 GPIO_ACTIVE_LOW>;
++			linux,can-disable;
++		};
++
++		switch-middle {
++			label = "Vibrate";
++			linux,input-type = <EV_ABS>;
++			linux,code = <ABS_SND_PROFILE>;
++			linux,input-value = <SND_PROFILE_VIBRATE>;
++			gpios = <&tlmm 52 GPIO_ACTIVE_LOW>;
++			linux,can-disable;
++		};
++
++		switch-bottom {
++			label = "Ring";
++			linux,input-type = <EV_ABS>;
++			linux,code = <ABS_SND_PROFILE>;
++			linux,input-value = <SND_PROFILE_RING>;
++			gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
++			linux,can-disable;
++		};
++	};
++
+ 	aliases {
+ 		serial0 = &uart9;
+ 		serial1 = &uart6;

@@ -1,0 +1,177 @@
+From 6d0764f5fc1eb969cfca09e3ebb301ec222141a4 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Fri, 18 Sep 2026 10:56:40 +0800
+Subject: [PATCH] usb: gadget: add bring-up diagnostics
+
+Log each DWC3 initialization stage and report the registered UDC.
+
+When an existing-only gadget driver cannot bind, report the requested UDC
+and every registered candidate with its current owner. This changes
+diagnostics only.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index f0a9bb575..28ce36a70 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -2245,6 +2245,9 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
+ 	dwc3_get_properties(dwc);
+ 
+ 	dwc3_get_software_properties(dwc);
++	dev_info(dev,
++		 "dwc3-diag: core probe dr_mode=%d max_speed=%d resource=%pr\n",
++		 dwc->dr_mode, dwc->maximum_speed, res);
+ 
+ 	dwc->usb_psy = dwc3_get_usb_power_supply(dwc);
+ 	if (IS_ERR(dwc->usb_psy))
+@@ -2278,6 +2281,9 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
+ 
+ 	dev_set_drvdata(dev, dwc);
+ 	dwc3_cache_hwparams(dwc);
++	dev_info(dev, "dwc3-diag: valid core revision=%#x hw_mode=%u\n",
++		 dwc->revision,
++		 DWC3_GHWPARAMS0_MODE(dwc->hwparams.hwparams0));
+ 
+ 	if (!dev_is_pci(dwc->sysdev) &&
+ 	    DWC3_GHWPARAMS0_AWIDTH(dwc->hwparams.hwparams0) == 64) {
+@@ -2327,6 +2333,8 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
+ 	ret = dwc3_get_dr_mode(dwc);
+ 	if (ret)
+ 		goto err_free_event_buffers;
++	dev_info(dev, "dwc3-diag: validated dr_mode=%d extcon=%s\n",
++		 dwc->dr_mode, dwc->edev ? "present" : "absent");
+ 
+ 	ret = dwc3_core_init(dwc);
+ 	if (ret) {
+@@ -2337,9 +2345,13 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
+ 	dwc3_check_params(dwc);
+ 	dwc3_debugfs_init(dwc);
+ 
++	dev_info(dev, "dwc3-diag: initializing mode=%d\n", dwc->dr_mode);
+ 	ret = dwc3_core_init_mode(dwc);
+ 	if (ret)
+ 		goto err_exit_debugfs;
++	dev_info(dev, "dwc3-diag: mode initialized gadget=%s xhci=%s\n",
++		 dwc->gadget ? "present" : "absent",
++		 dwc->xhci ? "present" : "absent");
+ 
+ 	pm_runtime_put(dev);
+ 
+diff --git a/drivers/usb/dwc3/dwc3-qcom-legacy.c b/drivers/usb/dwc3/dwc3-qcom-legacy.c
+index d3fad0fcf..383c68872 100644
+--- a/drivers/usb/dwc3/dwc3-qcom-legacy.c
++++ b/drivers/usb/dwc3/dwc3-qcom-legacy.c
+@@ -713,6 +713,7 @@ static int dwc3_qcom_of_register_core(struct platform_device *pdev)
+ 		dev_err(dev, "failed to find dwc3 core child\n");
+ 		return -ENODEV;
+ 	}
++	dev_info(dev, "dwc3-diag: populate core child=%pOF\n", dwc3_np);
+ 
+ 	ret = of_platform_populate(np, NULL, NULL, dev);
+ 	if (ret) {
+@@ -725,6 +726,10 @@ static int dwc3_qcom_of_register_core(struct platform_device *pdev)
+ 		ret = -ENODEV;
+ 		dev_err(dev, "failed to get dwc3 platform device\n");
+ 		of_platform_depopulate(dev);
++	} else {
++		dev_info(dev, "dwc3-diag: core device=%s driver=%s\n",
++			 dev_name(&qcom->dwc3->dev),
++			 dev_driver_string(&qcom->dwc3->dev));
+ 	}
+ 
+ 	return ret;
+@@ -745,6 +750,7 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, qcom);
+ 	qcom->dev = &pdev->dev;
++	dev_info(dev, "dwc3-diag: legacy wrapper probe node=%pOF\n", np);
+ 
+ 	qcom->resets = devm_reset_control_array_get_optional_exclusive(dev);
+ 	if (IS_ERR(qcom->resets)) {
+@@ -804,6 +810,9 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 		goto depopulate;
+ 
+ 	qcom->mode = usb_get_dr_mode(&qcom->dwc3->dev);
++	dev_info(dev, "dwc3-diag: wrapper core=%s dr_mode=%d driver=%s\n",
++		 dev_name(&qcom->dwc3->dev), qcom->mode,
++		 dev_driver_string(&qcom->dwc3->dev));
+ 
+ 	/* enable vbus override for device mode */
+ 	if (qcom->mode != USB_DR_MODE_HOST)
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 050ea2b46..47ed144b1 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -4736,6 +4736,8 @@ int dwc3_gadget_init(struct dwc3 *dwc)
+ 	int irq;
+ 	struct device *dev;
+ 
++	dev_info(dwc->dev, "dwc3-diag: gadget init start num_eps=%u\n",
++		 dwc->num_eps);
+ 	irq = dwc3_gadget_get_irq(dwc);
+ 	if (irq < 0) {
+ 		ret = irq;
+@@ -4743,6 +4745,7 @@ int dwc3_gadget_init(struct dwc3 *dwc)
+ 	}
+ 
+ 	dwc->irq_gadget = irq;
++	dev_info(dwc->dev, "dwc3-diag: gadget irq=%d\n", irq);
+ 
+ 	dwc->ep0_trb = dma_alloc_coherent(dwc->sysdev,
+ 					  sizeof(*dwc->ep0_trb) * 2,
+@@ -4820,9 +4823,11 @@ int dwc3_gadget_init(struct dwc3 *dwc)
+ 
+ 	ret = usb_add_gadget(dwc->gadget);
+ 	if (ret) {
+-		dev_err(dwc->dev, "failed to add gadget\n");
++		dev_err(dwc->dev, "dwc3-diag: failed to add gadget: %d\n", ret);
+ 		goto err5;
+ 	}
++	dev_info(dwc->dev, "dwc3-diag: usb_add_gadget succeeded device=%s\n",
++		 dev_name(&dwc->gadget->dev));
+ 
+ 	if (DWC3_IP_IS(DWC32) && dwc->maximum_speed == USB_SPEED_SUPER_PLUS)
+ 		dwc3_gadget_set_ssp_rate(dwc->gadget, dwc->max_ssp_rate);
+diff --git a/drivers/usb/gadget/udc/core.c b/drivers/usb/gadget/udc/core.c
+index ab1bcc551..e7695448b 100644
+--- a/drivers/usb/gadget/udc/core.c
++++ b/drivers/usb/gadget/udc/core.c
+@@ -1460,6 +1460,9 @@ int usb_add_gadget(struct usb_gadget *gadget)
+ 				&gadget->dev.kobj, "gadget");
+ 	if (ret)
+ 		goto err_del_gadget;
++	dev_info(gadget->dev.parent,
++		 "dwc3-diag: UDC registered name=%s gadget=%s\n",
++		 dev_name(&udc->dev), dev_name(&gadget->dev));
+ 
+ 	return 0;
+ 
+@@ -1734,6 +1737,7 @@ static void gadget_unbind_driver(struct device *dev)
+ int usb_gadget_register_driver_owner(struct usb_gadget_driver *driver,
+ 		struct module *owner, const char *mod_name)
+ {
++	struct usb_udc *udc;
+ 	int ret;
+ 
+ 	if (!driver || !driver->bind || !driver->setup)
+@@ -1755,6 +1759,19 @@ int usb_gadget_register_driver_owner(struct usb_gadget_driver *driver,
+ 		if (driver->match_existing_only) {
+ 			pr_warn("%s: couldn't find an available UDC or it's busy\n",
+ 					driver->function);
++			pr_warn("%s: requested UDC %s\n", driver->function,
++				driver->udc_name ?: "<any>");
++			if (list_empty(&udc_list)) {
++				pr_warn("%s: no UDC candidates are registered\n",
++					driver->function);
++			} else {
++				list_for_each_entry(udc, &udc_list, list)
++					pr_warn("%s: candidate UDC %s, owner %s\n",
++						driver->function,
++						dev_name(&udc->dev),
++						udc->driver ?
++						udc->driver->function : "<none>");
++			}
+ 			ret = -EBUSY;
+ 		} else {
+ 			pr_info("%s: couldn't find an available UDC\n",

@@ -1,0 +1,198 @@
+From 7b801b1d72eda6b94eb91dc498a2b71e4c9f7d5a Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Wed, 23 Sep 2026 10:53:57 +0800
+Subject: [PATCH] media: venus: use a DMA buffer for SDM845 v2 encoder EOS
+
+The SDM845 v2 firmware must receive a valid DMA address for the
+encoder EOS marker. Keep that buffer alive until input-buffer completion
+or session teardown.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/media/platform/qcom/venus/core.c |  1 +
+ drivers/media/platform/qcom/venus/core.h |  9 +++
+ drivers/media/platform/qcom/venus/venc.c | 71 +++++++++++++++++++++++-
+ 3 files changed, 78 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/venus/core.c b/drivers/media/platform/qcom/venus/core.c
+index 08e1e853e..c1454f30b 100644
+--- a/drivers/media/platform/qcom/venus/core.c
++++ b/drivers/media/platform/qcom/venus/core.c
+@@ -899,6 +899,7 @@ static const struct venus_resources sdm845_res_v2 = {
+ 	.dec_nodename = "video-core0",
+ 	.enc_nodename = "video-core1",
+ 	.min_compressed_buf_size_luma = true,
++	.requires_eos_buffer = true,
+ };
+ 
+ static const struct freq_tbl sc7180_freq_table[] = {
+diff --git a/drivers/media/platform/qcom/venus/core.h b/drivers/media/platform/qcom/venus/core.h
+index f2174bb6e..e5ff90ce9 100644
+--- a/drivers/media/platform/qcom/venus/core.h
++++ b/drivers/media/platform/qcom/venus/core.h
+@@ -103,6 +103,8 @@ struct venus_resources {
+ 	const char *dec_nodename;
+ 	/* SDM845 v2 firmware needs a luma-sized compressed output buffer. */
+ 	bool min_compressed_buf_size_luma;
++	/* Some firmware requires a real DMA buffer for encoder EOS. */
++	bool requires_eos_buffer;
+ 	const struct firmware_version *min_fw;
+ };
+ 
+@@ -342,6 +344,11 @@ struct venus_buffer {
+ 	struct list_head ref_list;
+ };
+ 
++struct venus_eos_buffer {
++	void *va;
++	dma_addr_t da;
++};
++
+ struct clock_data {
+ 	u32 core_id;
+ 	unsigned long freq;
+@@ -450,6 +457,7 @@ enum venus_inst_modes {
+  * @pic_struct:		bitstream progressive vs interlaced
+  * @next_buf_last: a flag to mark next queued capture buffer as last
+  * @drain_active:	Drain sequence is in progress
++ * @eos_buf:		temporary DMA buffer used to signal encoder EOS
+  * @flags:	bitmask flags describing current instance mode
+  * @dpb_ids:	DPB buffer ID's
+  */
+@@ -521,6 +529,7 @@ struct venus_inst {
+ 	unsigned int pic_struct;
+ 	bool next_buf_last;
+ 	bool drain_active;
++	struct venus_eos_buffer *eos_buf;
+ 	enum venus_inst_modes flags;
+ 	struct ida dpb_ids;
+ };
+diff --git a/drivers/media/platform/qcom/venus/venc.c b/drivers/media/platform/qcom/venus/venc.c
+index 4c88b5d36..c957bd87c 100644
+--- a/drivers/media/platform/qcom/venus/venc.c
++++ b/drivers/media/platform/qcom/venus/venc.c
+@@ -4,6 +4,7 @@
+  * Copyright (C) 2017 Linaro Ltd.
+  */
+ #include <linux/clk.h>
++#include <linux/dma-mapping.h>
+ #include <linux/module.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/platform_device.h>
+@@ -23,6 +24,7 @@
+ #include "pm_helpers.h"
+ 
+ #define NUM_B_FRAMES_MAX	4
++#define VENUS_EOS_TAG		(~0U)
+ 
+ /*
+  * Three resons to keep MPLANE formats (despite that the number of planes
+@@ -527,6 +529,52 @@ static int venc_subscribe_event(struct v4l2_fh *fh,
+ 	}
+ }
+ 
++static void venc_free_eos_buffer(struct venus_inst *inst)
++{
++	struct venus_eos_buffer *eos;
++
++	eos = xchg(&inst->eos_buf, NULL);
++	if (!eos)
++		return;
++
++	dma_free_attrs(inst->core->dev, SZ_4K, eos->va, eos->da, 0);
++	kfree(eos);
++}
++
++static int venc_alloc_eos_buffer(struct venus_inst *inst,
++				 struct hfi_frame_data *fdata)
++{
++	struct venus_eos_buffer *eos;
++
++	if (READ_ONCE(inst->eos_buf))
++		return -EBUSY;
++
++	eos = kzalloc(sizeof(*eos), GFP_KERNEL);
++	if (!eos)
++		return -ENOMEM;
++
++	eos->va = dma_alloc_attrs(inst->core->dev, SZ_4K, &eos->da,
++				  GFP_KERNEL, 0);
++	if (!eos->va) {
++		kfree(eos);
++		return -ENOMEM;
++	}
++
++	if (upper_32_bits(eos->da)) {
++		dma_free_attrs(inst->core->dev, SZ_4K, eos->va, eos->da, 0);
++		kfree(eos);
++		return -EOVERFLOW;
++	}
++
++	WRITE_ONCE(inst->eos_buf, eos);
++	fdata->device_addr = lower_32_bits(eos->da);
++	fdata->extradata_addr = lower_32_bits(eos->da);
++	fdata->alloc_len = SZ_4K;
++	fdata->clnt_data = VENUS_EOS_TAG;
++
++	return 0;
++}
++
+ static int
+ venc_encoder_cmd(struct file *file, void *fh, struct v4l2_encoder_cmd *cmd)
+ {
+@@ -551,11 +599,20 @@ venc_encoder_cmd(struct file *file, void *fh, struct v4l2_encoder_cmd *cmd)
+ 
+ 		fdata.buffer_type = HFI_BUFFER_INPUT;
+ 		fdata.flags |= HFI_BUFFERFLAG_EOS;
+-		fdata.device_addr = 0xdeadb000;
++		if (inst->core->res->requires_eos_buffer) {
++			ret = venc_alloc_eos_buffer(inst, &fdata);
++			if (ret)
++				goto unlock;
++		} else {
++			fdata.device_addr = 0xdeadb000;
++		}
+ 
+ 		ret = hfi_session_process_buf(inst, &fdata);
+-
+-		inst->enc_state = VENUS_ENC_STATE_DRAIN;
++		if (ret) {
++			venc_free_eos_buffer(inst);
++		} else {
++			inst->enc_state = VENUS_ENC_STATE_DRAIN;
++		}
+ 	} else if (cmd->cmd == V4L2_ENC_CMD_START) {
+ 		if (inst->enc_state == VENUS_ENC_STATE_DRAIN) {
+ 			ret = -EBUSY;
+@@ -1196,6 +1253,8 @@ static void venc_release_session(struct venus_inst *inst)
+ 
+ 	mutex_unlock(&inst->lock);
+ 
++	venc_free_eos_buffer(inst);
++
+ 	venus_pm_load_scale(inst);
+ 	INIT_LIST_HEAD(&inst->registeredbufs);
+ 	venus_pm_release_core(inst);
+@@ -1359,6 +1418,11 @@ static void venc_buf_done(struct venus_inst *inst, unsigned int buf_type,
+ 
+ 	venc_pm_touch(inst);
+ 
++	if (buf_type == HFI_BUFFER_INPUT && tag == VENUS_EOS_TAG) {
++		venc_free_eos_buffer(inst);
++		return;
++	}
++
+ 	if (buf_type == HFI_BUFFER_INPUT)
+ 		type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+ 	else
+@@ -1541,6 +1605,7 @@ static int venc_close(struct file *file)
+ 
+ 	venc_pm_get(inst);
+ 	venus_close_common(inst, file);
++	venc_free_eos_buffer(inst);
+ 	inst->enc_state = VENUS_ENC_STATE_DEINIT;
+ 	venc_pm_put(inst, false);
+ 
+-- 
+2.47.3
+
