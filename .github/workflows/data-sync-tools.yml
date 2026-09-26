@@ -1,7 +1,8 @@
 name: "Data: Sync tools"
 run-name: Update Tools in Scripts by @${{ github.actor }}
 #
-# Some of our scripts download tools from a repo. These can't be bumped by dependabot, so this workflow is a self-created dependabot to bump versions of those tools to stay up-to-date.
+# Some scripts download tools from a repo. Run this workflow manually to check
+# for newer versions of tools that Dependabot cannot update.
 # This workflow only creates a PR if the version was actually updated.
 # To add a new tool, it just needs to be added to the matrix below by filling out all the variables.
 #
@@ -12,9 +13,6 @@ permissions:
 
 on:
   workflow_dispatch:
-
-  schedule:
-    - cron: "42 3 16 * *" # Run monthly on the 16th day of the month at 03:42 AM (random value as to not overload GitHub)
 
 jobs:
   update-tool-version:

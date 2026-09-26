@@ -7,11 +7,10 @@
 //
 // Used by:
 //   - maintenance-label-wip.yml   (workflow_run worker: instant, one PR)
-//   - maintenance-label-wip-sweep.yml (cron backstop: all open PRs)
+//   - maintenance-label-wip-sweep.yml (manual sweep: all open PRs)
 //
-// These run from the default branch context (workflow_run / schedule), which
-// has a read/write GITHUB_TOKEN even for fork PRs -- unlike a pull_request_review
-// trigger, whose token is read-only on forks.
+// Both use a write-capable GITHUB_TOKEN even for fork PRs, unlike a
+// pull_request_review trigger, whose token is read-only on forks.
 
 const LABEL = "Work in progress";
 

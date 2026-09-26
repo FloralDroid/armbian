@@ -1,8 +1,6 @@
 name: "Maintenance: Rewrite kernel configs"
 
 on:
-  schedule:
-    - cron: "0 0 * * MON"
   workflow_dispatch:
 
 permissions:
@@ -237,7 +235,7 @@ jobs:
             echo
             echo "### What this PR does"
             echo "- Regenerates and **synchronizes Linux kernel config fragments** across boards/families based on the prepared inventory."
-            echo "- Runs \`./compile.sh rewrite-kernel-config\` for each scheduled (family, branch) and aggregates all changes into **one PR**."
+            echo "- Runs \`./compile.sh rewrite-kernel-config\` for each inventory-derived (family, branch) and aggregates all changes into **one PR**."
             echo "- No userspace changes; only **Kconfig option** updates (enable/disable/modules/values) aligned with the targeted kernel branches."
             echo
             echo "### How it was produced"

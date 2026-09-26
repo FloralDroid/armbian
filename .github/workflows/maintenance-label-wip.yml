@@ -3,8 +3,8 @@ name: "Maintenance: Label work in progress"
 # Privileged half of the WIP-label automation. Triggered when the fork-safe
 # listener (maintenance-listen-review-wip.yml) finishes, this runs in the
 # default-branch context with a write token and syncs the "Work in progress"
-# label for the reviewed PR. A cron backstop (maintenance-label-wip-sweep.yml)
-# additionally catches conversation-resolution events, which have no trigger.
+# label for the reviewed PR. The manual sweep (maintenance-label-wip-sweep.yml)
+# can catch conversation-resolution changes, which have no trigger.
 
 on:
   workflow_run:

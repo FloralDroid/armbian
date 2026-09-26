@@ -1,15 +1,13 @@
 name: "Maintenance: Sweep work in progress labels"
 
-# Backstop for the WIP-label automation. GitHub Actions has no trigger for a
-# review conversation being resolved/unresolved, so the event-driven worker
-# (maintenance-label-wip.yml) cannot react to that on its own. This scheduled
-# sweep recomputes the "Work in progress" label for every open PR, catching
-# conversation resolution and any missed events. Runs from the default branch,
-# so its GITHUB_TOKEN has write access. Tune the cron for more/less latency.
+# Manual backstop for the WIP-label automation. GitHub Actions has no trigger
+# for a review conversation being resolved/unresolved, so the event-driven
+# worker (maintenance-label-wip.yml) cannot react to that on its own. Run this
+# sweep to recompute the "Work in progress" label for every open PR after
+# conversation resolution or missed events. It checks out the default branch
+# and has a write-capable GITHUB_TOKEN.
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 permissions:
