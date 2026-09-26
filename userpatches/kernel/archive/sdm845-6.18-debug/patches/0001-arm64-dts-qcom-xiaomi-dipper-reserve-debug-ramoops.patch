@@ -1,20 +1,22 @@
-From 65166474f19dffb28d09bfcfe93c8a44f9cb552e Mon Sep 17 00:00:00 2001
+From 56a877cbfd53b3fb83c042dd89d1e90798bc406f Mon Sep 17 00:00:00 2001
 From: 5656565566 <contact@home56.top>
-Date: Thu, 24 Sep 2026 17:54:48 +0800
+Date: Sat, 26 Sep 2026 21:17:26 +0800
 Subject: [PATCH] arm64: dts: qcom: xiaomi-dipper: reserve debug ramoops memory
 
 Reserve a debug-only 4 MiB region for persistent panic records and console output. The 0xb0000000 candidate was present in Max Furman's original Dipper device-tree patch, but production dropped it because warm-reset retention was not verified. Keep production unchanged and require a controlled-panic test before trusting saved records.
 
+Enable 16-byte ECC to improve integrity after captured warm-reset records showed bit corruption.
+
 Signed-off-by: 5656565566 <contact@home56.top>
 ---
- arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts | 8 ++++++++
- 1 file changed, 8 insertions(+)
+ arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts | 9 +++++++++
+ 1 file changed, 9 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
-index f75ecc681..8a85a9cee 100644
+index f75ecc681..9e0802215 100644
 --- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
 +++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
-@@ -246,6 +246,14 @@ removed_region: memory@88f00000 {
+@@ -246,6 +246,15 @@ removed_region: memory@88f00000 {
  			no-map;
  		};
  
@@ -24,6 +26,7 @@ index f75ecc681..8a85a9cee 100644
 +			reg = <0 0xb0000000 0 0x400000>;
 +			record-size = <0x40000>;
 +			console-size = <0x100000>;
++			ecc-size = <16>;
 +		};
 +
  	};
