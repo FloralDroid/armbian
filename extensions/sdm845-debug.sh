@@ -53,8 +53,7 @@ function custom_kernel_config__sdm845_debug() {
 }
 
 function post_customize_image__sdm845_debug_capture() {
-	install -d -m 755 "${SDCARD}/etc/sysctl.d" "${SDCARD}/etc/systemd/system.conf.d" \
-		"${SDCARD}/etc/systemd/system/multi-user.target.wants"
+	install -d -m 755 "${SDCARD}/etc/sysctl.d" "${SDCARD}/etc/systemd/system.conf.d"
 
 	cat > "${SDCARD}/etc/sysctl.d/90-sdm845-debug-panic.conf" <<'EOF'
 kernel.watchdog = 1
@@ -71,20 +70,7 @@ EOF
 	cat > "${SDCARD}/etc/systemd/system.conf.d/90-sdm845-debug-watchdog.conf" <<'EOF'
 [Manager]
 RuntimeWatchdogSec=30s
+RuntimeWatchdogPreSec=10s
+RuntimeWatchdogPreGovernor=panic
 EOF
-
-	cat > "${SDCARD}/etc/systemd/system/sdm845-debug-watchdog.service" <<'EOF'
-[Unit]
-Description=Configure SDM845 debug watchdog pretimeout
-ConditionPathExists=/sys/class/watchdog/watchdog0/pretimeout
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -ec 'echo panic > /sys/class/watchdog/watchdog0/pretimeout_governor; echo 10 > /sys/class/watchdog/watchdog0/pretimeout'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-	ln -s ../sdm845-debug-watchdog.service \
-		"${SDCARD}/etc/systemd/system/multi-user.target.wants/sdm845-debug-watchdog.service"
 }
