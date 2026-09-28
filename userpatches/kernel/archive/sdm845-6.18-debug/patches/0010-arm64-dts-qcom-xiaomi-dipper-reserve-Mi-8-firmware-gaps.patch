@@ -1,0 +1,55 @@
+From 2f9a5bcd5cc9b83d6da3c03e472350da60798593 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Tue, 29 Sep 2026 00:20:54 +0800
+Subject: [PATCH] arm64: dts: qcom: xiaomi-dipper: reserve Mi 8 firmware gaps
+
+The MiCode Dipper Pie and Q device trees reserve XBL at 0x85d00000-0x85efffff and a removed region at 0x85fc0000-0x8a8fffff. The current Dipper tree leaves three gaps in those ranges; the live /proc/iomem reports all three as System RAM. Restore the generic TZ reservation and reserve the missing XBL and upper removed-region gaps.
+
+Keep this in the debug patch series while testing whether excluding these 70 MiB changes the repeatable 3500 MiB memory stress hang. The memory map mismatch is established, but access to these PFNs during the hang has not been observed.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
+index fdc5296ab..dc4116589 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
+@@ -31,7 +31,6 @@
+ #include "pm8998.dtsi"
+ #include "pmi8998.dtsi"
+ 
+-/delete-node/ &tz_mem;
+ /delete-node/ &adsp_mem;
+ /delete-node/ &wlan_msa_mem;
+ /delete-node/ &mpss_region;
+@@ -182,6 +181,12 @@ cam_rear_dvdd: cam-rear-dvdd-regulator {
+ 	};
+ 
+ 	reserved-memory {
++		/* Mi 8 Pie/Q firmware reserves the MiB before the generic XBL region. */
++		xbl-mem@85d00000 {
++			reg = <0 0x85d00000 0 0x100000>;
++			no-map;
++		};
++
+ 		linux,cma {
+ 			compatible = "shared-dma-pool";
+ 			alloc-ranges = <0 0x00000000 0 0xffffffff>;
+@@ -246,6 +251,12 @@ removed_region: memory@88f00000 {
+ 			no-map;
+ 		};
+ 
++		/* Complete the Mi 8 firmware's removed region through 0x8a8fffff. */
++		memory@89100000 {
++			reg = <0 0x89100000 0 0x1800000>;
++			no-map;
++		};
++
+ 		/* Debug-only: verify this region survives a warm reset before relying on it. */
+ 		ramoops: ramoops@b0000000 {
+ 			compatible = "ramoops";
+-- 
+2.47.3
+
