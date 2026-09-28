@@ -1,0 +1,76 @@
+From 677e7b386c999c8f1e276cdecdf62ccb9188ba44 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Mon, 28 Sep 2026 09:49:18 +0800
+Subject: [PATCH 6/9] drm/msm: mdss: add SDM845 mdp1 bandwidth experiment
+
+An SDM845 OnePlus 6T report associates MDSS runtime suspend with a hang when the mdp1-mem interconnect vote drops to zero. Leave the existing vote unchanged by default, and provide an SDM845-only switch to retain a minimal peak vote of one for A/B testing.
+
+Log each suspend stage and interconnect return value so a persistent console record can show how far the operation progressed. This does not establish the cause on Xiaomi Dipper.
+
+Link: https://lore-kernel.gnuweeb.org/phone-devel/20260627-rfc-sdm845-interconnect-collapse-workaround-v1-1-608a38de3715%40samcday.com/
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/gpu/drm/msm/msm_mdss.c | 32 +++++++++++++++++++++++++++-----
+ 1 file changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_mdss.c b/drivers/gpu/drm/msm/msm_mdss.c
+index 4dbb1b1d8..5b30e5af4 100644
+--- a/drivers/gpu/drm/msm/msm_mdss.c
++++ b/drivers/gpu/drm/msm/msm_mdss.c
+@@ -11,6 +11,7 @@
+ #include <linux/irqchip.h>
+ #include <linux/irqdesc.h>
+ #include <linux/irqchip/chained_irq.h>
++#include <linux/moduleparam.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+@@ -24,6 +25,11 @@
+ 
+ #define MIN_IB_BW	400000000UL /* Min ib vote 400MB */
+ 
++static bool sdm845_mdp1_keep_bw;
++module_param_named(sdm845_mdp1_keep_bw, sdm845_mdp1_keep_bw, bool, 0600);
++MODULE_PARM_DESC(sdm845_mdp1_keep_bw,
++		 "Keep a minimal SDM845 mdp1-mem vote during MDSS suspend (debug experiment)");
++
+ struct msm_mdss_data {
+ 	u32 reg_bus_bw;
+ };
+@@ -311,12 +317,28 @@ static int msm_mdss_enable(struct msm_mdss *msm_mdss)
+ 
+ static int msm_mdss_disable(struct msm_mdss *msm_mdss)
+ {
+-	int i;
+-
++	bool sdm845 = of_device_is_compatible(msm_mdss->dev->of_node,
++						"qcom,sdm845-mdss");
++	bool keep_bw = sdm845 && READ_ONCE(sdm845_mdp1_keep_bw);
++	int i, ret;
++	u32 peak;
++
++	if (sdm845)
++		dev_info(msm_mdss->dev, "disable begin; mdp1 keep_bw=%u\n", keep_bw);
+ 	clk_bulk_disable_unprepare(msm_mdss->num_clocks, msm_mdss->clocks);
+-
+-	for (i = 0; i < msm_mdss->num_mdp_paths; i++)
+-		icc_set_bw(msm_mdss->mdp_path[i], 0, 0);
++	if (sdm845)
++		dev_info(msm_mdss->dev, "clocks disabled\n");
++
++	for (i = 0; i < msm_mdss->num_mdp_paths; i++) {
++		peak = keep_bw && i == 1 ? 1 : 0;
++		if (sdm845)
++			dev_info(msm_mdss->dev, "mdp%d-mem vote begin peak=%u\n",
++				 i, peak);
++		ret = icc_set_bw(msm_mdss->mdp_path[i], 0, peak);
++		if (sdm845)
++			dev_info(msm_mdss->dev, "mdp%d-mem vote done ret=%d\n",
++				 i, ret);
++	}
+ 
+ 	if (msm_mdss->reg_bus_path)
+ 		icc_set_bw(msm_mdss->reg_bus_path, 0, 0);
+-- 
+2.47.3
+

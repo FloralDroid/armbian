@@ -1,0 +1,85 @@
+From 67b85a65f35bf3f3b9d8045bed3e4ddc019544aa Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Mon, 28 Sep 2026 09:48:25 +0800
+Subject: [PATCH 5/9] clk: qcom: sdm845: add MMNOC TBU collapse experiment
+
+Qualcomm reports that changing the SW collapse bits of three SDM845 MMNOC TBU GDSCs can hang the board. Keep the existing behavior by default and expose a debug-only switch that skips future writes to those bits. Limit the switch to SDM845 because the descriptors are shared with SDM670.
+
+This is an A/B experiment, not a confirmed fix. Enabling it after probe cannot undo earlier register writes.
+
+Link: https://lore-kernel.gnuweeb.org/linux-clk/20241205222156.1880299-1-quic_c_gdjako%40quicinc.com/
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/clk/qcom/gcc-sdm845.c | 16 ++++++++++++++++
+ drivers/clk/qcom/gdsc.c       |  8 ++++++++
+ drivers/clk/qcom/gdsc.h       |  1 +
+ 3 files changed, 25 insertions(+)
+
+diff --git a/drivers/clk/qcom/gcc-sdm845.c b/drivers/clk/qcom/gcc-sdm845.c
+index 6d0f9cede..eb1017f4d 100644
+--- a/drivers/clk/qcom/gcc-sdm845.c
++++ b/drivers/clk/qcom/gcc-sdm845.c
+@@ -24,6 +24,11 @@
+ #include "gdsc.h"
+ #include "reset.h"
+ 
++static bool sdm845_mmnoc_skip_collapse;
++module_param_named(mmnoc_skip_collapse, sdm845_mmnoc_skip_collapse, bool, 0600);
++MODULE_PARM_DESC(mmnoc_skip_collapse,
++		 "Skip SDM845 MMNOC TBU GDSC SW collapse writes (debug experiment)");
++
+ enum {
+ 	P_BI_TCXO,
+ 	P_AUD_REF_CLK,
+@@ -4006,6 +4011,17 @@ static int gcc_sdm845_probe(struct platform_device *pdev)
+ 		return ret;
+ 
+ 	gcc_desc = of_device_get_match_data(&pdev->dev);
++	if (gcc_desc == &gcc_sdm845_desc) {
++		/* The GDSC descriptors are also shared with SDM670. */
++		hlos1_vote_mmnoc_mmu_tbu_hf0_gdsc.skip_set_collapse =
++			&sdm845_mmnoc_skip_collapse;
++		hlos1_vote_mmnoc_mmu_tbu_hf1_gdsc.skip_set_collapse =
++			&sdm845_mmnoc_skip_collapse;
++		hlos1_vote_mmnoc_mmu_tbu_sf_gdsc.skip_set_collapse =
++			&sdm845_mmnoc_skip_collapse;
++		dev_info(&pdev->dev, "MMNOC TBU GDSC collapse skip=%u\n",
++			 sdm845_mmnoc_skip_collapse);
++	}
+ 	return qcom_cc_really_probe(&pdev->dev, gcc_desc, regmap);
+ }
+ 
+diff --git a/drivers/clk/qcom/gdsc.c b/drivers/clk/qcom/gdsc.c
+index 71826ccbd..9bb7c58a1 100644
+--- a/drivers/clk/qcom/gdsc.c
++++ b/drivers/clk/qcom/gdsc.c
+@@ -128,6 +128,14 @@ static int gdsc_update_collapse_bit(struct gdsc *sc, bool val)
+ 	u32 reg, mask;
+ 	int ret;
+ 
++	if (sc->skip_set_collapse) {
++		bool skip = READ_ONCE(*sc->skip_set_collapse);
++
++		pr_debug("%s: collapse=%u skip=%u\n", sc->pd.name, val, skip);
++		if (skip)
++			return 0;
++	}
++
+ 	if (sc->collapse_mask) {
+ 		reg = sc->collapse_ctrl;
+ 		mask = sc->collapse_mask;
+diff --git a/drivers/clk/qcom/gdsc.h b/drivers/clk/qcom/gdsc.h
+index dd843e86c..82e71958f 100644
+--- a/drivers/clk/qcom/gdsc.h
++++ b/drivers/clk/qcom/gdsc.h
+@@ -68,6 +68,7 @@ struct gdsc {
+ #define RETAIN_FF_ENABLE	BIT(7)
+ #define NO_RET_PERIPH	BIT(8)
+ #define HW_CTRL_TRIGGER	BIT(9)
++	bool				*skip_set_collapse;
+ 	struct reset_controller_dev	*rcdev;
+ 	unsigned int			*resets;
+ 	unsigned int			reset_count;
+-- 
+2.47.3
+

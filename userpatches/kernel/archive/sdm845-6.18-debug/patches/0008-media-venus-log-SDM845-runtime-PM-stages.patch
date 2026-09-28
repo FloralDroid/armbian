@@ -1,0 +1,107 @@
+From bcd4fc24b5aa8aeda18540af1401b8a5a6a7a993 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Mon, 28 Sep 2026 09:50:25 +0800
+Subject: [PATCH 8/9] media: venus: log SDM845 runtime PM stages
+
+The SDM845 Venus runtime PM paths power down the core and change cpu-cfg and video-mem interconnect votes. Print stage entry and return values for the HFI, power and ICC operations so pstore console can distinguish a completed transition from the last operation attempted before a hang.
+
+Restrict the added messages to SDM845 Venus compatibles. This is diagnostic logging and does not change power sequencing.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/media/platform/qcom/venus/core.c | 39 +++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/qcom/venus/core.c b/drivers/media/platform/qcom/venus/core.c
+index c1454f30b..a7a09acf7 100644
+--- a/drivers/media/platform/qcom/venus/core.c
++++ b/drivers/media/platform/qcom/venus/core.c
+@@ -578,23 +578,41 @@ static __maybe_unused int venus_runtime_suspend(struct device *dev)
+ {
+ 	struct venus_core *core = dev_get_drvdata(dev);
+ 	const struct venus_pm_ops *pm_ops = core->pm_ops;
++	bool trace = of_device_is_compatible(dev->of_node, "qcom,sdm845-venus") ||
++		     of_device_is_compatible(dev->of_node, "qcom,sdm845-venus-v2");
+ 	int ret;
+ 
++	if (trace)
++		dev_info(dev, "runtime suspend: HFI begin\n");
+ 	ret = hfi_core_suspend(core);
++	if (trace)
++		dev_info(dev, "runtime suspend: HFI ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (pm_ops->core_power) {
++		if (trace)
++			dev_info(dev, "runtime suspend: core power off begin\n");
+ 		ret = pm_ops->core_power(core, POWER_OFF);
++		if (trace)
++			dev_info(dev, "runtime suspend: core power off ret=%d\n", ret);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
++	if (trace)
++		dev_info(dev, "runtime suspend: cpu-cfg vote 0 begin\n");
+ 	ret = icc_set_bw(core->cpucfg_path, 0, 0);
++	if (trace)
++		dev_info(dev, "runtime suspend: cpu-cfg vote 0 ret=%d\n", ret);
+ 	if (ret)
+ 		goto err_cpucfg_path;
+ 
++	if (trace)
++		dev_info(dev, "runtime suspend: video-mem vote 0 begin\n");
+ 	ret = icc_set_bw(core->video_path, 0, 0);
++	if (trace)
++		dev_info(dev, "runtime suspend: video-mem vote 0 ret=%d\n", ret);
+ 	if (ret)
+ 		goto err_video_path;
+ 
+@@ -633,23 +651,42 @@ static __maybe_unused int venus_runtime_resume(struct device *dev)
+ {
+ 	struct venus_core *core = dev_get_drvdata(dev);
+ 	const struct venus_pm_ops *pm_ops = core->pm_ops;
++	bool trace = of_device_is_compatible(dev->of_node, "qcom,sdm845-venus") ||
++		     of_device_is_compatible(dev->of_node, "qcom,sdm845-venus-v2");
+ 	int ret;
+ 
++	if (trace)
++		dev_info(dev, "runtime resume: video-mem vote begin\n");
+ 	ret = icc_set_bw(core->video_path, kbps_to_icc(20000), 0);
++	if (trace)
++		dev_info(dev, "runtime resume: video-mem vote ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
++	if (trace)
++		dev_info(dev, "runtime resume: cpu-cfg vote begin\n");
+ 	ret = icc_set_bw(core->cpucfg_path, kbps_to_icc(1000), 0);
++	if (trace)
++		dev_info(dev, "runtime resume: cpu-cfg vote ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (pm_ops->core_power) {
++		if (trace)
++			dev_info(dev, "runtime resume: core power on begin\n");
+ 		ret = pm_ops->core_power(core, POWER_ON);
++		if (trace)
++			dev_info(dev, "runtime resume: core power on ret=%d\n", ret);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
+-	return hfi_core_resume(core, false);
++	if (trace)
++		dev_info(dev, "runtime resume: HFI begin\n");
++	ret = hfi_core_resume(core, false);
++	if (trace)
++		dev_info(dev, "runtime resume: HFI ret=%d\n", ret);
++	return ret;
+ }
+ 
+ static const struct dev_pm_ops venus_pm_ops = {
+-- 
+2.47.3
+

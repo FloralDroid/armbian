@@ -1,0 +1,76 @@
+From 88bf3f66e7d55afb7142beeeb037a2677664337c Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Mon, 28 Sep 2026 09:49:58 +0800
+Subject: [PATCH 7/9] interconnect: qcom: sdm845: add MM3 keepalive experiment
+
+The SDM845 MM3 BCM includes Venus masters but is not marked keepalive. Provide a default-off debug switch to retain its minimum vote on the next ICC aggregation. Use single-copy accesses because the switch can change while aggregation runs.
+
+There is no upstream evidence that the existing MM3 value is wrong. This switch is only an A/B diagnostic and does not issue an immediate vote when written.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/interconnect/qcom/bcm-voter.c |  4 ++--
+ drivers/interconnect/qcom/sdm845.c    | 25 +++++++++++++++++++++++++
+ 2 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/interconnect/qcom/bcm-voter.c b/drivers/interconnect/qcom/bcm-voter.c
+index a2d437a05..e1c709def 100644
+--- a/drivers/interconnect/qcom/bcm-voter.c
++++ b/drivers/interconnect/qcom/bcm-voter.c
+@@ -80,7 +80,7 @@ static void bcm_aggregate_mask(struct qcom_icc_bcm *bcm)
+ 		}
+ 	}
+ 
+-	if (bcm->keepalive) {
++	if (READ_ONCE(bcm->keepalive)) {
+ 		bcm->vote_x[QCOM_ICC_BUCKET_AMC] = bcm->enable_mask;
+ 		bcm->vote_x[QCOM_ICC_BUCKET_WAKE] = bcm->enable_mask;
+ 		bcm->vote_y[QCOM_ICC_BUCKET_AMC] = bcm->enable_mask;
+@@ -115,7 +115,7 @@ static void bcm_aggregate(struct qcom_icc_bcm *bcm)
+ 		bcm->vote_y[bucket] = bcm_div(temp, bcm->aux_data.unit);
+ 	}
+ 
+-	if (bcm->keepalive && bcm->vote_x[QCOM_ICC_BUCKET_AMC] == 0 &&
++	if (READ_ONCE(bcm->keepalive) && bcm->vote_x[QCOM_ICC_BUCKET_AMC] == 0 &&
+ 	    bcm->vote_y[QCOM_ICC_BUCKET_AMC] == 0) {
+ 		bcm->vote_x[QCOM_ICC_BUCKET_AMC] = 1;
+ 		bcm->vote_x[QCOM_ICC_BUCKET_WAKE] = 1;
+diff --git a/drivers/interconnect/qcom/sdm845.c b/drivers/interconnect/qcom/sdm845.c
+index 855802be9..085895e1f 100644
+--- a/drivers/interconnect/qcom/sdm845.c
++++ b/drivers/interconnect/qcom/sdm845.c
+@@ -1341,6 +1341,31 @@ static struct qcom_icc_bcm bcm_mm3 = {
+ 	.nodes = { &qxm_camnoc_sf, &qxm_rot, &qxm_venus0, &qxm_venus1, &qxm_venus_arm9 },
+ };
+ 
++static int sdm845_mm3_keepalive_set(const char *val, const struct kernel_param *kp)
++{
++	bool enable;
++	int ret;
++
++	ret = kstrtobool(val, &enable);
++	if (ret)
++		return ret;
++
++	/* The next ICC aggregation applies this vote to hardware. */
++	WRITE_ONCE(*(bool *)kp->arg, enable);
++	pr_info("SDM845 MM3 keepalive=%u\n", enable);
++	return 0;
++}
++
++static const struct kernel_param_ops sdm845_mm3_keepalive_ops = {
++	.set = sdm845_mm3_keepalive_set,
++	.get = param_get_bool,
++};
++
++module_param_cb(mm3_keepalive, &sdm845_mm3_keepalive_ops,
++		&bcm_mm3.keepalive, 0600);
++MODULE_PARM_DESC(mm3_keepalive,
++		 "Keep SDM845 MM3 BCM voted on (debug experiment)");
++
+ static struct qcom_icc_bcm bcm_sh5 = {
+ 	.name = "SH5",
+ 	.keepalive = false,
+-- 
+2.47.3
+

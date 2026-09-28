@@ -1,0 +1,41 @@
+From c607b2a3ab452c7f7c71fbc18b3001c46c5a2190 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Sun, 27 Sep 2026 18:19:29 +0800
+Subject: [PATCH] pstore: ftrace: exclude ECC notice from record alignment
+
+The pstore inode includes the ECC notice in total_size. Using that size to align ftrace records shifts every entry when the notice length is not a multiple of the record size, and can decode the notice itself as trace data. Align and bound the sequence using the trace data size instead.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ fs/pstore/inode.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/fs/pstore/inode.c b/fs/pstore/inode.c
+index b4e55c90f..80ce20b9e 100644
+--- a/fs/pstore/inode.c
++++ b/fs/pstore/inode.c
+@@ -74,9 +74,10 @@ static void *pstore_ftrace_seq_start(struct seq_file *s, loff_t *pos)
+ 	if (!data)
+ 		return NULL;
+ 
+-	data->off = ps->total_size % REC_SIZE;
++	/* The appended ECC notice is not part of the ftrace record stream. */
++	data->off = ps->record->size % REC_SIZE;
+ 	data->off += *pos * REC_SIZE;
+-	if (data->off + REC_SIZE > ps->total_size)
++	if (data->off + REC_SIZE > ps->record->size)
+ 		return NULL;
+ 
+ 	return_ptr(data);
+@@ -94,7 +95,7 @@ static void *pstore_ftrace_seq_next(struct seq_file *s, void *v, loff_t *pos)
+ 
+ 	(*pos)++;
+ 	data->off += REC_SIZE;
+-	if (data->off + REC_SIZE > ps->total_size)
++	if (data->off + REC_SIZE > ps->record->size)
+ 		return NULL;
+ 
+ 	return data;
+-- 
+2.47.3
+

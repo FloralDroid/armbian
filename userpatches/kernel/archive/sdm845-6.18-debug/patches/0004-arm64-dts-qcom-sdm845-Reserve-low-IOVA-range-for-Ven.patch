@@ -1,0 +1,58 @@
+From 1cb0813006b33eaab5a0bbdb49caae3bb738945f Mon Sep 17 00:00:00 2001
+From: Vikash Garodia <vikash.garodia@oss.qualcomm.com>
+Date: Fri, 7 Aug 2026 13:55:03 +0530
+Subject: [PATCH 4/9] arm64: dts: qcom: sdm845: Reserve low IOVA range for
+ Venus
+
+Venus VPU reserves IOVA addresses below 0x25800000 (600MB), primarily for
+secure non-pixel buffers. DMA into that range, from any other stream id
+would triggers unhandled SMMU page faults that cause spontaneous device
+reboots. This is readily reproduced with one or more browser tabs
+driving multiple concurrent video decode streams.
+
+Add a reserved-memory IOVA reservation node covering [0, 0x25800000]
+and reference it from the venus node so the IOMMU layer keeps DMA
+allocations above that boundary.
+
+Fixes: 36a80df44b6f ("arm64: dts: sdm845: Add video nodes")
+Cc: stable@vger.kernel.org
+Link: https://lore-kernel.gnuweeb.org/linux-media/20260807-iris_iova_600mb_fix-v1-19-3996f67e33f9%40oss.qualcomm.com/
+Signed-off-by: Vikash Garodia <vikash.garodia@oss.qualcomm.com>
+---
+ arch/arm64/boot/dts/qcom/sdm845.dtsi | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845.dtsi b/arch/arm64/boot/dts/qcom/sdm845.dtsi
+index 2d8c198f5..0a7decee1 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845.dtsi
+@@ -897,6 +897,17 @@ fastrpc_mem: fastrpc {
+ 			size = <0x0 0x1000000>;
+ 			reusable;
+ 		};
++
++		/*
++		 * The Venus VPU reserves IOVA below 0x25800000 (600MB),
++		 * primarily for non-pixel buffers using different Stream IDs.
++		 * DMA into that range triggers unhandled SMMU faults and
++		 * spontaneous reboots, so reserve it to keep IOMMU
++		 * allocations above this boundary.
++		 */
++		venus_iova: venus-iova {
++			iommu-addresses = <&venus 0x0 0x0 0x0 0x25800000>;
++		};
+ 	};
+ 
+ 	adsp_pas: remoteproc-adsp {
+@@ -4310,7 +4321,7 @@ venus: video-codec@aa00000 {
+ 				      "vcodec1_core", "vcodec1_bus";
+ 			iommus = <&apps_smmu 0x10a0 0x8>,
+ 				 <&apps_smmu 0x10b0 0x0>;
+-			memory-region = <&venus_mem>;
++			memory-region = <&venus_mem>, <&venus_iova>;
+ 			interconnects = <&mmss_noc MASTER_VIDEO_P0 0 &mem_noc SLAVE_EBI1 0>,
+ 					<&gladiator_noc MASTER_APPSS_PROC 0 &config_noc SLAVE_VENUS_CFG 0>;
+ 			interconnect-names = "video-mem", "cpu-cfg";
+-- 
+2.47.3
+
