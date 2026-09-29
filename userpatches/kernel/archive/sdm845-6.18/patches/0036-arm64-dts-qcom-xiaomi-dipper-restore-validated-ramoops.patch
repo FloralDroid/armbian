@@ -1,0 +1,36 @@
+From bcbde2a08de0b53adcf7a1aea6e437c98937829e Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Tue, 29 Sep 2026 10:42:10 +0800
+Subject: [PATCH] arm64: dts: qcom: xiaomi-dipper: restore validated ramoops
+
+Controlled panics and watchdog resets on the tested Mi 8 retained records in the 4 MiB region at 0xb0000000. Restore a production layout limited to dmesg and console records, with 16-byte ECC for the observed warm-reset bit errors.
+
+Do not reserve pmsg or persistent ftrace areas; those remain debug-only because persistent function tracing adds continuous runtime overhead.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
+index acdb930e1..8e054fd87 100644
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-dipper.dts
+@@ -257,6 +257,14 @@ memory@89100000 {
+ 			no-map;
+ 		};
+ 
++		ramoops: ramoops@b0000000 {
++			compatible = "ramoops";
++			reg = <0 0xb0000000 0 0x400000>;
++			record-size = <0x40000>;
++			console-size = <0x100000>;
++			ecc-size = <16>;
++		};
++
+ 	};
+ 
+ 	vph_pwr: vph-pwr-regulator {
+-- 
+2.47.3
+

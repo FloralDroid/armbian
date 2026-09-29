@@ -32,6 +32,24 @@ function custom_kernel_config__xiaomi_dipper_drivers() {
 	)
 }
 
+function post_customize_image__xiaomi_dipper_recovery() {
+	install -d -m 755 "${SDCARD}/etc/sysctl.d" "${SDCARD}/etc/systemd/system.conf.d"
+
+	cat > "${SDCARD}/etc/sysctl.d/90-xiaomi-dipper-recovery.conf" <<'EOF'
+kernel.panic_on_rcu_stall = 1
+kernel.panic_on_oops = 1
+kernel.panic_on_warn = 0
+kernel.panic = 1
+EOF
+
+	cat > "${SDCARD}/etc/systemd/system.conf.d/90-xiaomi-dipper-watchdog.conf" <<'EOF'
+[Manager]
+RuntimeWatchdogSec=30s
+RuntimeWatchdogPreSec=10s
+RuntimeWatchdogPreGovernor=panic
+EOF
+}
+
 # Use distribution firmware packages; proprietary device extraction stays outside Git.
 declare -g BOARD_FIRMWARE_INSTALL="-full"
 
