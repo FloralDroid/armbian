@@ -50,6 +50,44 @@ RuntimeWatchdogPreGovernor=panic
 EOF
 }
 
+function post_customize_image__xiaomi_dipper_memory() {
+	install -d -m 755 "${SDCARD}/etc/sysctl.d" "${SDCARD}/etc/systemd/system"
+
+	cat > "${SDCARD}/etc/sysctl.d/90-xiaomi-dipper-memory.conf" <<'EOF'
+vm.page-cluster = 0
+EOF
+
+	# procps reads sysctl.conf after drop-ins.
+	sed -i 's/^[[:space:]]*vm\.page-cluster[[:space:]]*=.*/vm.page-cluster=0/' \
+		"${SDCARD}/etc/sysctl.conf"
+
+	cat > "${SDCARD}/etc/systemd/system/ksm.service" <<'EOF'
+[Unit]
+Description=KSM configuration
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '\
+  K=/sys/kernel/mm/ksm; \
+  echo 0 > $$K/run; \
+  echo none > $$K/advisor_mode; \
+  echo 200 > $$K/pages_to_scan; \
+  echo 20 > $$K/sleep_millisecs; \
+  echo 1 > $$K/smart_scan; \
+  echo 0 > $$K/use_zero_pages; \
+  echo 1 > $$K/run'
+
+ExecStop=/bin/sh -c 'echo 0 > /sys/kernel/mm/ksm/run'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+	chroot_sdcard systemctl --no-reload enable ksm.service
+}
+
 # Use distribution firmware packages; proprietary device extraction stays outside Git.
 declare -g BOARD_FIRMWARE_INSTALL="-full"
 
