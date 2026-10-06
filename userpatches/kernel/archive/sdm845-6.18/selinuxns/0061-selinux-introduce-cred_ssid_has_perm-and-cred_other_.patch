@@ -1,0 +1,259 @@
+From 6576c6f5e116725c54c49f306133bed06fb787f8 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Fri, 27 Sep 2024 10:38:49 -0400
+Subject: [PATCH 61/90] selinux: introduce cred_ssid_has_perm() and
+ cred_other_has_perm()
+
+Introduce cred_ssid_has_perm() for checking permissions between
+a fixed (source SID, target SID) pair against the current SELinux
+namespace and all ancestors. This helper is appropriate for
+checks between two object SIDs, but should NOT be used
+when dealing with task/cred objects.
+
+Introduce cred_other_has_perm() for checking permissions between
+two creds against the current SELinux namespace and all
+ancestors.
+
+Convert permission checks of these two forms in the hook functions
+to use these new namespace-aware helpers.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 62bb6dc9430d783475dd00b0efda8e67280cb838
+---
+ security/selinux/avc.c         | 62 ++++++++++++++++++++++++++++++++++
+ security/selinux/hooks.c       | 61 +++++++++++++--------------------
+ security/selinux/include/avc.h |  7 ++++
+ 3 files changed, 93 insertions(+), 37 deletions(-)
+
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index a0f72635191c4a5948a5d7540482bce764e9db3e..6d6bfce444acec1cad0ec6a6e54fdf1b13bfe1f1 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -1416,6 +1416,68 @@ int cred_has_perm_noaudit(const struct cred *cred, u32 tsid, u16 tclass,
+ 	return 0;
+ }
+ 
++int cred_ssid_has_perm(const struct cred *cred, u32 ssid, u32 tsid, u16 tclass,
++		       u32 requested, struct common_audit_data *ad)
++{
++	struct cred_security_struct *crsec;
++	struct selinux_state *state;
++	int rc;
++
++	do {
++		crsec = selinux_cred(cred);
++		state = crsec->state;
++		rc = avc_has_perm(state, ssid, tsid, tclass, requested, ad);
++		if (rc)
++			return rc;
++
++		cred = crsec->parent_cred;
++	} while (cred);
++
++	return 0;
++}
++
++static u32 cred_sid_for_state(const struct cred *cred,
++			      const struct selinux_state *state)
++{
++	const struct cred_security_struct *crsec;
++	u32 sid;
++
++	crsec = selinux_cred(cred);
++	while (crsec->state != state && crsec->parent_cred)
++		crsec = selinux_cred(crsec->parent_cred);
++	if (crsec->state == state)
++		sid = crsec->sid;
++	else
++		sid = SECINITSID_UNLABELED;
++	return sid;
++}
++
++int cred_other_has_perm(const struct cred *cred, const struct cred *other,
++			u16 tclass, u32 requested,
++			struct common_audit_data *ad)
++{
++	struct cred_security_struct *crsec;
++	struct selinux_state *state;
++	u32 ssid;
++	u32 tsid;
++	int rc;
++
++	do {
++		crsec = selinux_cred(cred);
++		ssid = crsec->sid;
++		state = crsec->state;
++		tsid = cred_sid_for_state(other, state);
++
++		rc = avc_has_perm(state, ssid, tsid, tclass, requested, ad);
++		if (rc)
++			return rc;
++
++		cred = crsec->parent_cred;
++	} while (cred);
++
++	return 0;
++}
++
+ u32 avc_policy_seqno(struct selinux_state *state)
+ {
+ 	return state->avc->avc_cache.latest_notif;
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index c6406a1ee42edb35170ded4d771428e4df7906c5..e649f044c5c38153f8fe56c75dbb5db4c8f81cce 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -469,9 +469,8 @@ static int may_context_mount_inode_relabel(u32 sid,
+ 	if (rc)
+ 		return rc;
+ 
+-	return avc_has_perm(cred_selinux_state(cred),
+-			    sid, sbsec->sid, SECCLASS_FILESYSTEM,
+-			    FILESYSTEM__ASSOCIATE, NULL);
++	return cred_ssid_has_perm(cred, sid, sbsec->sid, SECCLASS_FILESYSTEM,
++				  FILESYSTEM__ASSOCIATE, NULL);
+ }
+ 
+ static int selinux_is_genfs_special_handling(struct super_block *sb)
+@@ -1887,10 +1886,9 @@ static int may_create(struct inode *dir,
+ 	if (rc)
+ 		return rc;
+ 
+-	return avc_has_perm(current_selinux_state,
+-			    newsid, sbsec->sid,
+-			    SECCLASS_FILESYSTEM,
+-			    FILESYSTEM__ASSOCIATE, &ad);
++	return cred_ssid_has_perm(cred, newsid, sbsec->sid,
++				  SECCLASS_FILESYSTEM, FILESYSTEM__ASSOCIATE,
++				  &ad);
+ }
+ 
+ #define MAY_LINK	0
+@@ -2079,9 +2077,8 @@ static inline u32 open_file_to_av(struct file *file)
+ 
+ static int selinux_binder_set_context_mgr(const struct cred *mgr)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), cred_sid(mgr), SECCLASS_BINDER,
+-			    BINDER__SET_CONTEXT_MGR, NULL);
++	return cred_other_has_perm(current_cred(), mgr, SECCLASS_BINDER,
++				   BINDER__SET_CONTEXT_MGR, NULL);
+ }
+ 
+ static int selinux_binder_transaction(const struct cred *from,
+@@ -2089,28 +2086,25 @@ static int selinux_binder_transaction(const struct cred *from,
+ {
+ 	u32 mysid = current_sid();
+ 	u32 fromsid = cred_sid(from);
+-	u32 tosid = cred_sid(to);
+ 	int rc;
+ 
+ 	if (mysid != fromsid) {
+-		rc = avc_has_perm(cred_selinux_state(from),
+-				  mysid, fromsid, SECCLASS_BINDER,
+-				  BINDER__IMPERSONATE, NULL);
++		rc = cred_other_has_perm(current_cred(), from,
++					 SECCLASS_BINDER,
++					 BINDER__IMPERSONATE, NULL);
+ 		if (rc)
+ 			return rc;
+ 	}
+ 
+-	return avc_has_perm(cred_selinux_state(from), fromsid, tosid,
+-			    SECCLASS_BINDER, BINDER__CALL, NULL);
++	return cred_other_has_perm(from, to, SECCLASS_BINDER, BINDER__CALL,
++				   NULL);
+ }
+ 
+ static int selinux_binder_transfer_binder(const struct cred *from,
+ 					  const struct cred *to)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    cred_sid(from), cred_sid(to),
+-			    SECCLASS_BINDER, BINDER__TRANSFER,
+-			    NULL);
++	return cred_other_has_perm(from, to, SECCLASS_BINDER,
++				   BINDER__TRANSFER, NULL);
+ }
+ 
+ static int selinux_binder_transfer_file(const struct cred *from,
+@@ -2178,9 +2172,8 @@ static int selinux_capset(struct cred *new, const struct cred *old,
+ 			  const kernel_cap_t *inheritable,
+ 			  const kernel_cap_t *permitted)
+ {
+-	return avc_has_perm(cred_selinux_state(old),
+-			    cred_sid(old), cred_sid(new), SECCLASS_PROCESS,
+-			    PROCESS__SETCAP, NULL);
++	return cred_other_has_perm(old, new, SECCLASS_PROCESS,
++				   PROCESS__SETCAP, NULL);
+ }
+ 
+ /*
+@@ -3450,12 +3443,9 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
+ 	if (rc)
+ 		return rc;
+ 
+-	return avc_has_perm(current_selinux_state,
+-			    newsid,
+-			    sbsec->sid,
+-			    SECCLASS_FILESYSTEM,
+-			    FILESYSTEM__ASSOCIATE,
+-			    &ad);
++	return cred_ssid_has_perm(cred, newsid, sbsec->sid,
++				  SECCLASS_FILESYSTEM,
++				  FILESYSTEM__ASSOCIATE, &ad);
+ }
+ 
+ static int selinux_inode_set_acl(struct mnt_idmap *idmap,
+@@ -4576,9 +4566,7 @@ static int selinux_task_prlimit(const struct cred *cred, const struct cred *tcre
+ 		av |= PROCESS__SETRLIMIT;
+ 	if (flags & LSM_PRLIMIT_READ)
+ 		av |= PROCESS__GETRLIMIT;
+-	return avc_has_perm(cred_selinux_state(cred),
+-			    cred_sid(cred), cred_sid(tcred),
+-			    SECCLASS_PROCESS, av, NULL);
++	return cred_other_has_perm(cred, tcred, SECCLASS_PROCESS, av, NULL);
+ }
+ 
+ static int selinux_task_setrlimit(struct task_struct *p, unsigned int resource,
+@@ -6528,9 +6516,8 @@ static int selinux_msg_queue_msgsnd(struct kern_ipc_perm *msq, struct msg_msg *m
+ 				   &ad);
+ 	if (!rc)
+ 		/* Can the message be put in the queue? */
+-		rc = avc_has_perm(current_selinux_state,
+-				  msec->sid, isec->sid, SECCLASS_MSGQ,
+-				  MSGQ__ENQUEUE, &ad);
++		rc = cred_ssid_has_perm(cred, msec->sid, isec->sid,
++					SECCLASS_MSGQ, MSGQ__ENQUEUE, &ad);
+ 
+ 	return rc;
+ }
+@@ -7455,8 +7442,8 @@ static int selinux_perf_event_write(struct perf_event *event)
+  */
+ static int selinux_uring_override_creds(const struct cred *new)
+ {
+-	return avc_has_perm(current_selinux_state, current_sid(), cred_sid(new),
+-			    SECCLASS_IO_URING, IO_URING__OVERRIDE_CREDS, NULL);
++	return cred_other_has_perm(current_cred(), new, SECCLASS_IO_URING,
++				   IO_URING__OVERRIDE_CREDS, NULL);
+ }
+ 
+ /**
+diff --git a/security/selinux/include/avc.h b/security/selinux/include/avc.h
+index 95178feac52c9e7e46dcc6f220b661ae5fcc43ad..3198ed11aa80460719166123e6bcec83160048de 100644
+--- a/security/selinux/include/avc.h
++++ b/security/selinux/include/avc.h
+@@ -170,6 +170,13 @@ int cred_has_perm(const struct cred *cred, u32 tsid, u16 tclass, u32 requested,
+ int cred_has_perm_noaudit(const struct cred *cred, u32 tsid, u16 tclass,
+ 			  u32 requested, struct av_decision *avd);
+ 
++int cred_ssid_has_perm(const struct cred *cred, u32 ssid, u32 tsid, u16 tclass,
++		       u32 requested, struct common_audit_data *ad);
++
++int cred_other_has_perm(const struct cred *cred, const struct cred *other,
++			u16 tclass, u32 requested,
++			struct common_audit_data *ad);
++
+ u32 avc_policy_seqno(struct selinux_state *state);
+ 
+ #define AVC_CALLBACK_GRANT		1

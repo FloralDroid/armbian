@@ -1,0 +1,274 @@
+From 57f849e5ec0d32e12ba7e82283a80a999a2c4283 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Thu, 12 Sep 2024 09:08:36 -0400
+Subject: [PATCH 57/90] selinux: introduce cred_task_has_perm()
+
+Introduce cred_task_has_perm() for checking permissions between a cred
+and a target task against not only the current SELinux namespace but all
+ancestor namespaces too.
+
+Convert existing cred-task permission checks in the SELinux hook
+functions to use cred_task_has_perm() instead of calling avc_has_perm().
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: c7cdca955810dafd83fd2c20ecc3724cc52b27a6
+---
+ security/selinux/avc.c         | 44 +++++++++++++++++
+ security/selinux/hooks.c       | 89 +++++++++++++---------------------
+ security/selinux/include/avc.h |  4 ++
+ 3 files changed, 81 insertions(+), 56 deletions(-)
+
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index 056e597912ec8efedcbe3a8875c259a1c95e26e0..466d6f5a7fd9b87f4df23d17da54bbf892cfe223 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -1246,6 +1246,50 @@ int avc_has_perm(struct selinux_state *state, u32 ssid, u32 tsid, u16 tclass,
+ 	return rc;
+ }
+ 
++static u32 task_sid_obj_for_state(const struct task_struct *p,
++				  const struct selinux_state *state)
++{
++	const struct cred_security_struct *crsec;
++	u32 sid;
++
++	rcu_read_lock();
++	crsec = selinux_cred(__task_cred(p));
++	while (crsec->state != state && crsec->parent_cred)
++		crsec = selinux_cred(crsec->parent_cred);
++	if (crsec->state == state)
++		sid = crsec->sid;
++	else
++		sid = SECINITSID_UNLABELED;
++	rcu_read_unlock();
++	return sid;
++}
++
++int cred_task_has_perm(const struct cred *cred, const struct task_struct *p,
++		       u16 tclass, u32 requested,
++		       struct common_audit_data *ad)
++{
++	struct cred_security_struct *crsec;
++	struct selinux_state *state;
++	u32 ssid;
++	u32 tsid;
++	int rc;
++
++	do {
++		crsec = selinux_cred(cred);
++		ssid = crsec->sid;
++		state = crsec->state;
++		tsid = task_sid_obj_for_state(p, state);
++
++		rc = avc_has_perm(state, ssid, tsid, tclass, requested, ad);
++		if (rc)
++			return rc;
++
++		cred = crsec->parent_cred;
++	} while (cred);
++
++	return 0;
++}
++
+ u32 avc_policy_seqno(struct selinux_state *state)
+ {
+ 	return state->avc->avc_cache.latest_notif;
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 2cbfc573fd06e818efc588a211447942d8193d26..3606f24a2d49d17090a5875ef78dacbf888fe7ba 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -2182,15 +2182,12 @@ static int selinux_binder_transfer_file(const struct cred *from,
+ static int selinux_ptrace_access_check(struct task_struct *child,
+ 				       unsigned int mode)
+ {
+-	u32 sid = current_sid();
+-	u32 csid = task_sid_obj(child);
+-
+ 	if (mode & PTRACE_MODE_READ)
+-		return avc_has_perm(current_selinux_state,
+-				    sid, csid, SECCLASS_FILE, FILE__READ, NULL);
++		return cred_task_has_perm(current_cred(), child,
++					  SECCLASS_FILE, FILE__READ, NULL);
+ 
+-	return avc_has_perm(current_selinux_state,
+-			    sid, csid, SECCLASS_PROCESS, PROCESS__PTRACE, NULL);
++	return cred_task_has_perm(current_cred(), child, SECCLASS_PROCESS,
++				  PROCESS__PTRACE, NULL);
+ }
+ 
+ static int selinux_ptrace_traceme(struct task_struct *parent)
+@@ -2203,9 +2200,8 @@ static int selinux_ptrace_traceme(struct task_struct *parent)
+ static int selinux_capget(const struct task_struct *target, kernel_cap_t *effective,
+ 			  kernel_cap_t *inheritable, kernel_cap_t *permitted)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(target), SECCLASS_PROCESS,
+-			    PROCESS__GETCAP, NULL);
++	return cred_task_has_perm(current_cred(), target, SECCLASS_PROCESS,
++				  PROCESS__GETCAP, NULL);
+ }
+ 
+ static int selinux_capset(struct cred *new, const struct cred *old,
+@@ -4580,23 +4576,20 @@ static int selinux_kernel_load_data(enum kernel_load_data_id id, bool contents)
+ 
+ static int selinux_task_setpgid(struct task_struct *p, pid_t pgid)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(p), SECCLASS_PROCESS,
+-			    PROCESS__SETPGID, NULL);
++	return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++				  PROCESS__SETPGID, NULL);
+ }
+ 
+ static int selinux_task_getpgid(struct task_struct *p)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(p), SECCLASS_PROCESS,
+-			    PROCESS__GETPGID, NULL);
++	return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++				  PROCESS__GETPGID, NULL);
+ }
+ 
+ static int selinux_task_getsid(struct task_struct *p)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(p), SECCLASS_PROCESS,
+-			    PROCESS__GETSESSION, NULL);
++	return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++				  PROCESS__GETSESSION, NULL);
+ }
+ 
+ static void selinux_current_getlsmprop_subj(struct lsm_prop *prop)
+@@ -4612,23 +4605,20 @@ static void selinux_task_getlsmprop_obj(struct task_struct *p,
+ 
+ static int selinux_task_setnice(struct task_struct *p, int nice)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(p), SECCLASS_PROCESS,
+-			    PROCESS__SETSCHED, NULL);
++	return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++				  PROCESS__SETSCHED, NULL);
+ }
+ 
+ static int selinux_task_setioprio(struct task_struct *p, int ioprio)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(p), SECCLASS_PROCESS,
+-			    PROCESS__SETSCHED, NULL);
++	return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++				  PROCESS__SETSCHED, NULL);
+ }
+ 
+ static int selinux_task_getioprio(struct task_struct *p)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(p), SECCLASS_PROCESS,
+-			    PROCESS__GETSCHED, NULL);
++	return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++				  PROCESS__GETSCHED, NULL);
+ }
+ 
+ static int selinux_task_prlimit(const struct cred *cred, const struct cred *tcred,
+@@ -4657,56 +4647,43 @@ static int selinux_task_setrlimit(struct task_struct *p, unsigned int resource,
+ 	   later be used as a safe reset point for the soft limit
+ 	   upon context transitions.  See selinux_bprm_committing_creds. */
+ 	if (old_rlim->rlim_max != new_rlim->rlim_max)
+-		return avc_has_perm(current_selinux_state,
+-				    current_sid(), task_sid_obj(p),
+-				    SECCLASS_PROCESS, PROCESS__SETRLIMIT, NULL);
++		return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++					  PROCESS__SETRLIMIT, NULL);
+ 
+ 	return 0;
+ }
+ 
+ static int selinux_task_setscheduler(struct task_struct *p)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(p), SECCLASS_PROCESS,
+-			    PROCESS__SETSCHED, NULL);
++	return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++				  PROCESS__SETSCHED, NULL);
+ }
+ 
+ static int selinux_task_getscheduler(struct task_struct *p)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(p), SECCLASS_PROCESS,
+-			    PROCESS__GETSCHED, NULL);
++	return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++				  PROCESS__GETSCHED, NULL);
+ }
+ 
+ static int selinux_task_movememory(struct task_struct *p)
+ {
+-	return avc_has_perm(current_selinux_state,
+-			    current_sid(), task_sid_obj(p), SECCLASS_PROCESS,
+-			    PROCESS__SETSCHED, NULL);
++	return cred_task_has_perm(current_cred(), p, SECCLASS_PROCESS,
++				  PROCESS__SETSCHED, NULL);
+ }
+ 
+ static int selinux_task_kill(struct task_struct *p, struct kernel_siginfo *info,
+ 				int sig, const struct cred *cred)
+ {
+-	struct selinux_state *state;
+-	u32 secid;
+ 	u32 perm;
+ 
+-	if (cred)
+-		state = cred_selinux_state(cred);
+-	else
+-		state = current_selinux_state;
++	if (!cred)
++		cred = current_cred();
+ 
+ 	if (!sig)
+ 		perm = PROCESS__SIGNULL; /* null signal; existence test */
+ 	else
+ 		perm = signal_to_av(sig);
+-	if (!cred)
+-		secid = current_sid();
+-	else
+-		secid = cred_sid(cred);
+-	return avc_has_perm(state, secid, task_sid_obj(p),
+-			    SECCLASS_PROCESS, perm, NULL);
++	return cred_task_has_perm(cred, p, SECCLASS_PROCESS, perm, NULL);
+ }
+ 
+ static void selinux_task_to_inode(struct task_struct *p,
+@@ -6870,14 +6847,14 @@ static int selinux_lsm_getattr(unsigned int attr, struct task_struct *p,
+ 	u32 len;
+ 
+ 	rcu_read_lock();
+-	crsec = task_cred_security(p);
+ 	if (p != current) {
+-		error = avc_has_perm(current_selinux_state,
+-				     current_sid(), crsec->sid,
+-				     SECCLASS_PROCESS, PROCESS__GETATTR, NULL);
++		error = cred_task_has_perm(current_cred(), p,
++					   SECCLASS_PROCESS,
++					   PROCESS__GETATTR, NULL);
+ 		if (error)
+ 			goto err_unlock;
+ 	}
++	crsec = task_cred_security(p);
+ 	switch (attr) {
+ 	case LSM_ATTR_CURRENT:
+ 		sid = crsec->sid;
+diff --git a/security/selinux/include/avc.h b/security/selinux/include/avc.h
+index f6a500e9d74dbf8b487c0ceae5c0d5c4ba14420c..5d79bb7c610c5b01d7338f4000f64b7f4ad3cada 100644
+--- a/security/selinux/include/avc.h
++++ b/security/selinux/include/avc.h
+@@ -150,6 +150,10 @@ int avc_has_extended_perms(struct selinux_state *state, u32 ssid, u32 tsid,
+ 			   u16 tclass, u32 requested, u8 driver, u8 base_perm,
+ 			   u8 perm, struct common_audit_data *ad);
+ 
++int cred_task_has_perm(const struct cred *cred, const struct task_struct *p,
++		       u16 tclass, u32 requested,
++		       struct common_audit_data *auditdata);
++
+ u32 avc_policy_seqno(struct selinux_state *state);
+ 
+ #define AVC_CALLBACK_GRANT		1

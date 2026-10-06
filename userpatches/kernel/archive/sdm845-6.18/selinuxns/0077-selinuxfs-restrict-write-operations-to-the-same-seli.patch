@@ -1,0 +1,115 @@
+From 099f7c871b9e5a91e1841d58bac7390b72b7cf56 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Fri, 21 Aug 2020 16:08:09 -0400
+Subject: [PATCH 77/90] selinuxfs: restrict write operations to the same
+ selinux namespace
+
+This ensures that once a process unshares its selinux namespace,
+it can no longer act on the parent namespace's selinuxfs instance,
+irrespective of policy.  This is a safety measure so that even if
+an otherwise unconfined process unshares its selinux namespace, it
+won't be able to subsequently affect the enforcing mode or policy of the
+parent.  This also helps avoid common mistakes like failing to create
+a mount namespace and mount a new selinuxfs instance in order to act
+on one's own selinux namespace after unsharing.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 489d3a3163c708a462b6bed408f2cfa15de6c85e
+
+Backport: retain the 6.18 load-policy lock placement and deprecated checkreqprot stub, with the same namespace write restriction applied to both.
+---
+ security/selinux/selinuxfs.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index c44d8570154ed2b75b5711c8e17304d9a3e317d8..16dfa86f689b0404c4f4938cdbbe0c31c5950a52 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -146,6 +146,9 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
+ 	int scan_value;
+ 	bool old_value, new_value;
+ 
++	if (state != current_selinux_state)
++		return -EPERM;
++
+ 	if (count >= PAGE_SIZE)
+ 		return -ENOMEM;
+ 
+@@ -705,6 +708,9 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
+ 	if (!count)
+ 		return -EINVAL;
+ 
++	if (fsi->state != current_selinux_state)
++		return -EPERM;
++
+ 	length = avc_has_perm(current_selinux_state, current_sid(), SECINITSID_SECURITY,
+ 			      SECCLASS_SECURITY, SECURITY__LOAD_POLICY, NULL);
+ 	if (length)
+@@ -802,6 +808,11 @@ static ssize_t sel_read_checkreqprot(struct file *filp, char __user *buf,
+ static ssize_t sel_write_checkreqprot(struct file *file, const char __user *buf,
+ 				      size_t count, loff_t *ppos)
+ {
++	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
++
++	if (fsi->state != current_selinux_state)
++		return -EPERM;
++
+ 	/*
+ 	 * Setting checkreqprot is no longer supported, see
+ 	 * https://github.com/SELinuxProject/selinux-kernel/wiki/DEPRECATE-checkreqprot
+@@ -828,6 +839,9 @@ static ssize_t sel_write_validatetrans(struct file *file,
+ 	u16 tclass;
+ 	int rc;
+ 
++	if (state != current_selinux_state)
++		return -EPERM;
++
+ 	rc = avc_has_perm(current_selinux_state,
+ 			  current_sid(), SECINITSID_SECURITY,
+ 			  SECCLASS_SECURITY, SECURITY__VALIDATE_TRANS, NULL);
+@@ -915,10 +929,14 @@ static ssize_t (*const write_op[])(struct file *, char *, size_t) = {
+ 
+ static ssize_t selinux_transaction_write(struct file *file, const char __user *buf, size_t size, loff_t *pos)
+ {
++	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
+ 	ino_t ino = file_inode(file)->i_ino;
+ 	char *data;
+ 	ssize_t rv;
+ 
++	if (fsi->state != current_selinux_state)
++		return -EPERM;
++
+ 	if (ino >= ARRAY_SIZE(write_op) || !write_op[ino])
+ 		return -EINVAL;
+ 
+@@ -1290,6 +1308,9 @@ static ssize_t sel_write_bool(struct file *filep, const char __user *buf,
+ 	unsigned index = file_inode(filep)->i_ino & SEL_INO_MASK;
+ 	const char *name = filep->f_path.dentry->d_name.name;
+ 
++	if (fsi->state != current_selinux_state)
++		return -EPERM;
++
+ 	if (count >= PAGE_SIZE)
+ 		return -ENOMEM;
+ 
+@@ -1346,6 +1367,9 @@ static ssize_t sel_commit_bools_write(struct file *filep,
+ 	ssize_t length;
+ 	int new_value;
+ 
++	if (fsi->state != current_selinux_state)
++		return -EPERM;
++
+ 	if (count >= PAGE_SIZE)
+ 		return -ENOMEM;
+ 
+@@ -1477,6 +1501,9 @@ static ssize_t sel_write_avc_cache_threshold(struct file *file,
+ 	ssize_t ret;
+ 	unsigned int new_value;
+ 
++	if (state != current_selinux_state)
++		return -EPERM;
++
+ 	ret = avc_has_perm(current_selinux_state,
+ 			   current_sid(), SECINITSID_SECURITY,
+ 			   SECCLASS_SECURITY, SECURITY__SETSECPARAM,

@@ -1,0 +1,89 @@
+From 36cff8edc40cb31b429c00f48530b789903b02be Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Mon, 23 Sep 2024 10:40:21 -0400
+Subject: [PATCH 58/90] selinux: introduce cred_has_extended_perms()
+
+Introduce cred_has_extended_perms() to check extended permissions
+against the current SELinux namespace and all ancestor namespaces.
+Update the caller of avc_has_extended_perms() to use this function
+instead.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: a67c30eab6156667a3a2476095d88c50dd54207f
+---
+ security/selinux/avc.c         | 26 ++++++++++++++++++++++++++
+ security/selinux/hooks.c       |  7 +++----
+ security/selinux/include/avc.h |  4 ++++
+ 3 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index 466d6f5a7fd9b87f4df23d17da54bbf892cfe223..d9640679ee477081dfc0de57909882ed555bb55f 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -1290,6 +1290,32 @@ int cred_task_has_perm(const struct cred *cred, const struct task_struct *p,
+ 	return 0;
+ }
+ 
++int cred_has_extended_perms(const struct cred *cred, u32 tsid, u16 tclass,
++			    u32 requested, u8 driver, u8 base_perm, u8 xperm,
++			    struct common_audit_data *ad)
++{
++	struct cred_security_struct *crsec;
++	struct selinux_state *state;
++	u32 ssid;
++	int rc;
++
++	do {
++		crsec = selinux_cred(cred);
++		ssid = crsec->sid;
++		state = crsec->state;
++
++		rc = avc_has_extended_perms(state, ssid, tsid, tclass,
++					    requested, driver, base_perm,
++					    xperm, ad);
++		if (rc)
++			return rc;
++
++		cred = crsec->parent_cred;
++	} while (cred);
++
++	return 0;
++}
++
+ u32 avc_policy_seqno(struct selinux_state *state)
+ {
+ 	return state->avc->avc_cache.latest_notif;
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 3606f24a2d49d17090a5875ef78dacbf888fe7ba..27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -3947,10 +3947,9 @@ static int ioctl_has_perm(const struct cred *cred, struct file *file,
+ 		return 0;
+ 
+ 	isec = inode_security(inode);
+-	rc = avc_has_extended_perms(cred_selinux_state(cred),
+-				    ssid, isec->sid, isec->sclass,
+-				    requested, driver, AVC_EXT_IOCTL, xperm,
+-				    &ad);
++	rc = cred_has_extended_perms(cred, isec->sid, isec->sclass,
++				     requested, driver, AVC_EXT_IOCTL,
++				     xperm, &ad);
+ out:
+ 	return rc;
+ }
+diff --git a/security/selinux/include/avc.h b/security/selinux/include/avc.h
+index 5d79bb7c610c5b01d7338f4000f64b7f4ad3cada..adbbecc681f213033a4dd1dfa478817bbffd769e 100644
+--- a/security/selinux/include/avc.h
++++ b/security/selinux/include/avc.h
+@@ -154,6 +154,10 @@ int cred_task_has_perm(const struct cred *cred, const struct task_struct *p,
+ 		       u16 tclass, u32 requested,
+ 		       struct common_audit_data *auditdata);
+ 
++int cred_has_extended_perms(const struct cred *cred, u32 tsid, u16 tclass,
++			    u32 requested, u8 driver, u8 base_perm, u8 xperm,
++			    struct common_audit_data *ad);
++
+ u32 avc_policy_seqno(struct selinux_state *state);
+ 
+ #define AVC_CALLBACK_GRANT		1

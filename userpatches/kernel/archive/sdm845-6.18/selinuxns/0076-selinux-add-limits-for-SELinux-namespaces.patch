@@ -1,0 +1,307 @@
+From 86144f46c36ef0cbea5f937022618094ceb4afba Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Tue, 1 Oct 2024 13:33:42 -0400
+Subject: [PATCH 76/90] selinux: add limits for SELinux namespaces
+
+Add maxns and maxnsdepth limits for SELinux namespaces
+to enable control over the max number of SELinux namespaces
+and the max depth to which one can nest SELinux namespaces.
+Provide Kconfig options to control the default values for both
+limits, and allow them to be overridden via selinuxfs in the
+init SELinux namespace only.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: b54c32c70440d6327f42fa3369e0131b5ef0dacd
+---
+ security/selinux/Kconfig            |  18 ++++
+ security/selinux/hooks.c            |  27 +++++-
+ security/selinux/include/classmap.h |   2 +-
+ security/selinux/include/security.h |   2 +
+ security/selinux/selinuxfs.c        | 135 ++++++++++++++++++++++++++++
+ 5 files changed, 179 insertions(+), 5 deletions(-)
+
+diff --git a/security/selinux/Kconfig b/security/selinux/Kconfig
+index 61abc1e094a800c3f25577f9c771f5700322d2fa..82db54462253a11d41a20b9b191606dc84b103f5 100644
+--- a/security/selinux/Kconfig
++++ b/security/selinux/Kconfig
+@@ -87,3 +87,21 @@ config SECURITY_SELINUX_DEBUG
+ 
+ 		echo -n 'file "security/selinux/*" +p' > \
+ 			/proc/dynamic_debug/control
++
++config SECURITY_SELINUX_MAXNS
++	int "SELinux default maximum number of namespaces"
++	depends on SECURITY_SELINUX
++	range 0 65535
++	default 65535
++	help
++	  This option sets the default maximum number of SELinux namespaces.
++	  The value may be viewed or modified via /sys/fs/selinux/maxns.
++
++config SECURITY_SELINUX_MAXNSDEPTH
++	int "SELinux default maximum depth of namespaces"
++	depends on SECURITY_SELINUX
++	range 0 32
++	default 32
++	help
++	  This option sets the default maximum depth of SELinux namespaces.
++	  The value may be viewed or modified via /sys/fs/selinux/maxnsdepth.
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 2ac89c9ccdb80b582d3e909f76592518d56d4bdc..2159aa12ec26403c58135a52d070a0e17e679e54 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -7934,17 +7934,34 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
+ 
+ static void selinux_state_free(struct work_struct *work);
+ 
++unsigned int selinux_maxns = CONFIG_SECURITY_SELINUX_MAXNS;
++unsigned int selinux_maxnsdepth = CONFIG_SECURITY_SELINUX_MAXNSDEPTH;
++
++static atomic_t selinux_nsnum = ATOMIC_INIT(0);
++
+ int selinux_state_create(const struct cred *cred)
+ {
+ 	struct cred_security_struct *crsec = selinux_cred(cred);
+ 	struct selinux_state *parent = crsec->state;
+ 	u32 creator_sid = crsec->sid;
+-	struct selinux_state *newstate;
++	struct selinux_state *newstate = NULL;
+ 	int rc;
+ 
++	if (atomic_inc_return(&selinux_nsnum) > selinux_maxns) {
++		rc = -ENOSPC;
++		goto err;
++	}
++
++	if (parent && parent->depth >= selinux_maxnsdepth) {
++		rc = -ENOSPC;
++		goto err;
++	}
++
+ 	newstate = kzalloc(sizeof(*newstate), GFP_KERNEL);
+-	if (!newstate)
+-		return -ENOMEM;
++	if (!newstate) {
++		rc = -ENOMEM;
++		goto err;
++	}
+ 
+ 	newstate->creator_sid = creator_sid;
+ 
+@@ -7966,6 +7983,7 @@ int selinux_state_create(const struct cred *cred)
+ 		 * to increment the parent reference count.
+ 		 */
+ 		newstate->parent = parent;
++		newstate->depth = parent->depth + 1;
+ 	}
+ 
+ 	/*
+@@ -7989,10 +8007,10 @@ int selinux_state_create(const struct cred *cred)
+ 		put_cred(crsec->parent_cred);
+ 		crsec->parent_cred = get_current_cred();
+ 	}
+-
+ 	return 0;
+ err:
+ 	kfree(newstate);
++	atomic_dec(&selinux_nsnum);
+ 	return rc;
+ }
+ 
+@@ -8007,6 +8025,7 @@ static void selinux_state_free(struct work_struct *work)
+ 			__free_page(state->status_page);
+ 		selinux_state_policy_free(state);
+ 		selinux_avc_free(state->avc);
++		atomic_dec(&selinux_nsnum);
+ 		kfree(state);
+ 		state = parent;
+ 	} while (state && refcount_dec_and_test(&state->count));
+diff --git a/security/selinux/include/classmap.h b/security/selinux/include/classmap.h
+index 5665aa5e7853e1e647d3123d04c150d8cdd13182..8310f068a221ea720c03e6f8bce340ea1baabd5c 100644
+--- a/security/selinux/include/classmap.h
++++ b/security/selinux/include/classmap.h
+@@ -50,7 +50,7 @@ const struct security_class_mapping secclass_map[] = {
+ 	  { "compute_av", "compute_create", "compute_member", "check_context",
+ 	    "load_policy", "compute_relabel", "compute_user", "setenforce",
+ 	    "setbool", "setsecparam", "setcheckreqprot", "read_policy",
+-	    "validate_trans", NULL } },
++	    "validate_trans", "setmaxns", "setmaxnsdepth", NULL } },
+ 	{ "process",
+ 	  { "fork",	    "transition",    "sigchld",	    "sigkill",
+ 	    "sigstop",	    "signull",	     "signal",	    "ptrace",
+diff --git a/security/selinux/include/security.h b/security/selinux/include/security.h
+index c000dcf86eec5bf7c56a5451658124aeb5f04b81..b30c9814eafa8bc13e74af7edfcfdad6d075383f 100644
+--- a/security/selinux/include/security.h
++++ b/security/selinux/include/security.h
+@@ -113,8 +113,10 @@ struct selinux_state {
+ 	struct work_struct work;
+ 
+ 	u32 creator_sid; /* SID of namespace creator */
++	unsigned short depth;
+ } __randomize_layout;
+ 
++extern unsigned int selinux_maxns, selinux_maxnsdepth;
+ int selinux_state_create(const struct cred *cred);
+ void __put_selinux_state(struct selinux_state *state);
+ 
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index 497744082220696df34fadd195578cffebbbcd20..c44d8570154ed2b75b5711c8e17304d9a3e317d8 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -65,6 +65,8 @@ enum sel_inos {
+ 	SEL_STATUS,	/* export current status using mmap() */
+ 	SEL_POLICY,	/* allow userspace to read the in kernel policy */
+ 	SEL_VALIDATE_TRANS, /* compute validatetrans decision */
++	SEL_MAXNS,	    /* maximum number of SELinux namespaces */
++	SEL_MAXNSDEPTH,	    /* maximum depth of SELinux namespaces */
+ 	SEL_INO_NEXT,	/* The next inode number to use */
+ };
+ 
+@@ -293,6 +295,137 @@ static const struct file_operations sel_disable_ops = {
+ 	.llseek		= generic_file_llseek,
+ };
+ 
++static ssize_t sel_read_maxns(struct file *filp, char __user *buf,
++			     size_t count, loff_t *ppos)
++{
++	char tmpbuf[TMPBUFLEN];
++	ssize_t length;
++
++	length = scnprintf(tmpbuf, TMPBUFLEN, "%u", selinux_maxns);
++	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
++}
++
++
++static ssize_t sel_write_maxns(struct file *file, const char __user *buf,
++				 size_t count, loff_t *ppos)
++
++{
++	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
++	struct selinux_state *state = fsi->state;
++	char *page = NULL;
++	ssize_t length;
++
++	/*
++	 * Only permit setting from the init SELinux namespace, and only
++	 * on the init SELinux namespace.
++	 */
++	if (current_selinux_state != init_selinux_state ||
++	    state != init_selinux_state)
++		return -EPERM;
++
++	length = avc_has_perm(current_selinux_state,
++			      current_sid(), SECINITSID_SECURITY,
++			      SECCLASS_SECURITY, SECURITY__SETMAXNS,
++			      NULL);
++	if (length)
++		return length;
++
++	if (count >= PAGE_SIZE)
++		return -ENOMEM;
++
++	/* No partial writes. */
++	if (*ppos != 0)
++		return -EINVAL;
++
++	page = memdup_user_nul(buf, count);
++	if (IS_ERR(page))
++		return PTR_ERR(page);
++
++	length = kstrtouint(page, 0, &selinux_maxns);
++	if (length)
++		goto out;
++
++	length = count;
++out:
++	kfree(page);
++	return length;
++}
++
++static const struct file_operations sel_maxns_ops = {
++	.read		= sel_read_maxns,
++	.write		= sel_write_maxns,
++	.llseek		= generic_file_llseek,
++};
++
++static ssize_t sel_read_maxnsdepth(struct file *filp, char __user *buf,
++				   size_t count, loff_t *ppos)
++{
++	char tmpbuf[TMPBUFLEN];
++	ssize_t length;
++
++	length = scnprintf(tmpbuf, TMPBUFLEN, "%u", selinux_maxnsdepth);
++	return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
++}
++
++
++static ssize_t sel_write_maxnsdepth(struct file *file, const char __user *buf,
++				    size_t count, loff_t *ppos)
++
++{
++	struct selinux_fs_info *fsi = file_inode(file)->i_sb->s_fs_info;
++	struct selinux_state *state = fsi->state;
++	char *page = NULL;
++	ssize_t length;
++	unsigned int new_value;
++
++	/*
++	 * Only permit setting from the init SELinux namespace, and only
++	 * on the init SELinux namespace.
++	 */
++	if (current_selinux_state != init_selinux_state ||
++	    state != init_selinux_state)
++		return -EPERM;
++
++	length = avc_has_perm(current_selinux_state,
++			      current_sid(), SECINITSID_SECURITY,
++			      SECCLASS_SECURITY, SECURITY__SETMAXNSDEPTH,
++			      NULL);
++	if (length)
++		return length;
++
++	if (count >= PAGE_SIZE)
++		return -ENOMEM;
++
++	/* No partial writes. */
++	if (*ppos != 0)
++		return -EINVAL;
++
++	page = memdup_user_nul(buf, count);
++	if (IS_ERR(page))
++		return PTR_ERR(page);
++
++	length = kstrtouint(page, 0, &new_value);
++	if (length)
++		goto out;
++
++	if (new_value > 32) {
++		length = -EINVAL;
++		goto out;
++	}
++	selinux_maxnsdepth = new_value;
++
++	length = count;
++out:
++	kfree(page);
++	return length;
++}
++
++static const struct file_operations sel_maxnsdepth_ops = {
++	.read		= sel_read_maxnsdepth,
++	.write		= sel_write_maxnsdepth,
++	.llseek		= generic_file_llseek,
++};
++
+ static ssize_t sel_read_policyvers(struct file *filp, char __user *buf,
+ 				   size_t count, loff_t *ppos)
+ {
+@@ -1922,6 +2055,8 @@ static int sel_fill_super(struct super_block *sb, struct fs_context *fc)
+ 		[SEL_POLICY] = {"policy", &sel_policy_ops, S_IRUGO},
+ 		[SEL_VALIDATE_TRANS] = {"validatetrans", &sel_transition_ops,
+ 					S_IWUGO},
++		[SEL_MAXNS] = {"maxns", &sel_maxns_ops, 0600},
++		[SEL_MAXNSDEPTH] = {"maxnsdepth", &sel_maxnsdepth_ops, 0600},
+ 		/* last one */ {"", NULL, 0}
+ 	};
+ 

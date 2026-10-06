@@ -1,0 +1,81 @@
+From 26a515d7fdadc615cdc073c4d94554161c26d77e Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Mon, 12 May 2025 11:35:53 -0400
+Subject: [PATCH 67/90] selinux: update cred_tsid_has_perm_noaudit() to return
+ the combined avd
+
+cred_tsid_has_perm_noaudit() currently just returns the last computed
+av_decision (avd) structure, which in the case of multiple SELinux
+namespaces will only contain the decisions from the init SELinux
+namespace. Generally this has no effect since a permission denial
+by any namespace will cause an immediate error return with -EACCES,
+but in the case where permission is allowed and the caller caches
+the avd itself for later reuse, it could lead to the caller
+incorrectly only using the cached decisions from the init namespace.
+Change cred_tsid_has_perm_noaudit() to combine the results from any
+avc_has_perm_noaudit() calls to produce the final avd that is returned
+to the caller to avoid this problem. The combining logic varies
+for different fields of the avd, e.g. intersection for allowed
+and flags (per-domain permissive), union for auditallow and auditdeny,
+and the seqno is always set from the current namespace only.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 1f53bfeff5381810d5081fd135fdd68a2e3ef477
+---
+ security/selinux/avc.c | 30 ++++++++++++++++++++----------
+ 1 file changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index 80a16255a2d8f211eba50017aeeae20eac3b3b7d..0d650efe16ac0a13c8ad703882dd0307b49afb1e 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -1557,28 +1557,38 @@ int cred_tsid_has_perm_noaudit(const struct cred *cred, u32 tsid, u16 tclass,
+ {
+ 	struct cred_security_struct *crsec;
+ 	struct selinux_state *state;
++	struct av_decision tmp_avd;
+ 	u32 ssid;
+ 	int rc;
+ 
+-	do {
++	crsec = selinux_cred(cred);
++	ssid = crsec->sid;
++	state = crsec->state;
++
++	rc = avc_has_perm_noaudit(state, ssid, tsid, tclass,
++				requested, 0, avd);
++	if (rc)
++		return rc;
++
++	cred = crsec->parent_cred;
++	while (cred) {
+ 		crsec = selinux_cred(cred);
+ 		ssid = crsec->sid;
+ 		state = crsec->state;
+ 
+-		/*
+-		 * TODO Do we need to use a tmp avd for each
+-		 * avc_has_perm_noaudit() call and intersect/union
+-		 * the sets as appropriate as we go? Or can we
+-		 * simply use the last result since we generally
+-		 * only care when there is a denial?
+-		 */
+ 		rc = avc_has_perm_noaudit(state, ssid, tsid, tclass,
+-					  requested, 0, avd);
++					  requested, 0, &tmp_avd);
++
++		avd->allowed &= tmp_avd.allowed;
++		avd->auditallow |= tmp_avd.auditallow;
++		avd->auditdeny |= tmp_avd.auditdeny;
++		avd->flags &= tmp_avd.flags;
++
+ 		if (rc)
+ 			return rc;
+ 
+ 		cred = crsec->parent_cred;
+-	} while (cred);
++	}
+ 
+ 	return 0;
+ }

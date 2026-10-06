@@ -1,0 +1,108 @@
+From eeadcb9e286ce1e6592cdb5075498939231c77ec Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20G=C3=B6ttsche?= <cgzones@googlemail.com>
+Date: Sun, 11 May 2025 19:30:12 +0200
+Subject: [PATCH 44/90] selinux: check for simple types
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Validate that the target of AVTAB_TYPE rules and file transitions are
+simple types and not attributes.
+
+Signed-off-by: Christian Göttsche <cgzones@googlemail.com>
+Acked-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+[PM: merge fuzz, dropped parts due to dependencies]
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+
+Upstream-commit: 2f0af91353cb64b54cfee5423820d2149039338d
+---
+ security/selinux/ss/avtab.c    |  9 ++++++++-
+ security/selinux/ss/policydb.c | 21 ++++++++++++++++++++-
+ security/selinux/ss/policydb.h |  1 +
+ 3 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/security/selinux/ss/avtab.c b/security/selinux/ss/avtab.c
+index 50df8b69de2ba667d15812a510c5f39d6ed7cba6..5b45f37fdcbbb5cb4b5cce17c6c8dcef803428ac 100644
+--- a/security/selinux/ss/avtab.c
++++ b/security/selinux/ss/avtab.c
+@@ -426,6 +426,13 @@ int avtab_read_item(struct avtab *a, struct policy_file *fp, struct policydb *po
+ 				}
+ 				key.specified = spec_order[i] | enabled;
+ 				datum.u.data = le32_to_cpu(buf32[items++]);
++
++				if ((key.specified & AVTAB_TYPE) &&
++				    !policydb_simpletype_isvalid(pol, datum.u.data)) {
++					pr_err("SELinux: avtab: invalid type\n");
++					return -EINVAL;
++				}
++
+ 				rc = insertf(a, &key, &datum, p);
+ 				if (rc)
+ 					return rc;
+@@ -517,7 +524,7 @@ int avtab_read_item(struct avtab *a, struct policy_file *fp, struct policydb *po
+ 		datum.u.data = le32_to_cpu(*buf32);
+ 	}
+ 	if ((key.specified & AVTAB_TYPE) &&
+-	    !policydb_type_isvalid(pol, datum.u.data)) {
++	    !policydb_simpletype_isvalid(pol, datum.u.data)) {
+ 		pr_err("SELinux: avtab: invalid type\n");
+ 		return -EINVAL;
+ 	}
+diff --git a/security/selinux/ss/policydb.c b/security/selinux/ss/policydb.c
+index e4adea4d76d2367bb1c394ddefdb294963f3e171..8ef225f8321bdebacef2e88cd0780ac8fe998804 100644
+--- a/security/selinux/ss/policydb.c
++++ b/security/selinux/ss/policydb.c
+@@ -984,6 +984,23 @@ bool policydb_type_isvalid(const struct policydb *p, u32 type)
+ 	return true;
+ }
+ 
++bool policydb_simpletype_isvalid(const struct policydb *p, u32 type)
++{
++	const struct type_datum *datum;
++
++	if (!type || type > p->p_types.nprim)
++		return false;
++
++	datum = p->type_val_to_struct[type - 1];
++	if (!datum)
++		return false;
++
++	if (datum->attribute)
++		return false;
++
++	return true;
++}
++
+ /*
+  * Return true if the fields in the security context
+  * structure `c' are valid.  Return 0 otherwise.
+@@ -2156,6 +2173,8 @@ static int filename_trans_read_helper_compat(struct policydb *p, struct policy_f
+ 	key.name = name;
+ 
+ 	otype = le32_to_cpu(buf[3]);
++	if (!policydb_simpletype_isvalid(p, otype))
++		goto out;
+ 
+ 	last = NULL;
+ 	datum = policydb_filenametr_search(p, &key);
+@@ -2278,7 +2297,7 @@ static int filename_trans_read_helper(struct policydb *p, struct policy_file *fp
+ 		datum->otype = le32_to_cpu(buf[0]);
+ 
+ 		rc = -EINVAL;
+-		if (!policydb_type_isvalid(p, datum->otype))
++		if (!policydb_simpletype_isvalid(p, datum->otype))
+ 			goto out;
+ 
+ 		dst = &datum->next;
+diff --git a/security/selinux/ss/policydb.h b/security/selinux/ss/policydb.h
+index b1a64c23e1dcd7bde89faa31094be2bf0542e098..974180b2e3a35fe8de92542a6e5d53449660799a 100644
+--- a/security/selinux/ss/policydb.h
++++ b/security/selinux/ss/policydb.h
+@@ -326,6 +326,7 @@ extern bool policydb_context_isvalid(const struct policydb *p,
+ 				     const struct context *c);
+ extern bool policydb_class_isvalid(const struct policydb *p, u16 class);
+ extern bool policydb_type_isvalid(const struct policydb *p, u32 type);
++extern bool policydb_simpletype_isvalid(const struct policydb *p, u32 type);
+ extern bool policydb_role_isvalid(const struct policydb *p, u32 role);
+ extern bool policydb_user_isvalid(const struct policydb *p, u32 user);
+ extern int policydb_read(struct policydb *p, struct policy_file *fp);

@@ -1,0 +1,171 @@
+From 2cd6c413bc4785306f44c2d8118000d0b9db65e2 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Wed, 3 Sep 2025 15:24:26 -0400
+Subject: [PATCH 89/90] selinux: implement LSM_ATTR_UNSHARE
+
+This implements the recently defined LSM_ATTR_UNSHARE attribute for
+the lsm_set_self_attr(2) and lsm_get_self_attr(2) system calls for
+SELinux.
+
+lsm_set_self_attr(LSM_ATTR_UNSHARE, ...) immediately unshares the
+SELinux namespace of the current process just like an unshare(2)
+system call would do for other Linux namespaces.
+
+lsm_get_self_attr(LSM_ATTR_UNSHARE, ...) sets ctx->ctx_len to 1 and
+ctx->ctx[0] to 1 iff the SELinux namespace was unshared and has not
+yet been fully initialized (i.e. no policy loaded yet); otherwise it
+sets ctx->ctx_len to 1 and ctx->ctx[0] to 0.
+
+Differences between this syscall interface and the selinuxfs interface
+that need discussion before moving forward:
+
+1. The syscall interface does not currently check any Linux capability
+or DAC permissions, whereas the selinuxfs interface can only be set by
+uid-0 or CAP_DAC_OVERRIDE processes (as a side effect of the fact that
+it is done via the filesystem interface). We need to decide what if
+any capability or DAC check should apply to this syscall interface and
+if any, add the checks to either the LSM framework code or to the
+SELinux hook function.
+
+Pros: Checking a capability or DAC permissions prevents misuse of this
+interface by unprivileged processes, particularly on systems with
+policies that do not yet define any of the new SELinux permissions
+introduced for controlling this operation. This is a potential concern
+on Linux distributions that do not tightly coordinate kernel updates
+with policy updates (or where users may choose to deploy upstream
+kernels on their own), but not on Android.
+
+Cons: Checking a capability or DAC permissions requires any process
+that uses this facility to have the corresponding capability or
+permissions, which might otherwise be unnecessary and create
+additional risks. This is less likely if we use a capability already
+required by container runtimes and similar components that might
+leverage this facility for unsharing SELinux namespaces.
+
+2. The syscall interface checks a new SELinux unshare_selinuxns
+permission in the process2 class between the task SID and itself,
+similar to other checks for setting process attributes. This means
+that:
+    allow domain self:process2 *; -or-
+    allow domain self:process2 ~anything-other-than-unshare_selinuxns; -or-
+    allow domain self:process2 unshare_selinuxns;
+would allow a process to unshare its SELinux namespace.
+
+The selinuxfs interface checks a new unshare permission in the
+security class between the task SID and the security initial SID,
+likewise similar to other checks for setting selinuxfs attributes.
+This means that:
+    allow domain security_t:security *; -or-
+    allow domain security_t:security ~anything-other-than-unshare; -or-
+    allow domain security_t:security unshare;
+would allow a process to unshare its SELinux namespace.
+
+Technically, the selinuxfs interface also currently requires open and
+write access to the selinuxfs node; hence:
+    allow domain security_t:file { open write };
+is also required for the selinuxfs interface.
+
+We need to decide what we want the SELinux check(s) to be for the
+syscall and whether it should be more like the former (process
+attributes) or more like the latter (security policy settings). Note
+that the permission name itself is unimportant here and only differs
+because it seemed less evident in the process2 class that we are
+talking about a SELinux namespace otherwise.
+
+Regardless, either form of allow rule can be prohibited in policies
+via neverallow rules on systems that enforce their usage
+(e.g. Android, not necessarily on Linux distributions).
+
+3. The selinuxfs interface currently offers more functionality than
+implemented here for the sycall interface, including:
+
+a) the ability to read the selinuxfs node to see if your namespace has
+ever been unshared. This is currently leveraged by a corresponding
+patch for the selinux-testsuite to detect that we are running in a
+child SELinux namespace and skip certain tests in that case. Currently
+the lsm_get_self_attr(LSM_ATTR_UNSHARE, ...) only returns 1 if the
+namespace has been unshared and is not yet fully initialized for use
+by e.g.  systemd to detect that it is running a child namespace and
+should load a policy.
+
+b) the abilities to get and set the maximum number of SELinux
+namespaces (via a /sys/fs/selinux/maxns node) and to get and set the
+maximum depth for SELinux namespaces (via a /sys/fs/selinux/maxnsdepth
+node). These could be left in selinuxfs or migrated to some other LSM
+management APIs since they are global in scope, not per-process
+attributes.
+
+Link: https://lore.kernel.org/selinux/CAHC9VhRGMmhxbajwQNfGFy+ZFF1uN=UEBjqQZQ4UBy7yds3eVQ@mail.gmail.com/
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 55399fe206935a2d0a8560d38ca7064d63e4a9ba
+---
+ security/selinux/hooks.c            | 24 ++++++++++++++++++++++++
+ security/selinux/include/classmap.h |  4 +++-
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 0923ab95e92356d67a7875758093698a467a9045..7457b869ceece972c70d241ff1c98a04edeff047 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -6946,6 +6946,18 @@ static int selinux_lsm_getattr(unsigned int attr, struct task_struct *p,
+ 	case LSM_ATTR_SOCKCREATE:
+ 		sid = crsec->sockcreate_sid;
+ 		break;
++#ifdef CONFIG_SECURITY_SELINUX_NS
++	case LSM_ATTR_UNSHARE:
++		*value = kmalloc(1, GFP_ATOMIC);
++		if (!(*value)) {
++			error = -ENOMEM;
++			goto err_unlock;
++		}
++		**value = !!(crsec->state != init_selinux_state &&
++			     !selinux_initialized(crsec->state));
++		error = 1;
++		goto err_unlock;
++#endif
+ 	default:
+ 		error = -EOPNOTSUPP;
+ 		goto err_unlock;
+@@ -7010,6 +7022,12 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
+ 		error = avc_has_perm(state, mysid, mysid, SECCLASS_PROCESS,
+ 				     PROCESS__SETCURRENT, NULL);
+ 		break;
++#ifdef CONFIG_SECURITY_SELINUX_NS
++	case LSM_ATTR_UNSHARE:
++		error = avc_has_perm(state, mysid, mysid, SECCLASS_PROCESS2,
++				     PROCESS2__UNSHARE_SELINUXNS, NULL);
++		break;
++#endif
+ 	default:
+ 		error = -EOPNOTSUPP;
+ 		break;
+@@ -7121,6 +7139,12 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
+ 		}
+ 
+ 		crsec->sid = sid;
++#ifdef CONFIG_SECURITY_SELINUX_NS
++	} else if (attr == LSM_ATTR_UNSHARE) {
++		error = selinux_state_create(new);
++		if (error)
++			goto abort_change;
++#endif
+ 	} else {
+ 		error = -EINVAL;
+ 		goto abort_change;
+diff --git a/security/selinux/include/classmap.h b/security/selinux/include/classmap.h
+index 8310f068a221ea720c03e6f8bce340ea1baabd5c..72a61833e1ede928e4ce5dbb2c0c2cde3282b23a 100644
+--- a/security/selinux/include/classmap.h
++++ b/security/selinux/include/classmap.h
+@@ -60,7 +60,9 @@ const struct security_class_mapping secclass_map[] = {
+ 	    "siginh",	    "setrlimit",     "rlimitinh",   "dyntransition",
+ 	    "setcurrent",   "execmem",	     "execstack",   "execheap",
+ 	    "setkeycreate", "setsockcreate", "getrlimit",   NULL } },
+-	{ "process2", { "nnp_transition", "nosuid_transition", NULL } },
++	{ "process2",
++	  { "nnp_transition", "nosuid_transition", "unshare_selinuxns",
++	    NULL } },
+ 	{ "system",
+ 	  { "ipc_info", "syslog_read", "syslog_mod", "syslog_console",
+ 	    "module_request", "module_load", "firmware_load",

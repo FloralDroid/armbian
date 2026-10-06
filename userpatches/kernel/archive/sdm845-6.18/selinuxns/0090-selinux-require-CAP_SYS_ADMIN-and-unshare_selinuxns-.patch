@@ -1,0 +1,44 @@
+From d964d2559749759aec3f6a4eca08a4228b137ce3 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Mon, 4 May 2026 09:16:23 -0400
+Subject: [PATCH 90/90] selinux: require CAP_SYS_ADMIN and unshare_selinuxns
+ for SELinux unshare
+
+Tighten up the checks for unsharing the SELinux namespace to
+approximate the checks if we were using a selinuxfs-based
+interface and require permission in ancestor namespaces as well.
+This may break some use cases and may change in the future, but
+let's be conservative for now.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: d66100b8759f2048abc7e9269e81222a92d5d09c
+---
+ security/selinux/hooks.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 7457b869ceece972c70d241ff1c98a04edeff047..52b0c5739509f648e534ebe4df03194911d1937d 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -7024,8 +7024,18 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
+ 		break;
+ #ifdef CONFIG_SECURITY_SELINUX_NS
+ 	case LSM_ATTR_UNSHARE:
+-		error = avc_has_perm(state, mysid, mysid, SECCLASS_PROCESS2,
+-				     PROCESS2__UNSHARE_SELINUXNS, NULL);
++		/*
++		 * TODO: Figure out how we want to control unsharing
++		 * of the SELinux namespace. For now, require CAP_SYS_ADMIN
++		 * and check SELinux unshare_selinuxns in this and all ancestor
++		 * namspaces.
++		 */
++		if (!ns_capable(current_user_ns(), CAP_SYS_ADMIN)) {
++			error = -EPERM;
++			break;
++		}
++		error = cred_self_has_perm(cred, SECCLASS_PROCESS2,
++					   PROCESS2__UNSHARE_SELINUXNS, NULL);
+ 		break;
+ #endif
+ 	default:

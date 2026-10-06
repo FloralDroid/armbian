@@ -1,0 +1,117 @@
+From e7974ef125f89eb804bdb9a26af8722fcadcc256 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Fri, 21 Aug 2020 16:05:39 -0400
+Subject: [PATCH 47/90] selinux: support multiple selinuxfs instances
+
+Support multiple selinuxfs instances, one per selinux namespace.
+
+The expected usage would be to unshare the SELinux namespace and
+the mount namespace, and then mount a new selinuxfs instance.  The
+new instance would then provide an interface for viewing and manipulating
+the state of the new SELinux namespace and would not affect the parent
+namespace in any manner.
+
+This change by itself should have no effect on SELinux behavior or
+APIs (userspace or LSM).
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: d59900f2f7f5d04fd9ed2fb1b167bd60ccd2f7ad
+---
+ security/selinux/selinuxfs.c | 51 +++++++++++++++++++++++++++++-------
+ 1 file changed, 41 insertions(+), 10 deletions(-)
+
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index e9460cc53711eeb7ecfc9a95f8b9c16a8440fb32..8855cb10c0e410a9d438667ddfea708cf4e0b4bf 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -81,19 +81,17 @@ struct selinux_fs_info {
+ 	struct super_block *sb;
+ };
+ 
+-static int selinux_fs_info_create(struct super_block *sb)
++static struct selinux_fs_info *selinux_fs_info_create(void)
+ {
+ 	struct selinux_fs_info *fsi;
+ 
+ 	fsi = kzalloc(sizeof(*fsi), GFP_KERNEL);
+ 	if (!fsi)
+-		return -ENOMEM;
++		return NULL;
+ 
+ 	fsi->last_ino = SEL_INO_NEXT - 1;
+ 	fsi->state = current_selinux_state;
+-	fsi->sb = sb;
+-	sb->s_fs_info = fsi;
+-	return 0;
++	return fsi;
+ }
+ 
+ static void selinux_fs_info_free(struct selinux_fs_info *fsi)
+@@ -1925,15 +1923,12 @@ static int sel_fill_super(struct super_block *sb, struct fs_context *fc)
+ 		/* last one */ {"", NULL, 0}
+ 	};
+ 
+-	ret = selinux_fs_info_create(sb);
+-	if (ret)
+-		goto err;
+-
+ 	ret = simple_fill_super(sb, SELINUX_MAGIC, selinux_files);
+ 	if (ret)
+ 		goto err;
+ 
+ 	fsi = sb->s_fs_info;
++	fsi->sb = sb;
+ 	fsi->bool_dir = sel_make_dir(sb->s_root, BOOL_DIR_NAME, &fsi->last_ino);
+ 	if (IS_ERR(fsi->bool_dir)) {
+ 		ret = PTR_ERR(fsi->bool_dir);
+@@ -2021,12 +2016,48 @@ static int sel_fill_super(struct super_block *sb, struct fs_context *fc)
+ 	return ret;
+ }
+ 
++static int selinuxfs_compare(struct super_block *sb, struct fs_context *fc)
++{
++	struct selinux_fs_info *fsi = sb->s_fs_info;
++
++	return (current_selinux_state == fsi->state);
++}
++
+ static int sel_get_tree(struct fs_context *fc)
+ {
+-	return get_tree_single(fc, sel_fill_super);
++	struct selinux_fs_info *fsi;
++	struct super_block *sb;
++	int err;
++
++	fsi = selinux_fs_info_create();
++	if (!fsi)
++		return -ENOMEM;
++
++	fc->s_fs_info = fsi;
++	sb = sget_fc(fc, selinuxfs_compare, set_anon_super_fc);
++	if (IS_ERR(sb))
++		return PTR_ERR(sb);
++
++	if (!sb->s_root) {
++		err = sel_fill_super(sb, fc);
++		if (err) {
++			deactivate_locked_super(sb);
++			return err;
++		}
++		sb->s_flags |= SB_ACTIVE;
++	}
++
++	fc->root = dget(sb->s_root);
++	return 0;
++}
++
++static void sel_free_fs_context(struct fs_context *fc)
++{
++	selinux_fs_info_free(fc->s_fs_info);
+ }
+ 
+ static const struct fs_context_operations sel_context_ops = {
++	.free		= sel_free_fs_context,
+ 	.get_tree	= sel_get_tree,
+ };
+ 

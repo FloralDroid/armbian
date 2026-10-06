@@ -1,0 +1,59 @@
+From d1bc0b2b8e813af13bb29f9b58eb5e3f0b03017a Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Fri, 3 Oct 2025 08:42:40 -0400
+Subject: [PATCH 88/90] lsm,uapi: introduce LSM_ATTR_UNSHARE
+
+This defines a new LSM_ATTR_UNSHARE attribute for the
+lsm_set_self_attr(2) and lsm_get_self_attr(2) system calls. When
+passed to lsm_set_self_attr(2), the LSM-specific namespace for the
+specified LSM id is immediately unshared in a similar manner to the
+unshare(2) system call for other Linux namespaces. When passed to
+lsm_get_self_attr(2), ctx->ctx_len is set to 1 and ctx->ctx[0] is set
+to a boolean (0 or 1) that indicates whether the LSM-specific
+namespace for the specified LSM id has been unshared and not yet fully
+initialized (e.g. no policy yet loaded).
+
+Link: https://lore.kernel.org/selinux/CAHC9VhRGMmhxbajwQNfGFy+ZFF1uN=UEBjqQZQ4UBy7yds3eVQ@mail.gmail.com/
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: ca93eacb1806e92edb50a6fd34a974dff12057a6
+---
+ Documentation/userspace-api/lsm.rst | 11 +++++++++++
+ include/uapi/linux/lsm.h            |  1 +
+ 2 files changed, 12 insertions(+)
+
+diff --git a/Documentation/userspace-api/lsm.rst b/Documentation/userspace-api/lsm.rst
+index a76da373841b26c2e39de7a58b50c9fed91e1be2..1134629863cfcde0ac8d612fd8500696485ce3e4 100644
+--- a/Documentation/userspace-api/lsm.rst
++++ b/Documentation/userspace-api/lsm.rst
+@@ -48,6 +48,17 @@ creating socket objects.
+ The proc filesystem provides this value in ``/proc/self/attr/sockcreate``.
+ This is supported by the SELinux security module.
+ 
++``LSM_ATTR_UNSHARE`` is used to unshare the LSM-specific namespace for
++the process.
++When passed to ``lsm_set_self_attr(2)``, the LSM-specific namespace
++for the specified LSM id is immediately unshared in a similar manner
++to the ``unshare(2)`` system call for other Linux namespaces. When
++passed to ``lsm_get_self_attr(2)``, ``ctx->ctx_len`` is set to ``1``
++and ``ctx->ctx[0]`` is set to a boolean (``0`` or ``1``) that
++indicates whether the LSM-specific namespace for the specified LSM id
++has been unshared and not yet fully initialized (e.g. no policy yet
++loaded).
++
+ Kernel interface
+ ================
+ 
+diff --git a/include/uapi/linux/lsm.h b/include/uapi/linux/lsm.h
+index 938593dfd5daf46e81011e1e69845c10bd89bc1b..fb1b4a8aa6399a1670befa99c5c34fc5edbde4dc 100644
+--- a/include/uapi/linux/lsm.h
++++ b/include/uapi/linux/lsm.h
+@@ -83,6 +83,7 @@ struct lsm_ctx {
+ #define LSM_ATTR_KEYCREATE	103
+ #define LSM_ATTR_PREV		104
+ #define LSM_ATTR_SOCKCREATE	105
++#define LSM_ATTR_UNSHARE	106
+ 
+ /*
+  * LSM_FLAG_XXX definitions identify special handling instructions

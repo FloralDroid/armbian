@@ -1,0 +1,89 @@
+From 2972bbfa08168a05ae442dd653ef5b0ebacb74a1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20G=C3=B6ttsche?= <cgzones@googlemail.com>
+Date: Sun, 11 May 2025 19:30:07 +0200
+Subject: [PATCH 40/90] selinux: check type attr map overflows
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Validate that no types with an invalid too high ID are present in the
+attribute map.  Gaps are still not checked.
+
+Signed-off-by: Christian Göttsche <cgzones@googlemail.com>
+Acked-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+[PM: changed name to ebitmap_get_highest_set_bit()]
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+
+Upstream-commit: 259915b053b88bae525024f85f36e49c1f903a4b
+---
+ security/selinux/ss/ebitmap.c  | 27 +++++++++++++++++++++++++++
+ security/selinux/ss/ebitmap.h  |  1 +
+ security/selinux/ss/policydb.c |  5 +++++
+ 3 files changed, 33 insertions(+)
+
+diff --git a/security/selinux/ss/ebitmap.c b/security/selinux/ss/ebitmap.c
+index 43bc19e2196098b3fb8ab4d9d9db0667fbf6ee97..ea894361fed644e75a2cc9aa50a374fde0e674bf 100644
+--- a/security/selinux/ss/ebitmap.c
++++ b/security/selinux/ss/ebitmap.c
+@@ -257,6 +257,33 @@ int ebitmap_contains(const struct ebitmap *e1, const struct ebitmap *e2,
+ 	return 1;
+ }
+ 
++u32 ebitmap_get_highest_set_bit(const struct ebitmap *e)
++{
++	const struct ebitmap_node *n;
++	unsigned long unit;
++	u32 pos = 0;
++
++	n = e->node;
++	if (!n)
++		return 0;
++
++	while (n->next)
++		n = n->next;
++
++	for (unsigned int i = EBITMAP_UNIT_NUMS; i > 0; i--) {
++		unit = n->maps[i - 1];
++		if (unit == 0)
++			continue;
++
++		pos = (i - 1) * EBITMAP_UNIT_SIZE;
++		while (unit >>= 1)
++			pos++;
++		break;
++	}
++
++	return n->startbit + pos;
++}
++
+ int ebitmap_get_bit(const struct ebitmap *e, u32 bit)
+ {
+ 	const struct ebitmap_node *n;
+diff --git a/security/selinux/ss/ebitmap.h b/security/selinux/ss/ebitmap.h
+index c9569998f287d32418cd091e5bcc4e0b5a11fd88..ae05cc8e46721ed5033209c10ee000fe52e34bcb 100644
+--- a/security/selinux/ss/ebitmap.h
++++ b/security/selinux/ss/ebitmap.h
+@@ -126,6 +126,7 @@ int ebitmap_and(struct ebitmap *dst, const struct ebitmap *e1,
+ 		const struct ebitmap *e2);
+ int ebitmap_contains(const struct ebitmap *e1, const struct ebitmap *e2,
+ 		     u32 last_e2bit);
++u32 ebitmap_get_highest_set_bit(const struct ebitmap *e);
+ int ebitmap_get_bit(const struct ebitmap *e, u32 bit);
+ int ebitmap_set_bit(struct ebitmap *e, u32 bit, int value);
+ void ebitmap_destroy(struct ebitmap *e);
+diff --git a/security/selinux/ss/policydb.c b/security/selinux/ss/policydb.c
+index ded23c8705b8c0256c8ea06cb366abcba5428430..736de07df3699de156bb6dea111b27da19063941 100644
+--- a/security/selinux/ss/policydb.c
++++ b/security/selinux/ss/policydb.c
+@@ -2978,6 +2978,11 @@ int policydb_read(struct policydb *p, struct policy_file *fp)
+ 			if (rc)
+ 				goto bad;
+ 		}
++
++		rc = -EINVAL;
++		if (ebitmap_get_highest_set_bit(e) >= p->p_types.nprim)
++			goto bad;
++
+ 		/* add the type itself as the degenerate case */
+ 		rc = ebitmap_set_bit(e, i, 1);
+ 		if (rc)

@@ -1,0 +1,57 @@
+From 6992ba3f955ce49d5109f5c7c2db5b7d9885e39c Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Wed, 29 Apr 2026 14:15:31 -0400
+Subject: [PATCH 37/90] selinux: fix sel_kill_sb()
+
+Fix the order in sel_kill_sb() to match other pseudo filesystems.
+This does not currently matter for selinuxfs per se but could
+in the future, e.g. with SELinux namespaces and multiple selinuxfs
+instances.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+
+Upstream-commit: ef5b517e7bacbaba03d706cd624366addf6ef33a
+
+Backport: retain the Linux 6.18 kill_litter_super() teardown helper.
+---
+ security/selinux/selinuxfs.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index e821519205978b3299ae8f8925c90e9600f529aa..c035a8497407f65f1e9618c836af60019510d6d0 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -94,9 +94,8 @@ static int selinux_fs_info_create(struct super_block *sb)
+ 	return 0;
+ }
+ 
+-static void selinux_fs_info_free(struct super_block *sb)
++static void selinux_fs_info_free(struct selinux_fs_info *fsi)
+ {
+-	struct selinux_fs_info *fsi = sb->s_fs_info;
+ 	unsigned int i;
+ 
+ 	if (fsi) {
+@@ -105,8 +104,7 @@ static void selinux_fs_info_free(struct super_block *sb)
+ 		kfree(fsi->bool_pending_names);
+ 		kfree(fsi->bool_pending_values);
+ 	}
+-	kfree(sb->s_fs_info);
+-	sb->s_fs_info = NULL;
++	kfree(fsi);
+ }
+ 
+ #define SEL_INITCON_INO_OFFSET		0x01000000
+@@ -1995,8 +1993,10 @@ static int sel_init_fs_context(struct fs_context *fc)
+ 
+ static void sel_kill_sb(struct super_block *sb)
+ {
+-	selinux_fs_info_free(sb);
++	struct selinux_fs_info *fsi = sb->s_fs_info;
++
+ 	kill_litter_super(sb);
++	selinux_fs_info_free(fsi);
+ }
+ 
+ static struct file_system_type sel_fs_type = {

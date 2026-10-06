@@ -1,0 +1,189 @@
+From 0935de9d63292e2d632c26777f77c9a4870dd798 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Mon, 7 Oct 2024 09:13:53 -0400
+Subject: [PATCH 73/90] selinux: make open_perms namespace-aware
+
+Adjust the handling of the open_perms policy capability to
+be namespace-aware. This ensures that file open permission
+is checked against each namespace in accordance with the
+namespace policy. Otherwise, a child SELinux namespace
+could escape checking of file open permission in the
+parent namespace by disabling it in its own policy.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 1b539f3e9119c4aefa1d84f1823a512740228774
+---
+ security/selinux/hooks.c            | 111 +++++++++++++++++++++-------
+ security/selinux/include/security.h |   5 +-
+ 2 files changed, 85 insertions(+), 31 deletions(-)
+
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index bd93581bc29cd058538a2beacf8aaa3235042037..4661933e507d8e751a414f4182004d9bcca4f3f4 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -2058,22 +2058,6 @@ static inline u32 file_to_av(const struct file *file)
+ 	return av;
+ }
+ 
+-/*
+- * Convert a file to an access vector and include the correct
+- * open permission.
+- */
+-static inline u32 open_file_to_av(struct file *file)
+-{
+-	u32 av = file_to_av(file);
+-	struct inode *inode = file_inode(file);
+-
+-	if (selinux_policycap_openperm() &&
+-	    inode->i_sb->s_magic != SOCKFS_MAGIC)
+-		av |= FILE__OPEN;
+-
+-	return av;
+-}
+-
+ /* Hook functions begin here. */
+ 
+ static int selinux_binder_set_context_mgr(const struct cred *mgr)
+@@ -3361,7 +3345,13 @@ static int selinux_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	const struct cred *cred = current_cred();
+ 	struct inode *inode = d_backing_inode(dentry);
+ 	unsigned int ia_valid = iattr->ia_valid;
+-	u32 av = FILE__WRITE;
++	struct inode_security_struct *isec;
++	struct cred_security_struct *crsec;
++	struct selinux_state *state;
++	struct common_audit_data ad;
++	u32 ssid, tsid, av, requested;
++	u16 sclass;
++	int rc;
+ 
+ 	/* ATTR_FORCE is just used for ATTR_KILL_S[UG]ID. */
+ 	if (ia_valid & ATTR_FORCE) {
+@@ -3375,13 +3365,41 @@ static int selinux_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 			ATTR_ATIME_SET | ATTR_MTIME_SET | ATTR_TIMES_SET))
+ 		return dentry_has_perm(cred, dentry, FILE__SETATTR);
+ 
+-	if (selinux_policycap_openperm() &&
+-	    inode->i_sb->s_magic != SOCKFS_MAGIC &&
+-	    (ia_valid & ATTR_SIZE) &&
+-	    !(ia_valid & ATTR_FILE))
+-		av |= FILE__OPEN;
++	/*
++	 * The following is an inlined version of dentry_has_perm()->
++	 * inode_has_perm()->cred_tsid_has_perm() in order to specialize
++	 * the requested permissions based on the open_perms policycap
++	 * value in each namespace.
++	 */
++	ad.type = LSM_AUDIT_DATA_DENTRY;
++	ad.u.dentry = dentry;
++	__inode_security_revalidate(inode, dentry, true);
++	if (unlikely(IS_PRIVATE(inode)))
++		return 0;
++	isec = selinux_inode(inode);
++	tsid = isec->sid;
++	sclass = isec->sclass;
++	av = FILE__WRITE;
++
++	do {
++		crsec = selinux_cred(cred);
++		ssid = crsec->sid;
++		state = crsec->state;
++		requested = av;
++
++		if (selinux_policycap_openperm(state) &&
++			inode->i_sb->s_magic != SOCKFS_MAGIC &&
++			(ia_valid & ATTR_SIZE) &&
++			!(ia_valid & ATTR_FILE))
++			requested |= FILE__OPEN;
++
++		rc = avc_has_perm(state, ssid, tsid, sclass, requested, &ad);
++		if (rc)
++			return rc;
++		cred = crsec->parent_cred;
++	} while (cred);
+ 
+-	return dentry_has_perm(cred, dentry, av);
++	return 0;
+ }
+ 
+ static int selinux_inode_getattr(const struct path *path)
+@@ -4323,11 +4341,17 @@ static int selinux_file_receive(struct file *file)
+ 
+ static int selinux_file_open(struct file *file)
+ {
+-	struct file_security_struct *fsec;
+-	struct inode_security_struct *isec;
++	struct file_security_struct *fsec = selinux_file(file);
++	struct inode *inode = file_inode(file);
++	struct inode_security_struct *isec = inode_security(inode);
++	const struct cred *cred = file->f_cred;
++	struct cred_security_struct *crsec;
++	struct selinux_state *state;
++	struct common_audit_data ad;
++	u32 ssid, tsid, av, requested;
++	u16 sclass;
++	int rc;
+ 
+-	fsec = selinux_file(file);
+-	isec = inode_security(file_inode(file));
+ 	/*
+ 	 * Save inode label and policy sequence number
+ 	 * at open-time so that selinux_file_permission
+@@ -4345,7 +4369,38 @@ static int selinux_file_open(struct file *file)
+ 	 * new inode label or new policy.
+ 	 * This check is not redundant - do not remove.
+ 	 */
+-	return file_path_has_perm(file->f_cred, file, open_file_to_av(file));
++	/*
++	 * The following is an inlined version of file_path_has_perm()->
++	 * inode_has_perm()->cred_tsid_has_perm() in order to specialize
++	 * the requested permissions based on the open_perms policycap
++	 * value in each namespace.
++	 */
++	ad.type = LSM_AUDIT_DATA_FILE;
++	ad.u.file = file;
++	cred = file->f_cred;
++	if (unlikely(IS_PRIVATE(inode)))
++		return 0;
++	tsid = isec->sid;
++	sclass = isec->sclass;
++	av = file_to_av(file);
++
++	do {
++		crsec = selinux_cred(cred);
++		ssid = crsec->sid;
++		state = crsec->state;
++		requested = av;
++
++		if (selinux_policycap_openperm(state) &&
++			inode->i_sb->s_magic != SOCKFS_MAGIC)
++			requested |= FILE__OPEN;
++
++		rc = avc_has_perm(state, ssid, tsid, sclass, requested, &ad);
++		if (rc)
++			return rc;
++		cred = crsec->parent_cred;
++	} while (cred);
++
++	return 0;
+ }
+ 
+ /* task security operations */
+diff --git a/security/selinux/include/security.h b/security/selinux/include/security.h
+index 02d503f407516fefcdd229e59f71a9f3c59df3e4..c000dcf86eec5bf7c56a5451658124aeb5f04b81 100644
+--- a/security/selinux/include/security.h
++++ b/security/selinux/include/security.h
+@@ -216,10 +216,9 @@ static inline bool selinux_policycap_netpeer(void)
+ 		current_selinux_state->policycap[POLICYDB_CAP_NETPEER]);
+ }
+ 
+-static inline bool selinux_policycap_openperm(void)
++static inline bool selinux_policycap_openperm(struct selinux_state *state)
+ {
+-	return READ_ONCE(
+-		current_selinux_state->policycap[POLICYDB_CAP_OPENPERM]);
++	return READ_ONCE(state->policycap[POLICYDB_CAP_OPENPERM]);
+ }
+ 
+ static inline bool selinux_policycap_extsockclass(void)

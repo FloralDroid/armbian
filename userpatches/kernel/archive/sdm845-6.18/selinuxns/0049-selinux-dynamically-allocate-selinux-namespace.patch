@@ -1,0 +1,268 @@
+From 219e1e80d96db861de4cb6e9a204a3dbe6b8f713 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Fri, 21 Aug 2020 16:05:52 -0400
+Subject: [PATCH 49/90] selinux: dynamically allocate selinux namespace
+
+Move from static allocation of a single selinux namespace to
+dynamic allocation.  Include necessary support for lifecycle management
+of the selinux namespace, modeled after the user namespace support.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 88f35dc23ef41b750b1da49c65a55f699a40026e
+---
+ security/selinux/avc.c              | 32 ++++++++++----
+ security/selinux/hooks.c            | 65 +++++++++++++++++++++++++----
+ security/selinux/include/security.h | 29 ++++++++++++-
+ security/selinux/netlink.c          |  2 +-
+ security/selinux/selinuxfs.c        |  3 +-
+ security/selinux/ss/services.c      | 17 +++++++-
+ 6 files changed, 127 insertions(+), 21 deletions(-)
+
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index 32e1a116f2b76ce9df6c862cd343fe8b9d4aeeb8..056e597912ec8efedcbe3a8875c259a1c95e26e0 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -91,20 +91,34 @@ struct selinux_avc {
+ 	struct avc_cache avc_cache;
+ };
+ 
+-static struct selinux_avc selinux_avc;
+-
+-void selinux_avc_init(struct selinux_avc **avc)
++int selinux_avc_create(struct selinux_avc **avc)
+ {
++	struct selinux_avc *newavc;
+ 	int i;
+ 
+-	selinux_avc.avc_cache_threshold = AVC_DEF_CACHE_THRESHOLD;
++	newavc = kzalloc(sizeof(*newavc), GFP_KERNEL);
++	if (!newavc)
++		return -ENOMEM;
++
++	newavc->avc_cache_threshold = AVC_DEF_CACHE_THRESHOLD;
++
+ 	for (i = 0; i < AVC_CACHE_SLOTS; i++) {
+-		INIT_HLIST_HEAD(&selinux_avc.avc_cache.slots[i]);
+-		spin_lock_init(&selinux_avc.avc_cache.slots_lock[i]);
++		INIT_HLIST_HEAD(&newavc->avc_cache.slots[i]);
++		spin_lock_init(&newavc->avc_cache.slots_lock[i]);
+ 	}
+-	atomic_set(&selinux_avc.avc_cache.active_nodes, 0);
+-	atomic_set(&selinux_avc.avc_cache.lru_hint, 0);
+-	*avc = &selinux_avc;
++	atomic_set(&newavc->avc_cache.active_nodes, 0);
++	atomic_set(&newavc->avc_cache.lru_hint, 0);
++
++	*avc = newavc;
++	return 0;
++}
++
++static void avc_flush(struct selinux_avc *avc);
++
++void selinux_avc_free(struct selinux_avc *avc)
++{
++	avc_flush(avc);
++	kfree(avc);
+ }
+ 
+ unsigned int avc_get_cache_threshold(struct selinux_avc *avc)
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index d4d4a568da5cc82dc3ee2758df6173ceaafbc52d..baeb8c8cfcae3663a58f8b30eebe26d2d5d4c3e5 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -107,7 +107,7 @@
+ 
+ #define SELINUX_INODE_INIT_XATTRS 1
+ 
+-struct selinux_state init_selinux_state;
++struct selinux_state *init_selinux_state;
+ struct selinux_state *current_selinux_state;
+ 
+ /* SECMARK reference count */
+@@ -7857,16 +7857,67 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
+ #endif
+ };
+ 
++static void selinux_state_free(struct work_struct *work);
++
++int selinux_state_create(struct selinux_state *parent,
++			 struct selinux_state **state)
++{
++	struct selinux_state *newstate;
++	int rc;
++
++	newstate = kzalloc(sizeof(*newstate), GFP_KERNEL);
++	if (!newstate)
++		return -ENOMEM;
++
++	refcount_set(&newstate->count, 1);
++	INIT_WORK(&newstate->work, selinux_state_free);
++
++	mutex_init(&newstate->status_lock);
++	mutex_init(&newstate->policy_mutex);
++
++	rc = selinux_avc_create(&newstate->avc);
++	if (rc)
++		goto err;
++
++	if (parent)
++		newstate->parent = get_selinux_state(parent);
++
++	*state = newstate;
++	return 0;
++err:
++	kfree(newstate);
++	return rc;
++}
++
++static void selinux_state_free(struct work_struct *work)
++{
++	struct selinux_state *parent, *state =
++		container_of(work, struct selinux_state, work);
++
++	do {
++		parent = state->parent;
++		if (state->status_page)
++			__free_page(state->status_page);
++		selinux_state_policy_free(state);
++		selinux_avc_free(state->avc);
++		kfree(state);
++		state = parent;
++	} while (state && refcount_dec_and_test(&state->count));
++}
++
++void __put_selinux_state(struct selinux_state *state)
++{
++	schedule_work(&state->work);
++}
++
+ static __init int selinux_init(void)
+ {
+ 	pr_info("SELinux:  Initializing.\n");
+ 
+-	memset(&init_selinux_state, 0, sizeof(init_selinux_state));
+-	enforcing_set(&init_selinux_state, selinux_enforcing_boot);
+-	selinux_avc_init(&init_selinux_state.avc);
+-	mutex_init(&init_selinux_state.status_lock);
+-	mutex_init(&init_selinux_state.policy_mutex);
+-	current_selinux_state = &init_selinux_state;
++	if (selinux_state_create(NULL, &init_selinux_state))
++		panic("SELinux: Could not create initial namespace\n");
++	enforcing_set(init_selinux_state, selinux_enforcing_boot);
++	current_selinux_state = init_selinux_state;
+ 
+ 	/* Set the security state for the initial task. */
+ 	cred_init_security();
+diff --git a/security/selinux/include/security.h b/security/selinux/include/security.h
+index 6b658203c7a8b3874ae8f95af3d6400eed775b1d..3e9728e1dc4bae3020157e63c7339db806654d44 100644
+--- a/security/selinux/include/security.h
++++ b/security/selinux/include/security.h
+@@ -105,11 +105,36 @@ struct selinux_state {
+ 	struct selinux_avc *avc;
+ 	struct selinux_policy __rcu *policy;
+ 	struct mutex policy_mutex;
++	struct selinux_state *parent;
++
++	refcount_t count;
++	struct work_struct work;
+ } __randomize_layout;
+ 
+-void selinux_avc_init(struct selinux_avc **avc);
++int selinux_state_create(struct selinux_state *parent,
++			 struct selinux_state **state);
++void __put_selinux_state(struct selinux_state *state);
++
++void selinux_policy_free(struct selinux_policy *policy);
++void selinux_state_policy_free(struct selinux_state *state);
++
++int selinux_avc_create(struct selinux_avc **avc);
++void selinux_avc_free(struct selinux_avc *avc);
++
++static inline void put_selinux_state(struct selinux_state *state)
++{
++	if (state && refcount_dec_and_test(&state->count))
++		__put_selinux_state(state);
++}
++
++static inline struct selinux_state *
++get_selinux_state(struct selinux_state *state)
++{
++	refcount_inc(&state->count);
++	return state;
++}
+ 
+-extern struct selinux_state init_selinux_state;
++extern struct selinux_state *init_selinux_state;
+ extern struct selinux_state *current_selinux_state;
+ 
+ static inline bool selinux_initialized(const struct selinux_state *state)
+diff --git a/security/selinux/netlink.c b/security/selinux/netlink.c
+index 4b8983f2b9f392044f5fa6f51d1405a161ed296e..7ad946ba03f848d4eb320d033c539b98d9b8a9d2 100644
+--- a/security/selinux/netlink.c
++++ b/security/selinux/netlink.c
+@@ -78,7 +78,7 @@ static void selnl_notify(int msgtype, void *data)
+ 	 * notifications. Modern libselinux on modern kernels uses the
+ 	 * SELinux status page instead, which is per-namespace already.
+ 	 */
+-	if (current_selinux_state != &init_selinux_state)
++	if (current_selinux_state != init_selinux_state)
+ 		return;
+ 
+ 	len = selnl_msglen(msgtype);
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index 8855cb10c0e410a9d438667ddfea708cf4e0b4bf..a527fec51d82a693e6453dfaf2ee7f10da023532 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -90,7 +90,7 @@ static struct selinux_fs_info *selinux_fs_info_create(void)
+ 		return NULL;
+ 
+ 	fsi->last_ino = SEL_INO_NEXT - 1;
+-	fsi->state = current_selinux_state;
++	fsi->state = get_selinux_state(current_selinux_state);
+ 	return fsi;
+ }
+ 
+@@ -99,6 +99,7 @@ static void selinux_fs_info_free(struct selinux_fs_info *fsi)
+ 	unsigned int i;
+ 
+ 	if (fsi) {
++		put_selinux_state(fsi->state);
+ 		for (i = 0; i < fsi->bool_num; i++)
+ 			kfree(fsi->bool_pending_names[i]);
+ 		kfree(fsi->bool_pending_names);
+diff --git a/security/selinux/ss/services.c b/security/selinux/ss/services.c
+index c2341891bf0fd4ea46a52295a7977218a81dd03b..06c0bdbf59eab6a8d31fe93dedbe44b26d2fc150 100644
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@ -2229,7 +2229,7 @@ static void security_load_policycaps(struct selinux_state *state,
+ static int security_preserve_bools(struct selinux_policy *oldpolicy,
+ 				struct selinux_policy *newpolicy);
+ 
+-static void selinux_policy_free(struct selinux_policy *policy)
++void selinux_policy_free(struct selinux_policy *policy)
+ {
+ 	if (!policy)
+ 		return;
+@@ -2241,6 +2241,21 @@ static void selinux_policy_free(struct selinux_policy *policy)
+ 	kfree(policy);
+ }
+ 
++void selinux_state_policy_free(struct selinux_state *state)
++{
++	struct selinux_policy *policy;
++
++	/*
++	 * This is only called from selinux_state_free() when the
++	 * refcount for the state drops to zero, i.e. there are no
++	 * remaining references to the state and hence no remaining
++	 * references to its policy.
++	 */
++	policy = rcu_dereference_protected(state->policy,
++					refcount_read(&state->count) == 0);
++	selinux_policy_free(policy);
++}
++
+ static void selinux_policy_cond_free(struct selinux_policy *policy)
+ {
+ 	cond_policydb_destroy_dup(&policy->policydb);

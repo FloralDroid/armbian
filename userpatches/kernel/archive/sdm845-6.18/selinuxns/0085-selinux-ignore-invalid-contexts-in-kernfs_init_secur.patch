@@ -1,0 +1,41 @@
+From 6cf4d2e6058fb1a99a85f5e3c0721bc5644e26ac Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Tue, 18 Nov 2025 10:00:57 -0500
+Subject: [PATCH 85/90] selinux: ignore invalid contexts in
+ kernfs_init_security in child namespace
+
+kernfs_init_security() tries to propagate the parent directory's
+SELinux xattr to the child (or compute a transition, depending on
+policy) when a child node is created. In the case of cgroup2,
+this can cause a hard failure when trying to create any files
+in the cgroup2 mount for a child SELinux namespace if the
+context in the parent is invalid in the child. Treat this
+the same way as if the parent lacked a SELinux xattr and just
+let the child be labeled based on policy.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 964c2a6e897ea5654ea26ba6adc58c2271103e1b
+---
+ security/selinux/hooks.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index cf9b957e61f472db7f30e5b05f6eefd3823484b0..75a400dc5d111262b38577e42435a9459d5f8df7 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -3836,8 +3836,13 @@ static int selinux_kernfs_init_security(struct kernfs_node *kn_dir,
+ 	rc = security_context_to_sid(current_selinux_state, context, clen,
+ 				     &parent_sid, GFP_KERNEL);
+ 	kfree(context);
+-	if (rc)
++	if (rc) {
++		if (rc == -EINVAL &&
++			current_selinux_state != init_selinux_state) {
++			return 0;
++		}
+ 		return rc;
++	}
+ 
+ 	if (crsec->create_sid) {
+ 		newsid = crsec->create_sid;

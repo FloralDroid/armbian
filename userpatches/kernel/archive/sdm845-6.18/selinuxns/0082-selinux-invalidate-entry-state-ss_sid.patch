@@ -1,0 +1,76 @@
+From 63ca4c630063d4bdef3faa470de46a9cedb54c70 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Mon, 4 May 2026 09:23:22 -0400
+Subject: [PATCH 82/90] selinux: invalidate entry state/ss_sid
+
+We need to invalidate these cached values even if the ss_sid cache isn't
+enabled, to avoid stale references from map_global_sid_to_ss().
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 2ea59c5a82169eeaf9ffdfff8b43b50701e8dd3a
+---
+ security/selinux/include/sidtab.h |  7 -------
+ security/selinux/ss/sidtab.c      | 11 +++++++++--
+ 2 files changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/security/selinux/include/sidtab.h b/security/selinux/include/sidtab.h
+index 2df3ac0df935d93018716b84af36d63acce3db8e..a82e51cea6b044db5d57a6e4dd9507dd8c59b688 100644
+--- a/security/selinux/include/sidtab.h
++++ b/security/selinux/include/sidtab.h
+@@ -180,15 +180,8 @@ static inline int sidtab_sid2str_get(struct sidtab *s,
+ #endif /* CONFIG_SECURITY_SELINUX_SID2STR_CACHE_SIZE > 0 */
+ 
+ #ifdef CONFIG_SECURITY_SELINUX_NS
+-#if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
+ extern void sidtab_invalidate_state(struct sidtab *s,
+ 				    struct selinux_state *state);
+-#else
+-static inline void sidtab_invalidate_state(struct sidtab *s,
+-					   struct selinux_state *state)
+-{
+-}
+-#endif /* CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0 */
+ #endif /* CONFIG_SECURITY_SELINUX_NS */
+ 
+ #endif /* _SS_SIDTAB_H_ */
+diff --git a/security/selinux/ss/sidtab.c b/security/selinux/ss/sidtab.c
+index eea37f78bec98d6d0cd9b196fd68aebc0a467308..76db8bc09c1cd52c8d268d79771f064868bfc663 100644
+--- a/security/selinux/ss/sidtab.c
++++ b/security/selinux/ss/sidtab.c
+@@ -650,13 +650,20 @@ int sidtab_sid2str_get(struct sidtab *s, struct sidtab_entry *entry, char **out,
+ #endif /* CONFIG_SECURITY_SELINUX_SID2STR_CACHE_SIZE > 0 */
+ 
+ #ifdef CONFIG_SECURITY_SELINUX_NS
+-#if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
+ static void sidtab_invalidate_state_entry(struct sidtab_entry *entry,
+ 					  struct selinux_state *state)
+ {
++#if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
+ 	struct sidtab_ss_sid_cache *cache;
+ 	int i, first, last;
++#endif
+ 
++	if (entry->state == state) {
++		WRITE_ONCE(entry->ss_sid, 0);
++		WRITE_ONCE(entry->state, NULL);
++	}
++
++#if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
+ 	cache = &entry->ss_sid_cache;
+ 	first = cache->first;
+ 	last = cache->last;
+@@ -684,6 +691,7 @@ static void sidtab_invalidate_state_entry(struct sidtab_entry *entry,
+ 			return;
+ 		}
+ 	}
++#endif
+ }
+ 
+ static void sidtab_invalidate_state_tree(union sidtab_entry_inner entry,
+@@ -731,5 +739,4 @@ void sidtab_invalidate_state(struct sidtab *s, struct selinux_state *state)
+ 
+ 	spin_unlock_irqrestore(&s->lock, flags);
+ }
+-#endif /* CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0 */
+ #endif /* CONFIG_SECURITY_SELINUX_NS */

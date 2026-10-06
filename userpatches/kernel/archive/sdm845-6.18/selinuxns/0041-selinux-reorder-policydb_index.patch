@@ -1,0 +1,62 @@
+From f765ea763e36c9b7736458efdaf18c6a7a7d63ba Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20G=C3=B6ttsche?= <cgzones@googlemail.com>
+Date: Sun, 11 May 2025 19:30:08 +0200
+Subject: [PATCH 41/90] selinux: reorder policydb_index()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Index as soon as possible to enable isvalid() checks to fail on gaps.
+
+Signed-off-by: Christian Göttsche <cgzones@googlemail.com>
+Acked-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+
+Upstream-commit: ecf41f6218b58c72f1511e395e480f70a9f44889
+---
+ security/selinux/ss/policydb.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/security/selinux/ss/policydb.c b/security/selinux/ss/policydb.c
+index 736de07df3699de156bb6dea111b27da19063941..e86ac142b9fe3b2c38b3ec984043d1e5d0c9e0bb 100644
+--- a/security/selinux/ss/policydb.c
++++ b/security/selinux/ss/policydb.c
+@@ -734,7 +734,6 @@ static int policydb_index(struct policydb *p)
+ 	pr_debug("SELinux:  %d classes, %d rules\n", p->p_classes.nprim,
+ 		 p->te_avtab.nel);
+ 
+-	avtab_hash_eval(&p->te_avtab, "rules");
+ 	symtab_hash_eval(p->symtab);
+ 
+ 	p->class_val_to_struct = kcalloc(p->p_classes.nprim,
+@@ -2822,6 +2821,10 @@ int policydb_read(struct policydb *p, struct policy_file *fp)
+ 		p->symtab[i].nprim = nprim;
+ 	}
+ 
++	rc = policydb_index(p);
++	if (rc)
++		goto bad;
++
+ 	rc = -EINVAL;
+ 	p->process_class = string_to_security_class(p, "process");
+ 	if (!p->process_class) {
+@@ -2833,6 +2836,8 @@ int policydb_read(struct policydb *p, struct policy_file *fp)
+ 	if (rc)
+ 		goto bad;
+ 
++	avtab_hash_eval(&p->te_avtab, "rules");
++
+ 	if (p->policyvers >= POLICYDB_VERSION_BOOL) {
+ 		rc = cond_read_list(p, fp);
+ 		if (rc)
+@@ -2930,10 +2935,6 @@ int policydb_read(struct policydb *p, struct policy_file *fp)
+ 	if (rc)
+ 		goto bad;
+ 
+-	rc = policydb_index(p);
+-	if (rc)
+-		goto bad;
+-
+ 	rc = -EINVAL;
+ 	perm = string_to_av_perm(p, p->process_class, "transition");
+ 	if (!perm) {

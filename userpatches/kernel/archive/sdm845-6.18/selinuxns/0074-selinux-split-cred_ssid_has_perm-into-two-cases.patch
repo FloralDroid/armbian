@@ -1,0 +1,169 @@
+From b5791fdca77bb8db9edb075aacf7c3537a17bc35 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Mon, 7 Oct 2024 11:53:42 -0400
+Subject: [PATCH 74/90] selinux: split cred_ssid_has_perm() into two cases
+
+Split cred_ssid_has_perm() into two separate functions,
+cred_obj_has_perm() to perform the namespace-aware checks
+for inter-object checks like associate, and cred_ssid_has_perm()
+to perform namespace-aware checks for socket and SysV IPC
+checks where the SSID is in fact derived from the creating
+task SID. Modify cred_ssid_has_perm() to only use the provided
+ssid for the initial check in the current namespace, and to
+instead use the task SID from the parent cred for each check
+against the ancestor namespaces. This ensures that socket
+and SysV IPC is correctly controlled in each namespace based
+on the task's SID/context in that namespace.
+
+We still need to determine whether peer labeling is correctly
+handled across different namespaces, and if not, to adapt
+appropriately.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 43979c5fe3953ba5448294ac5044f3e113a9d26e
+---
+ security/selinux/avc.c         | 59 ++++++++++++++++++++++++++++++++--
+ security/selinux/hooks.c       | 16 ++++-----
+ security/selinux/include/avc.h |  3 ++
+ 3 files changed, 67 insertions(+), 11 deletions(-)
+
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index c6bc1f0a745d1826cb7915530d6d0c7a05e5f9ef..4de1b4e275f0b7b1e9b9080bca758ba5bbc21089 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -1594,7 +1594,7 @@ int cred_tsid_has_perm_noaudit(const struct cred *cred, u32 tsid, u16 tclass,
+ }
+ 
+ /**
+- * cred_ssid_has_perm - Check and audit permissions on a (ssid, tsid) pair
++ * cred_obj_has_perm - Check and audit permissions on a (ssid, tsid) pair
+  * @cred: subject credentials
+  * @ssid: source security identifier
+  * @tsid: target security identifier
+@@ -1611,8 +1611,9 @@ int cred_tsid_has_perm_noaudit(const struct cred *cred, u32 tsid, u16 tclass,
+  * DO NOT USE when checking permissions involving cred/task SIDs; this
+  * helper is only for object-to-object checks.
+  */
+-int cred_ssid_has_perm(const struct cred *cred, u32 ssid, u32 tsid, u16 tclass,
+-		       u32 requested, struct common_audit_data *ad)
++int cred_obj_has_perm(const struct cred *cred, u32 ssid, u32 tsid,
++		      u16 tclass, u32 requested,
++		      struct common_audit_data *ad)
+ {
+ 	struct cred_security_struct *crsec;
+ 	struct selinux_state *state;
+@@ -1631,6 +1632,58 @@ int cred_ssid_has_perm(const struct cred *cred, u32 ssid, u32 tsid, u16 tclass,
+ 	return 0;
+ }
+ 
++/**
++ * cred_ssid_has_perm - Check and audit permissions on a (ssid, tsid) pair
++ * @cred: subject credentials
++ * @ssid: source security identifier
++ * @tsid: target security identifier
++ * @tclass: target security class
++ * @requested: requested permissions, interpreted based on @tclass
++ * @ad: auxiliary audit data
++ *
++ * Check permissions between a source SID @ssid and a target SID @tsid for
++ * @cred's namespace and check between the parent cred's SID and %tsid
++ * for all ancestors to determine whether the @requested permissions are
++ * granted.
++ * Audit the granting or denial of permissions in accordance with the policy.
++ * Return %0 if all @requested permissions are granted, -%EACCES if any
++ * permissions are denied, or another -errno upon other errors.
++ * DO NOT USE when checking permissions involving cred/task SIDs; this
++ * helper is only for socket and IPC checks.
++ */
++int cred_ssid_has_perm(const struct cred *cred, u32 ssid, u32 tsid, u16 tclass,
++		       u32 requested, struct common_audit_data *ad)
++{
++	struct cred_security_struct *crsec;
++	struct selinux_state *state;
++	int rc;
++
++	/* Check using the provided ssid in the current namespace. */
++	crsec = selinux_cred(cred);
++	state = crsec->state;
++	rc = avc_has_perm(state, ssid, tsid, tclass, requested, ad);
++	if (rc)
++		return rc;
++
++	cred = crsec->parent_cred;
++	while (cred) {
++		/*
++		 * In all ancestor namespaces, use the task SID from
++		 * the corresponding credential as the subject SID.
++		 */
++		crsec = selinux_cred(cred);
++		state = crsec->state;
++		ssid = crsec->sid;
++		rc = avc_has_perm(state, ssid, tsid, tclass, requested, ad);
++		if (rc)
++			return rc;
++
++		cred = crsec->parent_cred;
++	}
++
++	return 0;
++}
++
+ static u32 cred_sid_for_state(const struct cred *cred,
+ 			      const struct selinux_state *state)
+ {
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 4661933e507d8e751a414f4182004d9bcca4f3f4..8f5930e8e0a85ada81a2c1a8dd74daa7f3bddd4f 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -469,8 +469,8 @@ static int may_context_mount_inode_relabel(u32 sid,
+ 	if (rc)
+ 		return rc;
+ 
+-	return cred_ssid_has_perm(cred, sid, sbsec->sid, SECCLASS_FILESYSTEM,
+-				  FILESYSTEM__ASSOCIATE, NULL);
++	return cred_obj_has_perm(cred, sid, sbsec->sid, SECCLASS_FILESYSTEM,
++				 FILESYSTEM__ASSOCIATE, NULL);
+ }
+ 
+ static int selinux_is_genfs_special_handling(struct super_block *sb)
+@@ -1887,9 +1887,9 @@ static int may_create(struct inode *dir,
+ 	if (rc)
+ 		return rc;
+ 
+-	return cred_ssid_has_perm(cred, newsid, sbsec->sid,
+-				  SECCLASS_FILESYSTEM, FILESYSTEM__ASSOCIATE,
+-				  &ad);
++	return cred_obj_has_perm(cred, newsid, sbsec->sid,
++				 SECCLASS_FILESYSTEM, FILESYSTEM__ASSOCIATE,
++				 &ad);
+ }
+ 
+ #define MAY_LINK	0
+@@ -3523,9 +3523,9 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
+ 	if (rc)
+ 		return rc;
+ 
+-	return cred_ssid_has_perm(cred, newsid, sbsec->sid,
+-				  SECCLASS_FILESYSTEM,
+-				  FILESYSTEM__ASSOCIATE, &ad);
++	return cred_obj_has_perm(cred, newsid, sbsec->sid,
++				 SECCLASS_FILESYSTEM,
++				 FILESYSTEM__ASSOCIATE, &ad);
+ }
+ 
+ static int selinux_inode_set_acl(struct mnt_idmap *idmap,
+diff --git a/security/selinux/include/avc.h b/security/selinux/include/avc.h
+index cf437d0479f56c3c5119ea69806ae2d17b8ed741..ce3df5a674f5fc09d9cd469192d647c24bc7ed57 100644
+--- a/security/selinux/include/avc.h
++++ b/security/selinux/include/avc.h
+@@ -169,6 +169,9 @@ int cred_tsid_has_perm(const struct cred *cred, u32 tsid, u16 tclass,
+ int cred_tsid_has_perm_noaudit(const struct cred *cred, u32 tsid, u16 tclass,
+ 			       u32 requested, struct av_decision *avd);
+ 
++int cred_obj_has_perm(const struct cred *cred, u32 ssid, u32 tsid, u16 tclass,
++		      u32 requested, struct common_audit_data *ad);
++
+ int cred_ssid_has_perm(const struct cred *cred, u32 ssid, u32 tsid, u16 tclass,
+ 		       u32 requested, struct common_audit_data *ad);
+ 

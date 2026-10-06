@@ -1,0 +1,112 @@
+From 4763c694f8fecff0e511dfb9b3de8dbf769f07f2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20G=C3=B6ttsche?= <cgzones@googlemail.com>
+Date: Sun, 11 May 2025 19:30:11 +0200
+Subject: [PATCH 43/90] selinux: more strict bounds check
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Validate the types used in bounds checks.
+Replace the usage of BUG(), to avoid halting the system on malformed
+polices.
+
+Signed-off-by: Christian Göttsche <cgzones@googlemail.com>
+Acked-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+[PM: merge fuzz, fixed typo identified by Smalley]
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+
+Upstream-commit: 3e6420d8d3a7fee5689c7e1575239a2dd9e9960b
+---
+ security/selinux/ss/policydb.c | 29 +++++++++++++++++++++++++++--
+ security/selinux/ss/policydb.h |  1 +
+ security/selinux/ss/services.c |  3 +++
+ 3 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/security/selinux/ss/policydb.c b/security/selinux/ss/policydb.c
+index 03a67069a93f74aa7821a275ad1701f223593640..e4adea4d76d2367bb1c394ddefdb294963f3e171 100644
+--- a/security/selinux/ss/policydb.c
++++ b/security/selinux/ss/policydb.c
+@@ -957,6 +957,15 @@ bool policydb_class_isvalid(const struct policydb *p, u16 class)
+ 	return true;
+ }
+ 
++bool policydb_user_isvalid(const struct policydb *p, u32 user)
++{
++	if (!user || user > p->p_users.nprim)
++		return false;
++	if (!p->sym_val_to_name[SYM_USERS][user - 1])
++		return false;
++	return true;
++}
++
+ bool policydb_role_isvalid(const struct policydb *p, u32 role)
+ {
+ 	if (!role || role > p->p_roles.nprim)
+@@ -1863,6 +1872,12 @@ static int user_bounds_sanity_check(void *key, void *datum, void *datap)
+ 			return -EINVAL;
+ 		}
+ 
++		if (!policydb_user_isvalid(p, upper->bounds)) {
++			pr_err("SELinux: user %s: invalid boundary id %d\n",
++			       (char *) key, upper->bounds);
++			return -EINVAL;
++		}
++
+ 		upper = p->user_val_to_struct[upper->bounds - 1];
+ 		ebitmap_for_each_positive_bit(&user->roles, node, bit)
+ 		{
+@@ -1900,6 +1915,12 @@ static int role_bounds_sanity_check(void *key, void *datum, void *datap)
+ 			return -EINVAL;
+ 		}
+ 
++		if (!policydb_role_isvalid(p, upper->bounds)) {
++			pr_err("SELinux: role %s: invalid boundary id %d\n",
++			       (char *) key, upper->bounds);
++			return -EINVAL;
++		}
++
+ 		upper = p->role_val_to_struct[upper->bounds - 1];
+ 		ebitmap_for_each_positive_bit(&role->types, node, bit)
+ 		{
+@@ -1934,9 +1955,13 @@ static int type_bounds_sanity_check(void *key, void *datum, void *datap)
+ 			return -EINVAL;
+ 		}
+ 
+-		upper = p->type_val_to_struct[upper->bounds - 1];
+-		BUG_ON(!upper);
++		if (!policydb_type_isvalid(p, upper->bounds)) {
++			pr_err("SELinux: type %s: invalid boundary id %d\n",
++			       (char *) key, upper->bounds);
++			return -EINVAL;
++		}
+ 
++		upper = p->type_val_to_struct[upper->bounds - 1];
+ 		if (upper->attribute) {
+ 			pr_err("SELinux: type %s: "
+ 			       "bounded by attribute %s\n",
+diff --git a/security/selinux/ss/policydb.h b/security/selinux/ss/policydb.h
+index 85633116623988346122f66aa63f459dc84cea1e..b1a64c23e1dcd7bde89faa31094be2bf0542e098 100644
+--- a/security/selinux/ss/policydb.h
++++ b/security/selinux/ss/policydb.h
+@@ -327,6 +327,7 @@ extern bool policydb_context_isvalid(const struct policydb *p,
+ extern bool policydb_class_isvalid(const struct policydb *p, u16 class);
+ extern bool policydb_type_isvalid(const struct policydb *p, u32 type);
+ extern bool policydb_role_isvalid(const struct policydb *p, u32 role);
++extern bool policydb_user_isvalid(const struct policydb *p, u32 user);
+ extern int policydb_read(struct policydb *p, struct policy_file *fp);
+ extern int policydb_write(struct policydb *p, struct policy_file *fp);
+ 
+diff --git a/security/selinux/ss/services.c b/security/selinux/ss/services.c
+index 8b75108b562585ea1c8af9c6934152293f4a32b4..0e8d3f91805eb5e110015031ee41f70edd00f1d2 100644
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@ -715,6 +715,9 @@ static void context_struct_compute_av(struct policydb *policydb,
+ 	 * If the given source and target types have boundary
+ 	 * constraint, lazy checks have to mask any violated
+ 	 * permission and notice it to userspace via audit.
++	 *
++	 * Infinite recursion is avoided via a depth pre-check in
++	 * type_bounds_sanity_check().
+ 	 */
+ 	type_attribute_bounds_av(policydb, scontext, tcontext,
+ 				 tclass, avd);

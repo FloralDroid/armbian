@@ -1,0 +1,33 @@
+From 7e67c4d065d2eeb072da450fa7ae05e7d059b3ff Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Tue, 8 Oct 2024 08:47:20 -0400
+Subject: [PATCH 75/90] selinux: convert nlmsg_sock_has_extended_perms() to
+ namespace-aware
+
+Convert nlmsg_sock_has_extended_perms() to use the
+cred_has_extended_perms() helper for namespace-aware checking.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 0a00a89f83431adec41212e8869dc0b47f3cc0d2
+---
+ security/selinux/hooks.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 8f5930e8e0a85ada81a2c1a8dd74daa7f3bddd4f..2ac89c9ccdb80b582d3e909f76592518d56d4bdc 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -6442,9 +6442,9 @@ static int nlmsg_sock_has_extended_perms(struct sock *sk, u32 perms, u16 nlmsg_t
+ 	driver = nlmsg_type >> 8;
+ 	xperm = nlmsg_type & 0xff;
+ 
+-	return avc_has_extended_perms(current_selinux_state, current_sid(),
+-				      sksec->sid, sksec->sclass, perms,
+-				      driver, AVC_EXT_NLMSG, xperm, &ad);
++	return cred_has_extended_perms(current_cred(), sksec->sid,
++				       sksec->sclass, perms, driver,
++				       AVC_EXT_NLMSG, xperm, &ad);
+ }
+ 
+ static int selinux_netlink_send(struct sock *sk, struct sk_buff *skb)

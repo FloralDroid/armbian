@@ -1,0 +1,87 @@
+From 899b0d1c284868ea3b90fd6c7c2493d43bab157b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20G=C3=B6ttsche?= <cgzones@googlemail.com>
+Date: Sun, 11 May 2025 19:30:01 +0200
+Subject: [PATCH 38/90] selinux: avoid nontransitive comparison
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Avoid using nontransitive comparison to prevent unexpected sorting
+results due to (well-defined) overflows.
+See https://www.qualys.com/2024/01/30/qsort.txt for a related issue in
+glibc's qsort(3).
+
+Signed-off-by: Christian Göttsche <cgzones@googlemail.com>
+Acked-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+[PM: use the cmp_int() macro from sort.h]
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+
+Upstream-commit: 60fb8dc7bf1af48edb443b5b0ca721de8b6ed449
+---
+ security/selinux/ss/policydb.c | 17 +++++++++--------
+ 1 file changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/security/selinux/ss/policydb.c b/security/selinux/ss/policydb.c
+index 483d7d54642a394f4939a58a6c9c379ac98a8dde..0c3057e9f4d0c4ceef9bad6e9158a02bf9f8ff94 100644
+--- a/security/selinux/ss/policydb.c
++++ b/security/selinux/ss/policydb.c
+@@ -30,6 +30,7 @@
+ #include <linux/string.h>
+ #include <linux/errno.h>
+ #include <linux/audit.h>
++#include <linux/sort.h>
+ #include "security.h"
+ 
+ #include "policydb.h"
+@@ -429,11 +430,11 @@ static int filenametr_cmp(const void *k1, const void *k2)
+ 	const struct filename_trans_key *ft2 = k2;
+ 	int v;
+ 
+-	v = ft1->ttype - ft2->ttype;
++	v = cmp_int(ft1->ttype, ft2->ttype);
+ 	if (v)
+ 		return v;
+ 
+-	v = ft1->tclass - ft2->tclass;
++	v = cmp_int(ft1->tclass, ft2->tclass);
+ 	if (v)
+ 		return v;
+ 
+@@ -464,15 +465,15 @@ static int rangetr_cmp(const void *k1, const void *k2)
+ 	const struct range_trans *key1 = k1, *key2 = k2;
+ 	int v;
+ 
+-	v = key1->source_type - key2->source_type;
++	v = cmp_int(key1->source_type, key2->source_type);
+ 	if (v)
+ 		return v;
+ 
+-	v = key1->target_type - key2->target_type;
++	v = cmp_int(key1->target_type, key2->target_type);
+ 	if (v)
+ 		return v;
+ 
+-	v = key1->target_class - key2->target_class;
++	v = cmp_int(key1->target_class, key2->target_class);
+ 
+ 	return v;
+ }
+@@ -501,15 +502,15 @@ static int role_trans_cmp(const void *k1, const void *k2)
+ 	const struct role_trans_key *key1 = k1, *key2 = k2;
+ 	int v;
+ 
+-	v = key1->role - key2->role;
++	v = cmp_int(key1->role, key2->role);
+ 	if (v)
+ 		return v;
+ 
+-	v = key1->type - key2->type;
++	v = cmp_int(key1->type, key2->type);
+ 	if (v)
+ 		return v;
+ 
+-	return key1->tclass - key2->tclass;
++	return cmp_int(key1->tclass, key2->tclass);
+ }
+ 
+ static const struct hashtab_key_params roletr_key_params = {

@@ -19,6 +19,7 @@ if [[ "${SDM845_DEBUG:-no}" == "yes" ]]; then
 fi
 
 function custom_kernel_config__xiaomi_dipper_drivers() {
+	opts_y+=("SECURITY_SELINUX_NS")
 	opts_m+=(
 		"BATTERY_QCOM_FG"
 		"DRM_MSM"

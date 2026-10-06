@@ -1,0 +1,197 @@
+From b4b2924ea5789a6a674c377d6e5189b21dc29e88 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20G=C3=B6ttsche?= <cgzones@googlemail.com>
+Date: Sun, 11 May 2025 19:30:04 +0200
+Subject: [PATCH 39/90] selinux: check length fields in policies
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In multiple places the binary policy announces how many items of some
+kind are to be expected next.  Before reading them the kernel already
+allocates enough memory for that announced size.  Validate that the
+remaining input size can actually fit the announced items, to avoid OOM
+issues on malformed binary policies.
+
+Signed-off-by: Christian Göttsche <cgzones@googlemail.com>
+Acked-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+[PM: manual merge fuzz fixups, style fixes]
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+
+Upstream-commit: 9f515660c8297246c4e3565c814ccd16368d74e9
+
+Backport: retain the existing Linux 6.18 allocation calls while adding policy length validation.
+---
+ security/selinux/ss/avtab.c       |  5 +++++
+ security/selinux/ss/conditional.c | 17 ++++++++++++++++
+ security/selinux/ss/policydb.c    | 32 +++++++++++++++++++++++++++++++
+ security/selinux/ss/policydb.h    | 14 ++++++++++++++
+ 4 files changed, 68 insertions(+)
+
+diff --git a/security/selinux/ss/avtab.c b/security/selinux/ss/avtab.c
+index 33556922f15ed7e4f11d3871f706f354fb407af1..50df8b69de2ba667d15812a510c5f39d6ed7cba6 100644
+--- a/security/selinux/ss/avtab.c
++++ b/security/selinux/ss/avtab.c
+@@ -548,6 +548,11 @@ int avtab_read(struct avtab *a, struct policy_file *fp, struct policydb *pol)
+ 		goto bad;
+ 	}
+ 
++	/* avtab_read_item() reads at least 96 bytes for any valid entry */
++	rc = size_check(3 * sizeof(u32), nel, fp);
++	if (rc)
++		goto bad;
++
+ 	rc = avtab_alloc(a, nel);
+ 	if (rc)
+ 		goto bad;
+diff --git a/security/selinux/ss/conditional.c b/security/selinux/ss/conditional.c
+index 280dc57df8d39c8d58825abc5a84f5730aa53d08..79e2f4ddc403c8a385633888fbf4e2be7ce55426 100644
+--- a/security/selinux/ss/conditional.c
++++ b/security/selinux/ss/conditional.c
+@@ -12,6 +12,7 @@
+ 
+ #include "security.h"
+ #include "conditional.h"
++#include "policydb.h"
+ #include "services.h"
+ 
+ /*
+@@ -329,6 +330,11 @@ static int cond_read_av_list(struct policydb *p, struct policy_file *fp,
+ 	if (len == 0)
+ 		return 0;
+ 
++	/* avtab_read_item() reads at least 96 bytes for any valid entry */
++	rc = size_check(3 * sizeof(u32), len, fp);
++	if (rc)
++		return rc;
++
+ 	list->nodes = kcalloc(len, sizeof(*list->nodes), GFP_KERNEL);
+ 	if (!list->nodes)
+ 		return -ENOMEM;
+@@ -379,6 +385,12 @@ static int cond_read_node(struct policydb *p, struct cond_node *node, struct pol
+ 
+ 	/* expr */
+ 	len = le32_to_cpu(buf[1]);
++
++	/* we will read 64 bytes per node */
++	rc = size_check(2 * sizeof(u32), len, fp);
++	if (rc)
++		return rc;
++
+ 	node->expr.nodes = kcalloc(len, sizeof(*node->expr.nodes), GFP_KERNEL);
+ 	if (!node->expr.nodes)
+ 		return -ENOMEM;
+@@ -417,6 +429,11 @@ int cond_read_list(struct policydb *p, struct policy_file *fp)
+ 
+ 	len = le32_to_cpu(buf[0]);
+ 
++	/* cond_read_node() reads at least 128 bytes for any valid node */
++	rc = size_check(4 * sizeof(u32), len, fp);
++	if (rc)
++		return rc;
++
+ 	p->cond_list = kcalloc(len, sizeof(*p->cond_list), GFP_KERNEL);
+ 	if (!p->cond_list)
+ 		return -ENOMEM;
+diff --git a/security/selinux/ss/policydb.c b/security/selinux/ss/policydb.c
+index 0c3057e9f4d0c4ceef9bad6e9158a02bf9f8ff94..ded23c8705b8c0256c8ea06cb366abcba5428430 100644
+--- a/security/selinux/ss/policydb.c
++++ b/security/selinux/ss/policydb.c
+@@ -1125,6 +1125,9 @@ int str_read(char **strp, gfp_t flags, struct policy_file *fp, u32 len)
+ 	if ((len == 0) || (len == (u32)-1))
+ 		return -EINVAL;
+ 
++	if (size_check(sizeof(char), len, fp))
++		return -EINVAL;
++
+ 	str = kmalloc(len + 1, flags | __GFP_NOWARN);
+ 	if (!str)
+ 		return -ENOMEM;
+@@ -1217,6 +1220,11 @@ static int common_read(struct policydb *p, struct symtab *s, struct policy_file
+ 	if (nel > SEL_VEC_MAX)
+ 		goto bad;
+ 
++	/* perm_read() reads at least 64 bytes for any valid permission */
++	rc = size_check(2 * sizeof(u32), nel, fp);
++	if (rc)
++		goto bad;
++
+ 	rc = symtab_init(&comdatum->permissions, nel);
+ 	if (rc)
+ 		goto bad;
+@@ -1402,6 +1410,11 @@ static int class_read(struct policydb *p, struct symtab *s, struct policy_file *
+ 		goto bad;
+ 	cladatum->value = val;
+ 
++	/* perm_read() reads at least 64 bytes for any valid permission */
++	rc = size_check(2 * sizeof(u32), nel, fp);
++	if (rc)
++		goto bad;
++
+ 	rc = symtab_init(&cladatum->permissions, nel);
+ 	if (rc)
+ 		goto bad;
+@@ -2002,6 +2015,13 @@ static int range_read(struct policydb *p, struct policy_file *fp)
+ 
+ 	nel = le32_to_cpu(buf[0]);
+ 
++	/* we read at least 64 bytes and mls_read_range_helper() 32 bytes
++	 * for any valid range-transition
++	 */
++	rc = size_check(3 * sizeof(u32), nel, fp);
++	if (rc)
++		return rc;
++
+ 	rc = hashtab_init(&p->range_tr, nel);
+ 	if (rc)
+ 		return rc;
+@@ -2776,6 +2796,13 @@ int policydb_read(struct policydb *p, struct policy_file *fp)
+ 		nprim = le32_to_cpu(buf[0]);
+ 		nel = le32_to_cpu(buf[1]);
+ 
++		/* every read_f() implementation reads at least 128 bytes
++		 * for any valid entry
++		 */
++		rc = size_check(4 * sizeof(u32), nel, fp);
++		if (rc)
++			goto out;
++
+ 		rc = symtab_init(&p->symtab[i], nel);
+ 		if (rc)
+ 			goto out;
+@@ -2817,6 +2844,11 @@ int policydb_read(struct policydb *p, struct policy_file *fp)
+ 		goto bad;
+ 	nel = le32_to_cpu(buf[0]);
+ 
++	/* we read at least 96 bytes for any valid role-transition */
++	rc = size_check(3 * sizeof(u32), nel, fp);
++	if (rc)
++		goto bad;
++
+ 	rc = hashtab_init(&p->role_tr, nel);
+ 	if (rc)
+ 		goto bad;
+diff --git a/security/selinux/ss/policydb.h b/security/selinux/ss/policydb.h
+index 20b834581106a42258b69d85a913edd1137ed305..fdc94398a254052e49480d0f563306496049b2df 100644
+--- a/security/selinux/ss/policydb.h
++++ b/security/selinux/ss/policydb.h
+@@ -355,6 +355,20 @@ struct policy_data {
+ 	struct policy_file *fp;
+ };
+ 
++static inline int size_check(size_t bytes, size_t num,
++			     const struct policy_file *fp)
++{
++	size_t len;
++
++	if (unlikely(check_mul_overflow(bytes, num, &len)))
++		return -EINVAL;
++
++	if (unlikely(len > fp->len))
++		return -EINVAL;
++
++	return 0;
++}
++
+ static inline int next_entry(void *buf, struct policy_file *fp, size_t bytes)
+ {
+ 	if (bytes > fp->len)

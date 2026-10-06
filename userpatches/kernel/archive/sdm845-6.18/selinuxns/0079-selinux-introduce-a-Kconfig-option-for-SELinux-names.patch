@@ -1,0 +1,151 @@
+From cd724e4581d17bf0fcca04d08a1951e06698ca22 Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Fri, 25 Oct 2024 08:14:46 -0400
+Subject: [PATCH 79/90] selinux: introduce a Kconfig option for SELinux
+ namespaces
+
+Introduce a separate SECURITY_SELINUX_NS Kconfig option for enabling
+SELinux namespaces and have it default to n since it is experimental.
+Make the SECURITY_SELINUX_MAXNS and SECURITY_SELINUX_MAXNSDEPTH Kconfig
+options depend on this new option.
+
+This option only controls whether the SELinux namespace support is
+exposed to userspace, not the underlying infrastructure support.
+When set to n, the kernel APIs for unsharing the SELinux namespace
+and for setting limits on SELinux namespaces are not exposed and only a
+single initial SELinux namespace is created during startup and
+associated with all tasks. When set to y, the kernel APIs are exposed
+and userspace can use them (if permitted by policy and constrained by
+the limits) to unshare the SELinux namespace.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: c98f6457e59f324202fec5f4c4ca3433fe263102
+---
+ security/selinux/Kconfig     | 28 +++++++++++++++++++++++++---
+ security/selinux/hooks.c     |  5 ++++-
+ security/selinux/selinuxfs.c |  6 ++++++
+ 3 files changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/security/selinux/Kconfig b/security/selinux/Kconfig
+index 82db54462253a11d41a20b9b191606dc84b103f5..b0990a7e5cf8778961f5dfc0ffcae08325781ad8 100644
+--- a/security/selinux/Kconfig
++++ b/security/selinux/Kconfig
+@@ -88,10 +88,32 @@ config SECURITY_SELINUX_DEBUG
+ 		echo -n 'file "security/selinux/*" +p' > \
+ 			/proc/dynamic_debug/control
+ 
++config SECURITY_SELINUX_NS
++	bool "SELinux namespace support (experimental)"
++	depends on SECURITY_SELINUX
++	default n
++	help
++	  This enables (experimental) support for SELinux namespaces,
++	  i.e the ability to create multiple SELinux namespaces where
++	  each namespace has its own independent enforcing mode,
++	  AVC, and policy, accessible through its own independent
++	  selinuxfs instance. When a task unshares its SELinux namespace,
++	  it is associated with a new child namespace whose initial
++	  state is permissive with no policy loaded, and the task is assigned
++	  a separate SID in the new namespace, initially the kernel SID,
++	  which is likewise independent of its SID in ancestor namespaces.
++	  Subsequent actions by the task and its descendants are checked
++	  against the new namespace and all ancestor namespaces, using the
++	  SID it has in each namespace for that namespace's checks. Objects
++	  like inodes only have a single SID irrespective of the namespace
++	  in which they are created or accessed. If the context associated
++	  with a SID is not defined in a namespace, then it is treated as
++	  the unlabeled SID for access checking purposes in that namespace.
++
+ config SECURITY_SELINUX_MAXNS
+ 	int "SELinux default maximum number of namespaces"
+-	depends on SECURITY_SELINUX
+-	range 0 65535
++	depends on SECURITY_SELINUX_NS
++	range 1 65535
+ 	default 65535
+ 	help
+ 	  This option sets the default maximum number of SELinux namespaces.
+@@ -99,7 +121,7 @@ config SECURITY_SELINUX_MAXNS
+ 
+ config SECURITY_SELINUX_MAXNSDEPTH
+ 	int "SELinux default maximum depth of namespaces"
+-	depends on SECURITY_SELINUX
++	depends on SECURITY_SELINUX_NS
+ 	range 0 32
+ 	default 32
+ 	help
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 2159aa12ec26403c58135a52d070a0e17e679e54..61909838f4c1bd48fc16a7518739c6469afd87f7 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -7934,8 +7934,10 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
+ 
+ static void selinux_state_free(struct work_struct *work);
+ 
++#ifdef CONFIG_SECURITY_SELINUX_NS
+ unsigned int selinux_maxns = CONFIG_SECURITY_SELINUX_MAXNS;
+ unsigned int selinux_maxnsdepth = CONFIG_SECURITY_SELINUX_MAXNSDEPTH;
++#endif
+ 
+ static atomic_t selinux_nsnum = ATOMIC_INIT(0);
+ 
+@@ -7947,6 +7949,7 @@ int selinux_state_create(const struct cred *cred)
+ 	struct selinux_state *newstate = NULL;
+ 	int rc;
+ 
++#ifdef CONFIG_SECURITY_SELINUX_NS
+ 	if (atomic_inc_return(&selinux_nsnum) > selinux_maxns) {
+ 		rc = -ENOSPC;
+ 		goto err;
+@@ -7956,7 +7959,7 @@ int selinux_state_create(const struct cred *cred)
+ 		rc = -ENOSPC;
+ 		goto err;
+ 	}
+-
++#endif
+ 	newstate = kzalloc(sizeof(*newstate), GFP_KERNEL);
+ 	if (!newstate) {
+ 		rc = -ENOMEM;
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index e5ae1d124f6ef1c9e4f38f870b5e66143a51b25b..deb081e815d46d01e808c0edbbaca38bff965209 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -65,8 +65,10 @@ enum sel_inos {
+ 	SEL_STATUS,	/* export current status using mmap() */
+ 	SEL_POLICY,	/* allow userspace to read the in kernel policy */
+ 	SEL_VALIDATE_TRANS, /* compute validatetrans decision */
++#ifdef CONFIG_SECURITY_SELINUX_NS
+ 	SEL_MAXNS,	    /* maximum number of SELinux namespaces */
+ 	SEL_MAXNSDEPTH,	    /* maximum depth of SELinux namespaces */
++#endif
+ 	SEL_INO_NEXT,	/* The next inode number to use */
+ };
+ 
+@@ -302,6 +304,7 @@ static const struct file_operations sel_disable_ops = {
+ 	.llseek		= generic_file_llseek,
+ };
+ 
++#ifdef CONFIG_SECURITY_SELINUX_NS
+ static ssize_t sel_read_maxns(struct file *filp, char __user *buf,
+ 			     size_t count, loff_t *ppos)
+ {
+@@ -432,6 +435,7 @@ static const struct file_operations sel_maxnsdepth_ops = {
+ 	.write		= sel_write_maxnsdepth,
+ 	.llseek		= generic_file_llseek,
+ };
++#endif
+ 
+ static ssize_t sel_read_policyvers(struct file *filp, char __user *buf,
+ 				   size_t count, loff_t *ppos)
+@@ -2136,8 +2140,10 @@ static int sel_fill_super(struct super_block *sb, struct fs_context *fc)
+ 		[SEL_POLICY] = {"policy", &sel_policy_ops, S_IRUGO},
+ 		[SEL_VALIDATE_TRANS] = {"validatetrans", &sel_transition_ops,
+ 					S_IWUGO},
++#ifdef CONFIG_SECURITY_SELINUX_NS
+ 		[SEL_MAXNS] = {"maxns", &sel_maxns_ops, 0600},
+ 		[SEL_MAXNSDEPTH] = {"maxnsdepth", &sel_maxnsdepth_ops, 0600},
++#endif
+ 		/* last one */ {"", NULL, 0}
+ 	};
+ 

@@ -1,0 +1,366 @@
+From 9c4db1775d82aa0c462caf75420c13c60882fe28 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20G=C3=B6ttsche?= <cgzones@googlemail.com>
+Date: Sun, 11 May 2025 19:30:09 +0200
+Subject: [PATCH 42/90] selinux: beef up isvalid checks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Check that an ID does not refer to a gap in the global array of
+definitions.
+
+Constify parameters of isvalid() function and change return type to
+bool.
+
+Signed-off-by: Christian Göttsche <cgzones@googlemail.com>
+Acked-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+[PM: merge fixes, dropped boolean checks due to missing dependency]
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+
+Upstream-commit: 7edea6e8c8e8944e060da6b0b81d66db8d5fffcc
+---
+ security/selinux/ss/hashtab.h  |  4 +--
+ security/selinux/ss/mls.c      | 66 +++++++++++++++++++++-------------
+ security/selinux/ss/mls.h      |  6 ++--
+ security/selinux/ss/policydb.c | 48 ++++++++++++++-----------
+ security/selinux/ss/policydb.h | 11 +++---
+ security/selinux/ss/services.c |  2 +-
+ security/selinux/ss/symtab.c   |  2 +-
+ security/selinux/ss/symtab.h   |  2 +-
+ 8 files changed, 83 insertions(+), 58 deletions(-)
+
+diff --git a/security/selinux/ss/hashtab.h b/security/selinux/ss/hashtab.h
+index deba82d78c3aebec20a98f74e4f3371fb3161a70..c641fb12916b0bb700a315d32d6a6186a8f18357 100644
+--- a/security/selinux/ss/hashtab.h
++++ b/security/selinux/ss/hashtab.h
+@@ -94,11 +94,11 @@ static inline int hashtab_insert(struct hashtab *h, void *key, void *datum,
+  * Returns NULL if no entry has the specified key or
+  * the datum of the entry otherwise.
+  */
+-static inline void *hashtab_search(struct hashtab *h, const void *key,
++static inline void *hashtab_search(const struct hashtab *h, const void *key,
+ 				   struct hashtab_key_params key_params)
+ {
+ 	u32 hvalue;
+-	struct hashtab_node *cur;
++	const struct hashtab_node *cur;
+ 
+ 	if (!h->size)
+ 		return NULL;
+diff --git a/security/selinux/ss/mls.c b/security/selinux/ss/mls.c
+index a6e49269f5351df096da8c9fb56103a2f7b0ee9d..3cd36e2015fa22bcad0a70236724c053078090e0 100644
+--- a/security/selinux/ss/mls.c
++++ b/security/selinux/ss/mls.c
+@@ -32,7 +32,7 @@
+ int mls_compute_context_len(struct policydb *p, struct context *context)
+ {
+ 	int i, l, len, head, prev;
+-	char *nm;
++	const char *nm;
+ 	struct ebitmap *e;
+ 	struct ebitmap_node *node;
+ 
+@@ -86,7 +86,8 @@ int mls_compute_context_len(struct policydb *p, struct context *context)
+ void mls_sid_to_context(struct policydb *p, struct context *context,
+ 			char **scontext)
+ {
+-	char *scontextp, *nm;
++	const char *nm;
++	char *scontextp;
+ 	int i, l, head, prev;
+ 	struct ebitmap *e;
+ 	struct ebitmap_node *node;
+@@ -155,27 +156,44 @@ void mls_sid_to_context(struct policydb *p, struct context *context,
+ 	*scontext = scontextp;
+ }
+ 
+-int mls_level_isvalid(struct policydb *p, struct mls_level *l)
++bool mls_level_isvalid(const struct policydb *p, const struct mls_level *l)
+ {
+-	struct level_datum *levdatum;
++	const char *name;
++	const struct level_datum *levdatum;
++	struct ebitmap_node *node;
++	u32 bit;
++	int rc;
+ 
+ 	if (!l->sens || l->sens > p->p_levels.nprim)
+-		return 0;
+-	levdatum = symtab_search(&p->p_levels,
+-				 sym_name(p, SYM_LEVELS, l->sens - 1));
++		return false;
++
++	name = sym_name(p, SYM_LEVELS, l->sens - 1);
++	if (!name)
++		return false;
++
++	levdatum = symtab_search(&p->p_levels, name);
+ 	if (!levdatum)
+-		return 0;
++		return false;
+ 
+ 	/*
+-	 * Return 1 iff all the bits set in l->cat are also be set in
++	 * Validate that all bits set in l->cat are also be set in
+ 	 * levdatum->level->cat and no bit in l->cat is larger than
+ 	 * p->p_cats.nprim.
+ 	 */
+-	return ebitmap_contains(&levdatum->level.cat, &l->cat,
+-				p->p_cats.nprim);
++	rc = ebitmap_contains(&levdatum->level.cat, &l->cat,
++			      p->p_cats.nprim);
++	if (!rc)
++		return false;
++
++	ebitmap_for_each_positive_bit(&levdatum->level.cat, node, bit) {
++		if (!sym_name(p, SYM_CATS, bit))
++			return false;
++	}
++
++	return true;
+ }
+ 
+-int mls_range_isvalid(struct policydb *p, struct mls_range *r)
++bool mls_range_isvalid(const struct policydb *p, const struct mls_range *r)
+ {
+ 	return (mls_level_isvalid(p, &r->level[0]) &&
+ 		mls_level_isvalid(p, &r->level[1]) &&
+@@ -183,32 +201,32 @@ int mls_range_isvalid(struct policydb *p, struct mls_range *r)
+ }
+ 
+ /*
+- * Return 1 if the MLS fields in the security context
++ * Return true if the MLS fields in the security context
+  * structure `c' are valid.  Return 0 otherwise.
+  */
+-int mls_context_isvalid(struct policydb *p, struct context *c)
++bool mls_context_isvalid(const struct policydb *p, const struct context *c)
+ {
+-	struct user_datum *usrdatum;
++	const struct user_datum *usrdatum;
+ 
+ 	if (!p->mls_enabled)
+-		return 1;
++		return true;
+ 
+ 	if (!mls_range_isvalid(p, &c->range))
+-		return 0;
++		return false;
+ 
+ 	if (c->role == OBJECT_R_VAL)
+-		return 1;
++		return true;
+ 
+ 	/*
+ 	 * User must be authorized for the MLS range.
+ 	 */
+ 	if (!c->user || c->user > p->p_users.nprim)
+-		return 0;
++		return false;
+ 	usrdatum = p->user_val_to_struct[c->user - 1];
+-	if (!mls_range_contains(usrdatum->range, c->range))
+-		return 0; /* user may not be associated with range */
++	if (!usrdatum || !mls_range_contains(usrdatum->range, c->range))
++		return false; /* user may not be associated with range */
+ 
+-	return 1;
++	return true;
+ }
+ 
+ /*
+@@ -449,8 +467,8 @@ int mls_convert_context(struct policydb *oldp, struct policydb *newp,
+ 		return 0;
+ 
+ 	for (l = 0; l < 2; l++) {
+-		char *name = sym_name(oldp, SYM_LEVELS,
+-				      oldc->range.level[l].sens - 1);
++		const char *name = sym_name(oldp, SYM_LEVELS,
++					    oldc->range.level[l].sens - 1);
+ 
+ 		levdatum = symtab_search(&newp->p_levels, name);
+ 
+diff --git a/security/selinux/ss/mls.h b/security/selinux/ss/mls.h
+index 07980636751fa0e2e98a6c8789870368f91e954e..93cde1b22992ca4fd38d11d050f86000fe985534 100644
+--- a/security/selinux/ss/mls.h
++++ b/security/selinux/ss/mls.h
+@@ -27,9 +27,9 @@
+ int mls_compute_context_len(struct policydb *p, struct context *context);
+ void mls_sid_to_context(struct policydb *p, struct context *context,
+ 			char **scontext);
+-int mls_context_isvalid(struct policydb *p, struct context *c);
+-int mls_range_isvalid(struct policydb *p, struct mls_range *r);
+-int mls_level_isvalid(struct policydb *p, struct mls_level *l);
++bool mls_context_isvalid(const struct policydb *p, const struct context *c);
++bool mls_range_isvalid(const struct policydb *p, const struct mls_range *r);
++bool mls_level_isvalid(const struct policydb *p, const struct mls_level *l);
+ 
+ int mls_context_to_sid(struct policydb *p, char oldc, char *scontext,
+ 		       struct context *context, struct sidtab *s, u32 def_sid);
+diff --git a/security/selinux/ss/policydb.c b/security/selinux/ss/policydb.c
+index e86ac142b9fe3b2c38b3ec984043d1e5d0c9e0bb..03a67069a93f74aa7821a275ad1701f223593640 100644
+--- a/security/selinux/ss/policydb.c
++++ b/security/selinux/ss/policydb.c
+@@ -948,44 +948,50 @@ int policydb_load_isids(struct policydb *p, struct sidtab *s)
+ 	return 0;
+ }
+ 
+-int policydb_class_isvalid(struct policydb *p, u16 class)
++bool policydb_class_isvalid(const struct policydb *p, u16 class)
+ {
+ 	if (!class || class > p->p_classes.nprim)
+-		return 0;
+-	return 1;
++		return false;
++	if (!p->sym_val_to_name[SYM_CLASSES][class - 1])
++		return false;
++	return true;
+ }
+ 
+-int policydb_role_isvalid(struct policydb *p, unsigned int role)
++bool policydb_role_isvalid(const struct policydb *p, u32 role)
+ {
+ 	if (!role || role > p->p_roles.nprim)
+-		return 0;
+-	return 1;
++		return false;
++	if (!p->sym_val_to_name[SYM_ROLES][role - 1])
++		return false;
++	return true;
+ }
+ 
+-int policydb_type_isvalid(struct policydb *p, unsigned int type)
++bool policydb_type_isvalid(const struct policydb *p, u32 type)
+ {
+ 	if (!type || type > p->p_types.nprim)
+-		return 0;
+-	return 1;
++		return false;
++	if (!p->sym_val_to_name[SYM_TYPES][type - 1])
++		return false;
++	return true;
+ }
+ 
+ /*
+- * Return 1 if the fields in the security context
++ * Return true if the fields in the security context
+  * structure `c' are valid.  Return 0 otherwise.
+  */
+-int policydb_context_isvalid(struct policydb *p, struct context *c)
++bool policydb_context_isvalid(const struct policydb *p, const struct context *c)
+ {
+-	struct role_datum *role;
+-	struct user_datum *usrdatum;
++	const struct role_datum *role;
++	const struct user_datum *usrdatum;
+ 
+ 	if (!c->role || c->role > p->p_roles.nprim)
+-		return 0;
++		return false;
+ 
+ 	if (!c->user || c->user > p->p_users.nprim)
+-		return 0;
++		return false;
+ 
+ 	if (!c->type || c->type > p->p_types.nprim)
+-		return 0;
++		return false;
+ 
+ 	if (c->role != OBJECT_R_VAL) {
+ 		/*
+@@ -994,24 +1000,24 @@ int policydb_context_isvalid(struct policydb *p, struct context *c)
+ 		role = p->role_val_to_struct[c->role - 1];
+ 		if (!role || !ebitmap_get_bit(&role->types, c->type - 1))
+ 			/* role may not be associated with type */
+-			return 0;
++			return false;
+ 
+ 		/*
+ 		 * User must be authorized for the role.
+ 		 */
+ 		usrdatum = p->user_val_to_struct[c->user - 1];
+ 		if (!usrdatum)
+-			return 0;
++			return false;
+ 
+ 		if (!ebitmap_get_bit(&usrdatum->roles, c->role - 1))
+ 			/* user may not be associated with role */
+-			return 0;
++			return false;
+ 	}
+ 
+ 	if (!mls_context_isvalid(p, c))
+-		return 0;
++		return false;
+ 
+-	return 1;
++	return true;
+ }
+ 
+ /*
+diff --git a/security/selinux/ss/policydb.h b/security/selinux/ss/policydb.h
+index fdc94398a254052e49480d0f563306496049b2df..85633116623988346122f66aa63f459dc84cea1e 100644
+--- a/security/selinux/ss/policydb.h
++++ b/security/selinux/ss/policydb.h
+@@ -322,10 +322,11 @@ struct policy_file {
+ 
+ extern void policydb_destroy(struct policydb *p);
+ extern int policydb_load_isids(struct policydb *p, struct sidtab *s);
+-extern int policydb_context_isvalid(struct policydb *p, struct context *c);
+-extern int policydb_class_isvalid(struct policydb *p, u16 class);
+-extern int policydb_type_isvalid(struct policydb *p, unsigned int type);
+-extern int policydb_role_isvalid(struct policydb *p, unsigned int role);
++extern bool policydb_context_isvalid(const struct policydb *p,
++				     const struct context *c);
++extern bool policydb_class_isvalid(const struct policydb *p, u16 class);
++extern bool policydb_type_isvalid(const struct policydb *p, u32 type);
++extern bool policydb_role_isvalid(const struct policydb *p, u32 role);
+ extern int policydb_read(struct policydb *p, struct policy_file *fp);
+ extern int policydb_write(struct policydb *p, struct policy_file *fp);
+ 
+@@ -397,7 +398,7 @@ static inline int put_entry(const void *buf, size_t bytes, size_t num,
+ 	return 0;
+ }
+ 
+-static inline char *sym_name(struct policydb *p, unsigned int sym_num,
++static inline const char *sym_name(const struct policydb *p, unsigned int sym_num,
+ 			     unsigned int element_nr)
+ {
+ 	return p->sym_val_to_name[sym_num][element_nr];
+diff --git a/security/selinux/ss/services.c b/security/selinux/ss/services.c
+index fb150025359b037e01cf8af3525ba9c1a536f0e7..8b75108b562585ea1c8af9c6934152293f4a32b4 100644
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@ -461,7 +461,7 @@ static void security_dump_masked_av(struct policydb *policydb,
+ 	struct common_datum *common_dat;
+ 	struct class_datum *tclass_dat;
+ 	struct audit_buffer *ab;
+-	char *tclass_name;
++	const char *tclass_name;
+ 	char *scontext_name = NULL;
+ 	char *tcontext_name = NULL;
+ 	char *permission_names[SEL_VEC_MAX];
+diff --git a/security/selinux/ss/symtab.c b/security/selinux/ss/symtab.c
+index 832660fd84a96c2554daddd1763fc1cbfb36c497..a756554e7f1d339b623786972901f5fb0ef88c5d 100644
+--- a/security/selinux/ss/symtab.c
++++ b/security/selinux/ss/symtab.c
+@@ -50,7 +50,7 @@ int symtab_insert(struct symtab *s, char *name, void *datum)
+ 	return hashtab_insert(&s->table, name, datum, symtab_key_params);
+ }
+ 
+-void *symtab_search(struct symtab *s, const char *name)
++void *symtab_search(const struct symtab *s, const char *name)
+ {
+ 	return hashtab_search(&s->table, name, symtab_key_params);
+ }
+diff --git a/security/selinux/ss/symtab.h b/security/selinux/ss/symtab.h
+index 8e667cdbf38fcb1f47c6f63eb00778390ad9959d..7cfa3b44953ab8121f86135c004f3b9ecb1ae41f 100644
+--- a/security/selinux/ss/symtab.h
++++ b/security/selinux/ss/symtab.h
+@@ -21,6 +21,6 @@ struct symtab {
+ int symtab_init(struct symtab *s, u32 size);
+ 
+ int symtab_insert(struct symtab *s, char *name, void *datum);
+-void *symtab_search(struct symtab *s, const char *name);
++void *symtab_search(const struct symtab *s, const char *name);
+ 
+ #endif /* _SS_SYMTAB_H_ */

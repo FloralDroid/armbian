@@ -1,0 +1,90 @@
+From a7907a25ae1f1ca181d068ecdc80ee72be94315a Mon Sep 17 00:00:00 2001
+From: Stephen Smalley <stephen.smalley.work@gmail.com>
+Date: Mon, 30 Sep 2024 12:54:37 -0400
+Subject: [PATCH 65/90] selinux: convert selinux_file_send_sigiotask() to
+ namespace-aware helper
+
+Convert selinux_file_send_sigiotask() to use the cred_task_has_perm()
+namespace-aware permission checking helper. This required saving the
+file owner cred in the file security blob for later use in this hook
+function. Since the cred already includes the cred/task security blob
+which has the task SID and the SELinux state/namespace, we can drop
+those separate fields from the file_security_struct at the same time.
+
+Signed-off-by: Stephen Smalley <stephen.smalley.work@gmail.com>
+
+Upstream-commit: 8497b26eb49f8609e8dc39752abbf8004cd156b9
+---
+ security/selinux/hooks.c          | 15 ++++++---------
+ security/selinux/include/objsec.h |  3 +--
+ 2 files changed, 7 insertions(+), 11 deletions(-)
+
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index c52844323045629b1041f6545a8bd8b0c79916af..f90546690f8b972d6d61f841f6876b6626fab349 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -3875,8 +3875,7 @@ static int selinux_file_alloc_security(struct file *file)
+ 	u32 sid = current_sid();
+ 
+ 	fsec->sid = sid;
+-	fsec->fown_sid = sid;
+-	fsec->state = get_selinux_state(current_selinux_state);
++	fsec->cred = get_cred(current_cred());
+ 
+ 	return 0;
+ }
+@@ -3896,8 +3895,7 @@ static void selinux_file_free_security(struct file *file)
+ {
+ 	struct file_security_struct *fsec = selinux_file(file);
+ 
+-	put_selinux_state(fsec->state);
+-	fsec->state = NULL;
++	put_cred(fsec->cred);
+ }
+ 
+ /*
+@@ -4265,14 +4263,14 @@ static void selinux_file_set_fowner(struct file *file)
+ 	struct file_security_struct *fsec;
+ 
+ 	fsec = selinux_file(file);
+-	fsec->fown_sid = current_sid();
++	put_cred(fsec->cred);
++	fsec->cred = get_cred(current_cred());
+ }
+ 
+ static int selinux_file_send_sigiotask(struct task_struct *tsk,
+ 				       struct fown_struct *fown, int signum)
+ {
+ 	struct file *file;
+-	u32 sid = task_sid_obj(tsk);
+ 	u32 perm;
+ 	struct file_security_struct *fsec;
+ 
+@@ -4286,9 +4284,8 @@ static int selinux_file_send_sigiotask(struct task_struct *tsk,
+ 	else
+ 		perm = signal_to_av(signum);
+ 
+-	return avc_has_perm(fsec->state,
+-			    fsec->fown_sid, sid,
+-			    SECCLASS_PROCESS, perm, NULL);
++	return cred_task_has_perm(fsec->cred, tsk, SECCLASS_PROCESS, perm,
++				  NULL);
+ }
+ 
+ static int selinux_file_receive(struct file *file)
+diff --git a/security/selinux/include/objsec.h b/security/selinux/include/objsec.h
+index a1ebfe74a46c227bdc04d0e0fabab97a4a74930d..e739ba62e6b58bdf019841960a022e8cf866fb16 100644
+--- a/security/selinux/include/objsec.h
++++ b/security/selinux/include/objsec.h
+@@ -74,10 +74,9 @@ struct inode_security_struct {
+ 
+ struct file_security_struct {
+ 	u32 sid; /* SID of open file description */
+-	u32 fown_sid; /* SID of file owner (for SIGIO) */
+ 	u32 isid; /* SID of inode at the time of file open */
+ 	u32 pseqno; /* Policy seqno at the time of file open */
+-	struct selinux_state *state; /* SELinux state */
++	const struct cred *cred; /* cred for file owner (for SIGIO) */
+ };
+ 
+ struct backing_file_security_struct {
