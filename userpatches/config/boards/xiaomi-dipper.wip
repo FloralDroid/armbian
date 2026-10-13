@@ -54,6 +54,11 @@ EOF
 function post_customize_image__xiaomi_dipper_memory() {
 	install -d -m 755 "${SDCARD}/etc/sysctl.d" "${SDCARD}/etc/systemd/system"
 
+	sed -i \
+		-e 's/^#\?[[:space:]]*ZRAM_PERCENTAGE=.*/ZRAM_PERCENTAGE=120/' \
+		-e 's/^#\?[[:space:]]*MEM_LIMIT_PERCENTAGE=.*/MEM_LIMIT_PERCENTAGE=50/' \
+		"${SDCARD}/etc/default/armbian-zram-config"
+
 	cat > "${SDCARD}/etc/sysctl.d/90-xiaomi-dipper-memory.conf" <<'EOF'
 vm.page-cluster = 0
 EOF
