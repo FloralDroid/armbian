@@ -1,0 +1,47 @@
+From 8beb78447169f78e1f64fc5fa8c3b949401e4080 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Fri, 16 Oct 2026 12:55:12 +0800
+Subject: [PATCH 3/3] media: venus: reject HFI commands while the core is
+ powered off
+
+venus_iface_cmdq_write_nolock() validates the HFI state but not whether
+the core is powered. A command written to a powered-off core lands in
+shared memory that nothing consumes, so the caller stalls for its full
+completion timeout and the teardown keeps retrying against a dead core.
+
+Check hdev->power_enabled and fail the write immediately with a clear
+error. With the session runtime PM reference held (previous patch) this
+should not trigger during streaming; it covers races with autosuspend and
+pending system error recovery.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/media/platform/qcom/venus/hfi_venus.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/media/platform/qcom/venus/hfi_venus.c b/drivers/media/platform/qcom/venus/hfi_venus.c
+index d3da35f..57a067c 100644
+--- a/drivers/media/platform/qcom/venus/hfi_venus.c
++++ b/drivers/media/platform/qcom/venus/hfi_venus.c
+@@ -400,6 +400,18 @@ static int venus_iface_cmdq_write_nolock(struct venus_hfi_device *hdev,
+ 	if (!venus_is_valid_state(hdev))
+ 		return -EINVAL;
+ 
++	if (!hdev->power_enabled) {
++		/*
++		 * The core is powered off (e.g. autosuspend raced the
++		 * teardown, or a system error is pending). Writing a
++		 * command here would only stall the caller for a second
++		 * with no firmware to consume it; fail fast instead.
++		 */
++		dev_err(dev, "cmd 0x%x rejected, core is powered off\n",
++			((struct hfi_pkt_hdr *)pkt)->pkt_type);
++		return -EIO;
++	}
++
+ 	cmd_packet = (struct hfi_pkt_hdr *)pkt;
+ 	hdev->last_packet_type = cmd_packet->pkt_type;
+ 
+-- 
+2.47.3
+

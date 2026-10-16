@@ -1,0 +1,151 @@
+From 1848cebd8d5abeb8287445335ebe2d39360c8b70 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Fri, 16 Oct 2026 12:55:12 +0800
+Subject: [PATCH 2/3] media: venus: defer teardown when the HFI core is
+ unresponsive
+
+venus_helper_vb2_stop_streaming() ignores the result of hfi_session_stop()
+and keeps issuing teardown commands (unload resources, unregister buffers,
+unset internal buffers, session deinit, abort) at an unresponsive core,
+each of them stalling for a full second. intbufs_unset_buffers() frees the
+internal DMA buffers even when the firmware never acknowledged the unset,
+so the system error recovery that follows reinitializes the core while the
+firmware may still hold references to freed memory, leading to SMMU
+translation faults and hard resets of the SoC.
+
+Stop the teardown on the first failure, mark the instance unresponsive and
+keep the internal buffers mapped; cleanup is left to the system error
+recovery path. A pure dma_free, without any HFI command, reclaims the
+buffers at instance close, so nothing leaks. intbufs_unset_buffers() skips
+the HFI unset for such an instance.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/media/platform/qcom/venus/core.c    | 10 ++++
+ drivers/media/platform/qcom/venus/core.h    |  6 +++
+ drivers/media/platform/qcom/venus/helpers.c | 57 ++++++++++++++-------
+ 3 files changed, 54 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/venus/core.c b/drivers/media/platform/qcom/venus/core.c
+index dc69e77..03b5ee3 100644
+--- a/drivers/media/platform/qcom/venus/core.c
++++ b/drivers/media/platform/qcom/venus/core.c
+@@ -26,6 +26,7 @@
+ #include "core.h"
+ #include "firmware.h"
+ #include "pm_helpers.h"
++#include "helpers.h"
+ #include "hfi_venus_io.h"
+ 
+ static void venus_coredump(struct venus_core *core)
+@@ -629,6 +630,15 @@ err_cpucfg_path:
+ 
+ void venus_close_common(struct venus_inst *inst, struct file *filp)
+ {
++	/*
++	 * Reclaim the internal DMA buffers deferred by an unresponsive
++	 * teardown. The session_unresponsive flag makes
++	 * intbufs_unset_buffers() a pure dma_free (no HFI command), which
++	 * is safe now that the core has been recovered.
++	 */
++	if (inst->session_unresponsive)
++		venus_helper_intbufs_free(inst);
++
+ 	/*
+ 	 * Drop the streaming-session runtime PM reference if it was never
+ 	 * released by a teardown (failed start_streaming). Idempotent with
+diff --git a/drivers/media/platform/qcom/venus/core.h b/drivers/media/platform/qcom/venus/core.h
+index 7603148..db26ef4 100644
+--- a/drivers/media/platform/qcom/venus/core.h
++++ b/drivers/media/platform/qcom/venus/core.h
+@@ -521,6 +521,12 @@ struct venus_inst {
+ 	struct completion done;
+ 	unsigned int error;
+ 	bool session_error;
++	/*
++	 * HFI core became unresponsive during session teardown: keep the
++	 * internal DMA buffers mapped (the firmware may still reference
++	 * them) until instance close, and stop issuing HFI commands.
++	 */
++	bool session_unresponsive;
+ 	/*
+ 	 * Runtime PM reference held for the whole streaming session: taken
+ 	 * in {venc,vdec}_start_streaming, released after the teardown in
+diff --git a/drivers/media/platform/qcom/venus/helpers.c b/drivers/media/platform/qcom/venus/helpers.c
+index 328cce3..1d1f21c 100644
+--- a/drivers/media/platform/qcom/venus/helpers.c
++++ b/drivers/media/platform/qcom/venus/helpers.c
+@@ -297,13 +297,15 @@ static int intbufs_unset_buffers(struct venus_inst *inst)
+ 	int ret = 0;
+ 
+ 	list_for_each_entry_safe(buf, n, &inst->internalbufs, list) {
+-		bd.buffer_size = buf->size;
+-		bd.buffer_type = buf->type;
+-		bd.num_buffers = 1;
+-		bd.device_addr = buf->da;
+-		bd.response_required = true;
+-
+-		ret = hfi_session_unset_buffers(inst, &bd);
++		if (!inst->session_unresponsive) {
++			bd.buffer_size = buf->size;
++			bd.buffer_type = buf->type;
++			bd.num_buffers = 1;
++			bd.device_addr = buf->da;
++			bd.response_required = true;
++
++			ret = hfi_session_unset_buffers(inst, &bd);
++		}
+ 
+ 		list_del_init(&buf->list);
+ 		dma_free_attrs(inst->core->dev, buf->size, buf->va, buf->da,
+@@ -1552,18 +1554,35 @@ void venus_helper_vb2_stop_streaming(struct vb2_queue *q)
+ 
+ 	if (inst->streamon_out & inst->streamon_cap) {
+ 		ret = hfi_session_stop(inst);
+-		ret |= hfi_session_unload_res(inst);
+-		ret |= venus_helper_unregister_bufs(inst);
+-		ret |= venus_helper_intbufs_free(inst);
+-		ret |= hfi_session_deinit(inst);
+-
+-		if (inst->session_error || test_bit(0, &core->sys_error))
+-			ret = -EIO;
+-
+-		if (ret)
+-			hfi_session_abort(inst);
+-
+-		venus_helper_free_dpb_bufs(inst);
++		if (ret) {
++			/*
++			 * The HFI core is unresponsive (powered off or stalled).
++			 * Do not continue issuing teardown commands at it and
++			 * keep the internal DMA buffers mapped: the firmware
++			 * may still hold references to them and a subsequent
++			 * recovery would chase them after being freed.
++			 * Cleanup is left to the system error recovery path;
++			 * the buffers are reclaimed (dma_free only) at close.
++			 */
++			inst->session_unresponsive = true;
++			dev_warn_ratelimited(core->dev,
++					     "session stop failed (%d), deferring teardown to recovery\n",
++					     ret);
++		} else {
++			ret = hfi_session_unload_res(inst);
++			ret |= venus_helper_unregister_bufs(inst);
++			ret |= venus_helper_intbufs_free(inst);
++			ret |= hfi_session_deinit(inst);
++
++			if (inst->session_error || test_bit(0, &core->sys_error))
++				ret = -EIO;
++
++			if (ret)
++				hfi_session_abort(inst);
++
++			venus_helper_free_dpb_bufs(inst);
++			inst->session_unresponsive = false;
++		}
+ 
+ 		venus_pm_load_scale(inst);
+ 		INIT_LIST_HEAD(&inst->registeredbufs);
+-- 
+2.47.3
+

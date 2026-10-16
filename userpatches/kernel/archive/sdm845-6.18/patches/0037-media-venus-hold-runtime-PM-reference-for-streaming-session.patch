@@ -1,0 +1,179 @@
+From 72b74b2363de2cbdd308f180c17352b9f579066f Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Fri, 16 Oct 2026 12:55:12 +0800
+Subject: [PATCH 1/3] media: venus: hold runtime PM reference for the streaming
+ session
+
+Both venc_start_streaming() and vdec_start_streaming() drop the session's
+runtime PM reference right after venus_pm_acquire_core() with a 2s
+autosuspend delay, and neither frame processing nor session teardown takes
+a reference of its own. The autosuspend timer therefore powers the Venus
+core off while the session is still live: teardown commands (session stop,
+buffer unset, session end, abort) are written into a powered-off core,
+never consumed by the firmware, and every synchronous wait stalls for its
+full second before failing. Traced on the SDM845 Mi 8 with a 12-frame
+burst: runtime suspend at t+2.28s, session stop issued at t+2.78s, four
+consecutive -ETIMEDOUT teardown failures, and a hard reset of the board
+during recovery on repeated runs.
+
+Keep the reference for the whole streaming session and release it only
+after the teardown completes in venus_helper_vb2_stop_streaming(), with a
+safety release in venus_close_common(). The reference belongs to the
+per-codec device (dev_dec/dev_enc, created from the video-core0/1 DT
+nodes), not to core->dev; venus_pm_put_session() picks the right device and
+is idempotent through inst->pm_session_ref. Verified with 3 concurrent
+720p encoders driven near 29 fps through v4l2-ctl: no throughput
+regression, and no HFI timeouts during teardown.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/media/platform/qcom/venus/core.c      |  8 ++++++
+ drivers/media/platform/qcom/venus/core.h      |  7 +++++
+ drivers/media/platform/qcom/venus/helpers.c   |  4 +++
+ .../media/platform/qcom/venus/pm_helpers.h    | 28 +++++++++++++++++++
+ drivers/media/platform/qcom/venus/vdec.c      |  9 ++++--
+ drivers/media/platform/qcom/venus/venc.c      | 10 +++++--
+ 6 files changed, 60 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/venus/core.c b/drivers/media/platform/qcom/venus/core.c
+index a7a09ac..dc69e77 100644
+--- a/drivers/media/platform/qcom/venus/core.c
++++ b/drivers/media/platform/qcom/venus/core.c
+@@ -629,6 +629,14 @@ err_cpucfg_path:
+ 
+ void venus_close_common(struct venus_inst *inst, struct file *filp)
+ {
++	/*
++	 * Drop the streaming-session runtime PM reference if it was never
++	 * released by a teardown (failed start_streaming). Idempotent with
++	 * the release in venus_helper_vb2_stop_streaming().
++	 */
++	if (inst->pm_session_ref)
++		venus_pm_put_session(inst);
++
+ 	/*
+ 	 * Make sure we don't have IRQ/IRQ-thread currently running
+ 	 * or pending execution, which would race with the inst destruction.
+diff --git a/drivers/media/platform/qcom/venus/core.h b/drivers/media/platform/qcom/venus/core.h
+index e5ff90c..7603148 100644
+--- a/drivers/media/platform/qcom/venus/core.h
++++ b/drivers/media/platform/qcom/venus/core.h
+@@ -521,6 +521,13 @@ struct venus_inst {
+ 	struct completion done;
+ 	unsigned int error;
+ 	bool session_error;
++	/*
++	 * Runtime PM reference held for the whole streaming session: taken
++	 * in {venc,vdec}_start_streaming, released after the teardown in
++	 * venus_helper_vb2_stop_streaming. Prevents the 2s autosuspend from
++	 * powering the core off under an active session.
++	 */
++	bool pm_session_ref;
+ 	const struct hfi_inst_ops *ops;
+ 	u32 session_type;
+ 	union hfi_get_property hprop;
+diff --git a/drivers/media/platform/qcom/venus/helpers.c b/drivers/media/platform/qcom/venus/helpers.c
+index 7f370ca..328cce3 100644
+--- a/drivers/media/platform/qcom/venus/helpers.c
++++ b/drivers/media/platform/qcom/venus/helpers.c
+@@ -13,6 +13,7 @@
+ #include <asm/div64.h>
+ 
+ #include "core.h"
++#include <linux/pm_runtime.h>
+ #include "helpers.h"
+ #include "hfi_helper.h"
+ #include "pm_helpers.h"
+@@ -1568,6 +1569,9 @@ void venus_helper_vb2_stop_streaming(struct vb2_queue *q)
+ 		INIT_LIST_HEAD(&inst->registeredbufs);
+ 	}
+ 
++	if (inst->pm_session_ref)
++		venus_pm_put_session(inst);
++
+ 	venus_helper_buffers_done(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+ 				  VB2_BUF_STATE_ERROR);
+ 	venus_helper_buffers_done(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+diff --git a/drivers/media/platform/qcom/venus/pm_helpers.h b/drivers/media/platform/qcom/venus/pm_helpers.h
+index a492c50..51acfb0 100644
+--- a/drivers/media/platform/qcom/venus/pm_helpers.h
++++ b/drivers/media/platform/qcom/venus/pm_helpers.h
+@@ -51,6 +51,34 @@ static inline int venus_pm_acquire_core(struct venus_inst *inst)
+ 	return ret;
+ }
+ 
++/*
++ * Release the streaming-session runtime PM reference taken in
++ * {venc,vdec}_start_streaming(). The reference lives on the per-codec
++ * device (dev_dec/dev_enc, created from the DT video-core nodes), never
++ * on core->dev; putting it on the wrong device underflows the core
++ * device usage count. Idempotent via inst->pm_session_ref.
++ */
++static inline void venus_pm_put_session(struct venus_inst *inst)
++{
++	struct venus_core *core = inst->core;
++	struct device *dev;
++
++	if (!inst->pm_session_ref)
++		return;
++
++	if (inst->session_type == VIDC_SESSION_TYPE_ENC && core->dev_enc)
++		dev = core->dev_enc;
++	else if (inst->session_type == VIDC_SESSION_TYPE_DEC && core->dev_dec)
++		dev = core->dev_dec;
++	else
++		dev = core->dev;
++
++	inst->pm_session_ref = false;
++	mutex_lock(&core->pm_lock);
++	pm_runtime_put_autosuspend(dev);
++	mutex_unlock(&core->pm_lock);
++}
++
+ static inline int venus_pm_release_core(struct venus_inst *inst)
+ {
+ 	struct venus_core *core = inst->core;
+diff --git a/drivers/media/platform/qcom/venus/vdec.c b/drivers/media/platform/qcom/venus/vdec.c
+index 27cb024..a67d2a5 100644
+--- a/drivers/media/platform/qcom/venus/vdec.c
++++ b/drivers/media/platform/qcom/venus/vdec.c
+@@ -1199,9 +1199,12 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
+ 		if (ret)
+ 			goto put_power;
+ 
+-		ret = vdec_pm_put(inst, true);
+-		if (ret)
+-			goto error;
++		/*
++		 * Keep the runtime PM reference for the whole streaming
++		 * session; see venc_start_streaming(). Released after the
++		 * teardown in venus_helper_vb2_stop_streaming().
++		 */
++		inst->pm_session_ref = true;
+ 
+ 		ret = vdec_start_output(inst);
+ 	}
+diff --git a/drivers/media/platform/qcom/venus/venc.c b/drivers/media/platform/qcom/venus/venc.c
+index c957bd8..0d54923 100644
+--- a/drivers/media/platform/qcom/venus/venc.c
++++ b/drivers/media/platform/qcom/venus/venc.c
+@@ -1337,9 +1337,13 @@ static int venc_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	if (ret)
+ 		goto put_power;
+ 
+-	ret = venc_pm_put(inst, true);
+-	if (ret)
+-		goto error;
++	/*
++	 * Keep the runtime PM reference for the whole streaming session.
++	 * Dropping it here (autosuspend, 2s) lets the core power-collapse
++	 * under an active session; the reference is released only after
++	 * the teardown in venus_helper_vb2_stop_streaming().
++	 */
++	inst->pm_session_ref = true;
+ 
+ 	ret = venc_set_properties(inst);
+ 	if (ret)
+-- 
+2.47.3
+
