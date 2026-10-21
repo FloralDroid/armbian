@@ -1,0 +1,204 @@
+From 028ecbec3c23328a2bfa14a50e158501a3c6d1b6 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Wed, 21 Oct 2026 16:58:45 +0800
+Subject: [PATCH] media: venus: use a DMA buffer for SDM845 v2 decoder EOS
+
+SDM845 v2 firmware rejects the decoder STOP marker's unmapped 0xdeadb000
+address with SESSION_FATAL. The failing HFI event carries the same
+address in event_data2, and decoding stops before all queued frames are
+returned.
+
+Use the existing requires_eos_buffer resource flag to supply a zeroed
+4 KiB DMA allocation for decoder EOS. Reject zero or non-32-bit DMA
+addresses, publish the allocation before HFI submission, and use a
+reserved input tag to consume its completion without looking up a vb2
+buffer. Leave the other platforms' sentinel and IRIS2 NULL-EOS paths
+unchanged.
+
+Release the allocation on input completion, failed submission, or an
+acknowledged session end. A skipped end during core recovery does not
+acknowledge firmware ownership. If close has no such acknowledgment,
+warn and retain the mapping rather than unmap memory still owned by
+firmware; reclaiming that error-path allocation needs a proven core
+DMA-quiescence barrier.
+
+The exact change passed 55 host fault-injection checks in ordinary and
+ASan/UBSan builds. A 12-AU fixture completed through both native V4L2
+MMAP and Android Codec2 hardware decoding, including EOS, without a new
+session fatal. The Android run kept SELinux enforcing enabled.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ drivers/media/platform/qcom/venus/vdec.c | 102 ++++++++++++++++++++++-
+ 1 file changed, 100 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/qcom/venus/vdec.c b/drivers/media/platform/qcom/venus/vdec.c
+index a67d2a59b..e9db3364f 100644
+--- a/drivers/media/platform/qcom/venus/vdec.c
++++ b/drivers/media/platform/qcom/venus/vdec.c
+@@ -4,6 +4,7 @@
+  * Copyright (C) 2017 Linaro Ltd.
+  */
+ #include <linux/clk.h>
++#include <linux/dma-mapping.h>
+ #include <linux/module.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/platform_device.h>
+@@ -22,6 +23,8 @@
+ #include "vdec.h"
+ #include "pm_helpers.h"
+ 
++#define VENUS_DEC_EOS_TAG		(~0U)
++
+ /*
+  * Three resons to keep MPLANE formats (despite that the number of planes
+  * currently is one):
+@@ -543,6 +546,85 @@ static int vdec_subscribe_event(struct v4l2_fh *fh,
+ 	}
+ }
+ 
++static void vdec_free_eos_buffer(struct venus_inst *inst)
++{
++	struct venus_eos_buffer *eos;
++
++	eos = xchg(&inst->eos_buf, NULL);
++	if (!eos)
++		return;
++
++	dma_free_attrs(inst->core->dev, SZ_4K, eos->va, eos->da, 0);
++	kfree(eos);
++}
++
++static int vdec_alloc_eos_buffer(struct venus_inst *inst,
++				 struct hfi_frame_data *fdata)
++{
++	struct venus_eos_buffer *eos;
++
++	/* The previous EOS must return ownership before another is submitted. */
++	if (READ_ONCE(inst->eos_buf))
++		return -EBUSY;
++
++	eos = kzalloc(sizeof(*eos), GFP_KERNEL);
++	if (!eos)
++		return -ENOMEM;
++
++	eos->va = dma_alloc_attrs(inst->core->dev, SZ_4K, &eos->da,
++				  GFP_KERNEL, 0);
++	if (!eos->va) {
++		kfree(eos);
++		return -ENOMEM;
++	}
++
++	if (!eos->da || upper_32_bits(eos->da)) {
++		dma_free_attrs(inst->core->dev, SZ_4K, eos->va, eos->da, 0);
++		kfree(eos);
++		return -EOVERFLOW;
++	}
++
++	memset(eos->va, 0, SZ_4K);
++	dma_wmb();
++	fdata->device_addr = lower_32_bits(eos->da);
++	fdata->alloc_len = SZ_4K;
++	fdata->clnt_data = VENUS_DEC_EOS_TAG;
++	/* Publish before submission: INPUT completion may arrive immediately. */
++	WRITE_ONCE(inst->eos_buf, eos);
++
++	return 0;
++}
++
++static bool vdec_eos_done(struct venus_inst *inst, unsigned int buf_type,
++			  u32 tag)
++{
++	if (!inst->core->res->requires_eos_buffer ||
++	    buf_type != HFI_BUFFER_INPUT || tag != VENUS_DEC_EOS_TAG)
++		return false;
++
++	vdec_free_eos_buffer(inst);
++	return true;
++}
++
++static void vdec_eos_end_done(struct venus_inst *inst, bool end_pending, int ret)
++{
++	/* A skipped end during core recovery is not an ownership acknowledgment. */
++	if (end_pending && !ret && !test_bit(0, &inst->core->sys_error))
++		vdec_free_eos_buffer(inst);
++}
++
++static void vdec_eos_close(struct venus_inst *inst)
++{
++	/*
++	 * No EBD or successful session end: do not unmap DMA still owned by
++	 * firmware. This experimental path retains one allocation on failure;
++	 * production reclamation needs a proven core DMA-quiescence barrier.
++	 */
++	if (READ_ONCE(inst->eos_buf))
++		dev_warn_ratelimited(inst->core->dev,
++				     "unacknowledged decoder EOS, retaining DMA buffer\n");
++}
++
+ static int
+ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
+ {
+@@ -573,12 +655,20 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
+ 		 * avoids misapplying this quirk and breaking VP9 decode on SC7280.
+ 		 */
+ 
+-		if (IS_IRIS2(inst->core) && is_fw_rev_or_older(inst->core, 1, 0, 87))
++		if (inst->core->res->requires_eos_buffer) {
++			ret = vdec_alloc_eos_buffer(inst, &fdata);
++			if (ret)
++				goto unlock;
++		} else if (IS_IRIS2(inst->core) &&
++			   is_fw_rev_or_older(inst->core, 1, 0, 87)) {
+ 			fdata.device_addr = 0;
+-		else
++		} else {
+ 			fdata.device_addr = 0xdeadb000;
++		}
+ 
+ 		ret = hfi_session_process_buf(inst, &fdata);
++		if (ret && inst->core->res->requires_eos_buffer)
++			vdec_free_eos_buffer(inst);
+ 
+ 		if (!ret && inst->codec_state == VENUS_DEC_STATE_DECODING) {
+ 			inst->codec_state = VENUS_DEC_STATE_DRAIN;
+@@ -1314,6 +1404,7 @@ static void vdec_stop_streaming(struct vb2_queue *q)
+ static void vdec_session_release(struct venus_inst *inst)
+ {
+ 	struct venus_core *core = inst->core;
++	bool end_pending;
+ 	int ret, abort = 0;
+ 
+ 	vdec_pm_get(inst);
+@@ -1329,7 +1420,10 @@ static void vdec_session_release(struct venus_inst *inst)
+ 	abort = (ret && ret != -EINVAL) ? 1 : 0;
+ 	ret = venus_helper_intbufs_free(inst);
+ 	abort = (ret && ret != -EINVAL) ? 1 : 0;
++	end_pending = inst->state >= INST_INIT &&
++		      !test_bit(0, &core->sys_error);
+ 	ret = hfi_session_deinit(inst);
++	vdec_eos_end_done(inst, end_pending, ret);
+ 	abort = (ret && ret != -EINVAL) ? 1 : 0;
+ 
+ 	if (inst->session_error || test_bit(0, &core->sys_error))
+@@ -1421,6 +1515,9 @@ static void vdec_buf_done(struct venus_inst *inst, unsigned int buf_type,
+ 
+ 	vdec_pm_touch(inst);
+ 
++	if (vdec_eos_done(inst, buf_type, tag))
++		return;
++
+ 	if (buf_type == HFI_BUFFER_INPUT)
+ 		type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+ 	else
+@@ -1764,6 +1861,7 @@ static int vdec_close(struct file *file)
+ 	vdec_pm_get(inst);
+ 	cancel_work_sync(&inst->delayed_process_work);
+ 	venus_close_common(inst, file);
++	vdec_eos_close(inst);
+ 	ida_destroy(&inst->dpb_ids);
+ 	vdec_pm_put(inst, false);
+ 
+-- 
+2.47.3
+
