@@ -1,0 +1,428 @@
+From 23222fc6307f67fc7d1a8641f8ad783cedb7e817 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Sat, 31 Oct 2026 00:27:47 +0800
+Subject: [PATCH] android: Add PID namespace UID CPU accounting
+
+Provide the Android uid_cputime proc paths, microsecond format and file
+permissions. Account live and exited threads in each proc PID namespace
+and its ancestors, map UIDs through the reader user namespace, and keep
+clear operations within that PID namespace. Coordinate exit and readers
+without a scheduler-wide UID lock. Free state with its PID namespace.
+
+CONFIG_ANDROID_UID_CPUTIME is optional and the event capability query
+reports whether it was compiled in.
+
+Kernel base: e8694cdbd7db99fa26f6e8c80a2a337e0de29a2f (6.18.53)
+---
+ include/linux/pid_namespace.h |   3 +
+ include/linux/sched.h         |   3 +
+ include/linux/uid_cputime.h   |  18 +++
+ init/Kconfig                  |   8 ++
+ kernel/Makefile               |   1 +
+ kernel/exit.c                 |   2 +
+ kernel/fork.c                 |   3 +
+ kernel/pid_namespace.c        |   6 +
+ kernel/uid_cputime.c          | 241 ++++++++++++++++++++++++++++++++++
+ 9 files changed, 285 insertions(+)
+ create mode 100644 include/linux/uid_cputime.h
+ create mode 100644 kernel/uid_cputime.c
+
+diff --git a/include/linux/pid_namespace.h b/include/linux/pid_namespace.h
+index 445517a72..465b56ec3 100644
+--- a/include/linux/pid_namespace.h
++++ b/include/linux/pid_namespace.h
+@@ -32,6 +32,9 @@ struct pid_namespace {
+ 	unsigned int level;
+ 	int pid_max;
+ 	struct pid_namespace *parent;
++#ifdef CONFIG_ANDROID_UID_CPUTIME
++	struct uid_cpu_stats *uid_cputime;
++#endif
+ #ifdef CONFIG_BSD_PROCESS_ACCT
+ 	struct fs_pin *bacct;
+ #endif
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e20e0bd7e..93a6289bc 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -835,6 +835,9 @@ struct task_struct {
+ 	refcount_t			usage;
+ 	/* Per task flags (PF_*), defined further below: */
+ 	unsigned int			flags;
++#ifdef CONFIG_ANDROID_UID_CPUTIME
++	atomic64_t			uid_cputime_accounted;
++#endif
+ 	unsigned int			ptrace;
+ 
+ #ifdef CONFIG_MEM_ALLOC_PROFILING
+diff --git a/include/linux/uid_cputime.h b/include/linux/uid_cputime.h
+new file mode 100644
+index 000000000..f1678123b
+--- /dev/null
++++ b/include/linux/uid_cputime.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_UID_CPUTIME_H
++#define _LINUX_UID_CPUTIME_H
++
++struct pid_namespace;
++struct task_struct;
++struct uid_cpu_stats;
++
++#ifdef CONFIG_ANDROID_UID_CPUTIME
++int uid_cputime_ns_init(struct pid_namespace *ns);
++void uid_cputime_ns_free(struct pid_namespace *ns);
++void uid_cputime_exit(struct task_struct *task);
++#else
++static inline int uid_cputime_ns_init(struct pid_namespace *ns) { return 0; }
++static inline void uid_cputime_ns_free(struct pid_namespace *ns) {}
++static inline void uid_cputime_exit(struct task_struct *task) {}
++#endif
++#endif
+diff --git a/init/Kconfig b/init/Kconfig
+index b0e59d995..bff9b9fb3 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1384,6 +1384,14 @@ config UTS_NS_RESOURCES
+ 	  Unbound namespaces retain the original kernel behavior.
+ 
+ 
++config ANDROID_UID_CPUTIME
++	bool "Android per-UID CPU time accounting"
++	depends on PROC_FS && PID_NS
++	help
++	  Provide the Android uid_cputime proc interface independently in each
++	  PID namespace. CPU time includes live and exited threads and child
++	  namespaces. Removing a UID range affects only that proc namespace.
++
+ config TIME_NS
+ 	bool "TIME namespace"
+ 	depends on GENERIC_GETTIMEOFDAY
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 58f4033ad..fa0f5ba34 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -209,3 +209,4 @@ $(obj)/kheaders.md5: $(obj)/kheaders-srclist FORCE
+ clean-files := kheaders.md5 kheaders-srclist kheaders-objlist
+ 
+ obj-$(CONFIG_UTS_NS_RESOURCES) += uts_resources.o
++obj-$(CONFIG_ANDROID_UID_CPUTIME) += uid_cputime.o
+diff --git a/kernel/exit.c b/kernel/exit.c
+index d60c12419..28f9f0ead 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -29,6 +29,7 @@
+ #include <linux/binfmts.h>
+ #include <linux/nsproxy.h>
+ #include <linux/pid_namespace.h>
++#include <linux/uid_cputime.h>
+ #include <linux/ptrace.h>
+ #include <linux/profile.h>
+ #include <linux/mount.h>
+@@ -953,6 +954,7 @@ void __noreturn do_exit(long code)
+ 
+ 	tsk->exit_code = code;
+ 	taskstats_exit(tsk, group_dead);
++	uid_cputime_exit(tsk);
+ 	unwind_deferred_task_exit(tsk);
+ 	trace_sched_process_exit(tsk, group_dead);
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 295cf8cf7..4f2b2dd5e 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2020,6 +2020,9 @@ __latent_entropy struct task_struct *copy_process(
+ 	p = dup_task_struct(current, node);
+ 	if (!p)
+ 		goto fork_out;
++#ifdef CONFIG_ANDROID_UID_CPUTIME
++	atomic64_set(&p->uid_cputime_accounted, 0);
++#endif
+ 	p->flags &= ~PF_KTHREAD;
+ 	if (args->kthread)
+ 		p->flags |= PF_KTHREAD;
+diff --git a/kernel/pid_namespace.c b/kernel/pid_namespace.c
+index 650be58d8..700299a3c 100644
+--- a/kernel/pid_namespace.c
++++ b/kernel/pid_namespace.c
+@@ -11,6 +11,7 @@
+ 
+ #include <linux/pid.h>
+ #include <linux/pid_namespace.h>
++#include <linux/uid_cputime.h>
+ #include <linux/user_namespace.h>
+ #include <linux/syscalls.h>
+ #include <linux/cred.h>
+@@ -98,6 +99,9 @@ static struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns
+ 		goto out_dec;
+ 
+ 	idr_init(&ns->idr);
++	err = uid_cputime_ns_init(ns);
++	if (err)
++		goto out_free_idr;
+ 
+ 	ns->pid_cachep = create_pid_cachep(level);
+ 	if (ns->pid_cachep == NULL)
+@@ -129,6 +133,7 @@ static struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns
+ out_free_inum:
+ 	ns_common_free(ns);
+ out_free_idr:
++	uid_cputime_ns_free(ns);
+ 	idr_destroy(&ns->idr);
+ 	kmem_cache_free(pid_ns_cachep, ns);
+ out_dec:
+@@ -149,6 +154,7 @@ static void delayed_free_pidns(struct rcu_head *p)
+ 
+ static void destroy_pid_namespace(struct pid_namespace *ns)
+ {
++	uid_cputime_ns_free(ns);
+ 	ns_tree_remove(ns);
+ 	unregister_pidns_sysctls(ns);
+ 
+diff --git a/kernel/uid_cputime.c b/kernel/uid_cputime.c
+new file mode 100644
+index 000000000..b4d5339d8
+--- /dev/null
++++ b/kernel/uid_cputime.c
+@@ -0,0 +1,241 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Android UID CPU time, including descendants of each proc PID namespace. */
++#include <linux/cred.h>
++#include <linux/hashtable.h>
++#include <linux/init.h>
++#include <linux/mutex.h>
++#include <linux/pid_namespace.h>
++#include <linux/proc_fs.h>
++#include <linux/sched/cputime.h>
++#include <linux/sched/signal.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/uid_cputime.h>
++#include <linux/user_namespace.h>
++
++struct uid_cpu_entry {
++	struct hlist_node node;
++	kuid_t uid;
++	u64 user, system;
++	u64 active_user, active_system;
++};
++
++struct uid_cpu_stats {
++	struct mutex lock;
++	DECLARE_HASHTABLE(entries, 6);
++	int error;
++};
++
++int uid_cputime_ns_init(struct pid_namespace *ns)
++{
++	struct uid_cpu_stats *stats;
++
++	stats = kzalloc(sizeof(*stats), GFP_KERNEL_ACCOUNT);
++	if (!stats)
++		return -ENOMEM;
++	mutex_init(&stats->lock);
++	hash_init(stats->entries);
++	smp_store_release(&ns->uid_cputime, stats);
++	return 0;
++}
++
++void uid_cputime_ns_free(struct pid_namespace *ns)
++{
++	struct uid_cpu_stats *stats = ns->uid_cputime;
++	struct uid_cpu_entry *entry;
++	struct hlist_node *next;
++	unsigned int bucket;
++
++	if (!stats)
++		return;
++	hash_for_each_safe(stats->entries, bucket, next, entry, node) {
++		hash_del(&entry->node);
++		kfree(entry);
++	}
++	kfree(stats);
++}
++
++static struct uid_cpu_entry *uid_cpu_entry(struct uid_cpu_stats *stats,
++					 kuid_t uid, gfp_t flags)
++{
++	struct uid_cpu_entry *entry;
++
++	hash_for_each_possible(stats->entries, entry, node, __kuid_val(uid))
++		if (uid_eq(entry->uid, uid))
++			return entry;
++	entry = kzalloc(sizeof(*entry), flags | __GFP_ACCOUNT);
++	if (entry) {
++		entry->uid = uid;
++		hash_add(stats->entries, &entry->node, __kuid_val(uid));
++	}
++	return entry;
++}
++
++void uid_cputime_exit(struct task_struct *task)
++{
++	struct pid_namespace *ns;
++	kuid_t uid = task_uid(task);
++
++	for (ns = task_active_pid_ns(task); ns; ns = ns->parent) {
++		struct uid_cpu_stats *stats = smp_load_acquire(&ns->uid_cputime);
++		struct uid_cpu_entry *entry;
++		u64 user, system;
++
++		if (!stats)
++			continue;
++		mutex_lock(&stats->lock);
++		if (atomic64_read(&task->uid_cputime_accounted) & BIT_ULL(ns->level))
++			goto unlock;
++		entry = uid_cpu_entry(stats, uid, GFP_KERNEL);
++		if (!entry) {
++			stats->error = -ENOMEM;
++			goto unlock;
++		}
++		task_cputime_adjusted(task, &user, &system);
++		entry->user += user;
++		entry->system += system;
++		/* Readers hold this namespace's lock when checking the bit. */
++		atomic64_or(BIT_ULL(ns->level), &task->uid_cputime_accounted);
++unlock:
++		mutex_unlock(&stats->lock);
++	}
++}
++
++static int uid_cputime_show(struct seq_file *m, void *unused)
++{
++	struct pid_namespace *ns = m->private;
++	struct uid_cpu_stats *stats = smp_load_acquire(&ns->uid_cputime);
++	struct user_namespace *user_ns = current_user_ns();
++	struct task_struct *group, *task;
++	struct uid_cpu_entry *entry;
++	unsigned int bucket;
++	u64 user, system;
++	int ret;
++
++	if (!stats)
++		return -ENODEV;
++	mutex_lock(&stats->lock);
++	ret = stats->error;
++	if (ret)
++		goto out;
++	hash_for_each(stats->entries, bucket, entry, node) {
++		entry->active_user = 0;
++		entry->active_system = 0;
++	}
++	rcu_read_lock();
++	for_each_process_thread(group, task) {
++		if (!task_pid_nr_ns(task, ns) ||
++		    (atomic64_read(&task->uid_cputime_accounted) & BIT_ULL(ns->level)))
++			continue;
++		entry = uid_cpu_entry(stats, task_uid(task), GFP_ATOMIC);
++		if (!entry) {
++			ret = -ENOMEM;
++			break;
++		}
++		task_cputime_adjusted(task, &user, &system);
++		entry->active_user += user;
++		entry->active_system += system;
++	}
++	rcu_read_unlock();
++	if (ret)
++		goto out;
++	hash_for_each(stats->entries, bucket, entry, node) {
++		if (!kuid_has_mapping(user_ns, entry->uid))
++			continue;
++		seq_printf(m, "%u: %llu %llu\n", from_kuid(user_ns, entry->uid),
++			   div_u64(entry->user + entry->active_user, NSEC_PER_USEC),
++			   div_u64(entry->system + entry->active_system, NSEC_PER_USEC));
++	}
++out:
++	mutex_unlock(&stats->lock);
++	return ret;
++}
++
++static int uid_cputime_open(struct inode *inode, struct file *file)
++{
++	struct pid_namespace *ns = get_pid_ns(proc_pid_ns(inode->i_sb));
++	int ret = single_open(file, uid_cputime_show, ns);
++
++	if (ret)
++		put_pid_ns(ns);
++	return ret;
++}
++
++static int uid_cputime_release(struct inode *inode, struct file *file)
++{
++	struct pid_namespace *ns = ((struct seq_file *)file->private_data)->private;
++	int ret = single_release(inode, file);
++
++	put_pid_ns(ns);
++	return ret;
++}
++
++static ssize_t uid_cputime_remove(struct file *file, const char __user *buffer,
++				 size_t count, loff_t *position)
++{
++	struct pid_namespace *ns = proc_pid_ns(file_inode(file)->i_sb);
++	struct uid_cpu_stats *stats = smp_load_acquire(&ns->uid_cputime);
++	struct user_namespace *user_ns = current_user_ns();
++	struct uid_cpu_entry *entry;
++	struct hlist_node *next;
++	char text[64], *first, *last;
++	unsigned int begin, end, uid, bucket;
++
++	if (!stats)
++		return -ENODEV;
++	if (!count || count >= sizeof(text))
++		return -EINVAL;
++	if (copy_from_user(text, buffer, count))
++		return -EFAULT;
++	text[count] = '\0';
++	last = strim(text);
++	first = strsep(&last, "-");
++	if (!last || kstrtouint(first, 10, &begin) ||
++	    kstrtouint(last, 10, &end) || begin > end)
++		return -EINVAL;
++	mutex_lock(&stats->lock);
++	hash_for_each_safe(stats->entries, bucket, next, entry, node) {
++		if (!kuid_has_mapping(user_ns, entry->uid))
++			continue;
++		uid = from_kuid(user_ns, entry->uid);
++		if (uid >= begin && uid <= end) {
++			hash_del(&entry->node);
++			kfree(entry);
++		}
++	}
++	mutex_unlock(&stats->lock);
++	return count;
++}
++
++static const struct proc_ops uid_cputime_ops = {
++	.proc_open = uid_cputime_open,
++	.proc_read = seq_read,
++	.proc_lseek = seq_lseek,
++	.proc_release = uid_cputime_release,
++};
++
++static const struct proc_ops uid_cputime_remove_ops = {
++	.proc_write = uid_cputime_remove,
++	.proc_lseek = noop_llseek,
++};
++
++static int __init uid_cputime_init(void)
++{
++	struct proc_dir_entry *parent;
++	int ret;
++
++	ret = uid_cputime_ns_init(&init_pid_ns);
++	if (ret)
++		return ret;
++	parent = proc_mkdir("uid_cputime", NULL);
++	if (!parent)
++		return -ENOMEM;
++	if (!proc_create("show_uid_stat", 0444, parent, &uid_cputime_ops) ||
++	    !proc_create("remove_uid_range", 0222, parent, &uid_cputime_remove_ops)) {
++		remove_proc_subtree("uid_cputime", NULL);
++		return -ENOMEM;
++	}
++	return 0;
++}
++subsys_initcall(uid_cputime_init);

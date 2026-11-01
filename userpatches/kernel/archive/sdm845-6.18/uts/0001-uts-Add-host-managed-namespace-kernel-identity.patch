@@ -1,0 +1,833 @@
+From 7cd5d278c0518f6d02bdf430ee79e296193c8e14 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Thu, 29 Oct 2026 16:34:11 +0800
+Subject: [PATCH] uts: Add host-managed namespace kernel identity
+
+Add an opt-in UTS namespace extension for container runtimes that need a
+consistent kernel identity without modifying libc or replacing syscall
+handlers. A host administrator configures release/version through a UTS
+namespace FD. The initial UTS is immutable, successful configuration
+seals both fields, and descendant UTS namespaces inherit the same
+identity family.
+
+Require initial user/PID namespace credentials and CAP_SYS_ADMIN for
+SET. Restrict GET and setns across identity families to the same
+administrators, including when a guest holds an otherwise usable
+namespace FD. Preserve standard hostname/domainname handling and
+architecture/personality ABI.
+
+Use the configured strings for uname and existing sysctls. Remove
+embedded host build identity from the configured namespace's proc
+version banner, clear old bytes in uname arrays, and derive UNAME26
+output from the instance release. Unconfigured namespaces retain their
+existing identity.
+
+Document the fixed native/compat ioctl ABI and add a focused nsfs
+selftest for validation, sealing, inherited views and denied escape
+paths. The test accepts an optional compat executable for raw AArch32
+validation on arm64.
+---
+ Documentation/userspace-api/index.rst         |   1 +
+ Documentation/userspace-api/uts-identity.rst  | 106 +++++++
+ fs/nsfs.c                                     |  11 +
+ fs/proc/version.c                             |  12 +-
+ include/linux/uts_namespace.h                 |   8 +
+ include/linux/utsname.h                       |  10 +
+ include/uapi/linux/nsfs.h                     |  16 +
+ init/Kconfig                                  |  10 +
+ kernel/sys.c                                  |  39 ++-
+ kernel/utsname.c                              | 104 +++++++
+ .../selftests/filesystems/nsfs/Makefile       |   2 +-
+ .../testing/selftests/filesystems/nsfs/config |   1 +
+ .../selftests/filesystems/nsfs/uts_identity.c | 283 ++++++++++++++++++
+ 13 files changed, 597 insertions(+), 6 deletions(-)
+ create mode 100644 Documentation/userspace-api/uts-identity.rst
+ create mode 100644 tools/testing/selftests/filesystems/nsfs/uts_identity.c
+
+diff --git a/Documentation/userspace-api/index.rst b/Documentation/userspace-api/index.rst
+index b8c73be4f..2203a0373 100644
+--- a/Documentation/userspace-api/index.rst
++++ b/Documentation/userspace-api/index.rst
+@@ -17,6 +17,7 @@ System calls
+    :maxdepth: 1
+ 
+    unshare
++   uts-identity
+    futex2
+    ebpf/index
+    ioctl/index
+diff --git a/Documentation/userspace-api/uts-identity.rst b/Documentation/userspace-api/uts-identity.rst
+new file mode 100644
+index 000000000..c33dbbd6a
+--- /dev/null
++++ b/Documentation/userspace-api/uts-identity.rst
+@@ -0,0 +1,106 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++Host-managed UTS kernel identity
++================================
++
++This project extension is enabled by CONFIG_UTS_NS_IDENTITY. It configures a
++noninitial UTS namespace through an open namespace file descriptor, without
++changing the kernel implementation or the architecture reported to programs.
++Unconfigured namespaces keep their existing behavior.
++
++Interface
++---------
++
++``NS_UTS_GET_IDENTITY`` and ``NS_UTS_SET_IDENTITY`` are defined in
++``<linux/nsfs.h>``. Both operate on ``struct uts_ns_identity``, a fixed 144-byte
++structure with the same layout in native and compat ABIs::
++
++    __u32 abi_version;
++    __u32 flags;
++    char release[65];
++    char version[65];
++    __u8 reserved[6];
++
++GET writes ABI version 1, the current release and version, and zero reserved
++bytes. ``UTS_NS_IDENTITY_SEALED`` is set in flags after configuration. GET does
++not require an input structure. The presence of GET and its returned version
++provide capability detection; a kernel without this extension returns ENOTTY.
++
++SET requires ABI version 1, zero flags and zero reserved bytes. Strings must
++contain 1 to 64 printable ASCII characters followed by a NUL. Release must not
++contain spaces. Trailing bytes after the NUL are not stored. The caller needs
++CAP_SYS_ADMIN in the initial user namespace, must belong to that user namespace,
++and must have the initial active PID namespace. The initial UTS namespace cannot
++be configured. The capability check is performed against the ioctl caller,
++rather than the credentials of the process that opened the namespace FD.
++
++The first successful SET atomically installs both strings and seals the
++namespace. Later SET requests, including those from the administrator, return
++EBUSY. There is no reset operation. A fresh instance requires a fresh UTS
++namespace. Invalid ABI versions, flags, reserved bytes and strings return
++EINVAL; invalid user pointers return EFAULT. Both ioctls return EINVAL on a
++namespace FD of another type. Unauthorized operations return EPERM.
++
++Configure the namespace before starting guest code or creating its descendant
++UTS namespaces. A descendant created before SET has its own unconfigured copy
++and is not retroactively configured. These ioctls do not notify sysctl pollers;
++release and version are initialized before the guest begins executing.
++
++Inheritance and access
++----------------------
++
++A namespace created with CLONE_NEWUTS inherits the parent's strings, sealed
++state and identity family. The identity family is the boot-unique namespace
++ID of the namespace on which SET succeeded. Independent SET operations create
++different families even when all their strings are identical.
++
++A task in a sealed family may use GET and setns within that family. It may not
++use either operation on an unconfigured UTS namespace, the initial namespace,
++or another family, even if it possesses an open FD and the usual namespace
++capabilities. Host administrators meeting the SET credential requirements may
++inspect and switch between families. Existing setns capability checks still
++apply. Unconfigured tasks retain standard switching rules between unconfigured
++UTS namespaces; entering a sealed family requires a host administrator.
++
++This extension does not make possession of initial user/PID namespace root
++credentials safe for guest code. The runtime must provide a separate PID
++namespace, restrict access to host tasks and files, and apply its normal device,
++mount, capability, seccomp and LSM policy. It must not hand host namespace FDs
++to the guest as a substitute for those controls.
++
++Views and compatibility
++-----------------------
++
++uname, including raw native and compat syscalls, and the osrelease/version
++sysctls read the configured UTS strings. Sysname and machine are unchanged;
++normal personality-dependent architecture handling remains in effect. The full
++release/version arrays returned by uname are zero-padded so bytes from the old
++host identity do not survive after a shorter configured string.
++
++For a configured namespace, /proc/version is rendered as::
++
++    <sysname> version <release> <version>\n
++
++It contains no additional compile-time user, hostname or compiler string. The
++host and unconfigured namespaces retain their original banner. Kernel log
++banners and other global diagnostic files are outside this interface and need
++separate runtime access controls.
++
++UNAME26 compatibility maps the configured release using its minor version and
++suffix, instead of the build release and LINUX_VERSION_PATCHLEVEL. A 3.x release
++uses 40 + minor; other numeric releases use 60 + minor. A missing or overflowing
++minor leaves the configured release unchanged. It never falls back to host
++identity. Old uname entry points use the same mapping where the architecture
++implements them. On arm64, AArch32 uses the compat newuname entry point; the
++removed ARM old-uname syscall numbers still return ENOSYS.
++
++Validation
++----------
++
++The filesystems/nsfs ``uts_identity`` selftest requires an initial-namespace
++administrator and exercises ABI validation, one-time sealing, libc/raw uname,
++sysctl and banner agreement, UNAME26, inherited namespaces, same-family setns,
++FD-based escape attempts, nested user namespaces and unchanged host identity.
++It accepts an optional path to a compat executable, run inside the configured
++guest. The project validation fixture uses a freestanding AArch32 executable
++for raw uname, ioctl and personality checks on arm64.
+diff --git a/fs/nsfs.c b/fs/nsfs.c
+index 4dee1e728..36e1e2cdb 100644
+--- a/fs/nsfs.c
++++ b/fs/nsfs.c
+@@ -178,6 +178,10 @@ static bool nsfs_ioctl_valid(unsigned int cmd)
+ 	case NS_GET_PID_IN_PIDNS:
+ 	case NS_GET_TGID_IN_PIDNS:
+ 	case NS_GET_ID:
++#ifdef CONFIG_UTS_NS_IDENTITY
++	case NS_UTS_GET_IDENTITY:
++	case NS_UTS_SET_IDENTITY:
++#endif
+ 		return true;
+ 	}
+ 
+@@ -225,6 +229,13 @@ static long ns_ioctl(struct file *filp, unsigned int ioctl,
+ 
+ 	ns = get_proc_ns(file_inode(filp));
+ 	switch (ioctl) {
++#ifdef CONFIG_UTS_NS_IDENTITY
++	case NS_UTS_GET_IDENTITY:
++	case NS_UTS_SET_IDENTITY:
++		if (ns->ns_type != CLONE_NEWUTS)
++			return -EINVAL;
++		return uts_identity_ioctl(to_uts_ns(ns), ioctl, arg);
++#endif
+ 	case NS_GET_USERNS:
+ 		return open_related_ns(ns, ns_get_owner);
+ 	case NS_GET_PARENT:
+diff --git a/fs/proc/version.c b/fs/proc/version.c
+index 02e3c3cd4..ca33a6a19 100644
+--- a/fs/proc/version.c
++++ b/fs/proc/version.c
+@@ -9,10 +9,14 @@
+ 
+ static int version_proc_show(struct seq_file *m, void *v)
+ {
+-	seq_printf(m, linux_proc_banner,
+-		utsname()->sysname,
+-		utsname()->release,
+-		utsname()->version);
++	down_read(&uts_sem);
++	if (utsname_has_identity())
++		seq_printf(m, "%s version %s %s\n", utsname()->sysname,
++			   utsname()->release, utsname()->version);
++	else
++		seq_printf(m, linux_proc_banner, utsname()->sysname,
++			   utsname()->release, utsname()->version);
++	up_read(&uts_sem);
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/uts_namespace.h b/include/linux/uts_namespace.h
+index 60f37fec0..a43404e76 100644
+--- a/include/linux/uts_namespace.h
++++ b/include/linux/uts_namespace.h
+@@ -10,6 +10,9 @@ extern struct user_namespace init_user_ns;
+ 
+ struct uts_namespace {
+ 	struct new_utsname name;
++#ifdef CONFIG_UTS_NS_IDENTITY
++	u64 identity_id;
++#endif
+ 	struct user_namespace *user_ns;
+ 	struct ucounts *ucounts;
+ 	struct ns_common ns;
+@@ -17,6 +20,11 @@ struct uts_namespace {
+ 
+ extern struct uts_namespace init_uts_ns;
+ 
++#ifdef CONFIG_UTS_NS_IDENTITY
++long uts_identity_ioctl(struct uts_namespace *ns, unsigned int cmd,
++			unsigned long arg);
++#endif
++
+ #ifdef CONFIG_UTS_NS
+ static inline struct uts_namespace *to_uts_ns(struct ns_common *ns)
+ {
+diff --git a/include/linux/utsname.h b/include/linux/utsname.h
+index 547bd4439..7202526f4 100644
+--- a/include/linux/utsname.h
++++ b/include/linux/utsname.h
+@@ -36,6 +36,16 @@ static inline struct new_utsname *init_utsname(void)
+ 	return &init_uts_ns.name;
+ }
+ 
++/* Read together with name under uts_sem. */
++static inline bool utsname_has_identity(void)
++{
++#ifdef CONFIG_UTS_NS_IDENTITY
++	return current->nsproxy->uts_ns->identity_id != 0;
++#else
++	return false;
++#endif
++}
++
+ extern struct rw_semaphore uts_sem;
+ 
+ #endif /* _LINUX_UTSNAME_H */
+diff --git a/include/uapi/linux/nsfs.h b/include/uapi/linux/nsfs.h
+index e098759ec..61ef1665f 100644
+--- a/include/uapi/linux/nsfs.h
++++ b/include/uapi/linux/nsfs.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/ioctl.h>
+ #include <linux/types.h>
++#include <linux/utsname.h>
+ 
+ #define NSIO	0xb7
+ 
+@@ -44,6 +45,21 @@ struct mnt_ns_info {
+ #define NS_GET_MNTNS_ID		_IOR(NSIO, 5,  __u64)
+ #define NS_GET_ID		_IOR(NSIO, 13, __u64)
+ 
++/* Project extension with the same fixed layout for native and compat ABIs. */
++#define UTS_NS_IDENTITY_VERSION	1
++#define UTS_NS_IDENTITY_SEALED	(1U << 0)
++
++struct uts_ns_identity {
++	__u32 abi_version;
++	__u32 flags;
++	char release[__NEW_UTS_LEN + 1];
++	char version[__NEW_UTS_LEN + 1];
++	__u8 reserved[6];
++};
++
++#define NS_UTS_GET_IDENTITY	_IOR(NSIO, 0x80, struct uts_ns_identity)
++#define NS_UTS_SET_IDENTITY	_IOW(NSIO, 0x81, struct uts_ns_identity)
++
+ enum init_ns_ino {
+ 	IPC_NS_INIT_INO		= 0xEFFFFFFFU,
+ 	UTS_NS_INIT_INO		= 0xEFFFFFFEU,
+diff --git a/init/Kconfig b/init/Kconfig
+index 6ce315af4..20d082d0a 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1364,6 +1364,16 @@ config UTS_NS
+ 	  In this namespace tasks see different info provided with the
+ 	  uname() system call
+ 
++config UTS_NS_IDENTITY
++	bool "Host-managed UTS kernel identity"
++	depends on UTS_NS && PID_NS
++	help
++	  Allow an administrator in the initial user and PID namespaces to
++	  configure and seal the kernel release and version of a noninitial
++	  UTS namespace through its namespace file descriptor. Descendants
++	  inherit the identity, including restrictions on namespace switching.
++	  Unconfigured namespaces retain the normal kernel identity.
++
+ config TIME_NS
+ 	bool "TIME namespace"
+ 	depends on GENERIC_GETTIMEOFDAY
+diff --git a/kernel/sys.c b/kernel/sys.c
+index c8376d7a0..fc88230dc 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -1329,10 +1329,48 @@ static int override_release(char __user *release, size_t len)
+ 	if (current->personality & UNAME26) {
+ 		const char *rest = UTS_RELEASE;
+ 		char buf[65] = { 0 };
++		char identity_release[__NEW_UTS_LEN + 1];
+ 		int ndots = 0;
+ 		unsigned v;
+ 		size_t copy;
+ 
++		v = LINUX_VERSION_PATCHLEVEL + 60;
++		if (IS_ENABLED(CONFIG_UTS_NS_IDENTITY)) {
++			char *minor, *end;
++			unsigned int patchlevel;
++			bool configured;
++
++			down_read(&uts_sem);
++			configured = utsname_has_identity();
++			if (configured)
++				memcpy(identity_release, utsname()->release,
++				       sizeof(identity_release));
++			up_read(&uts_sem);
++
++			if (configured) {
++				/* Never use the build identity for a configured namespace. */
++				minor = strchr(identity_release, '.');
++				if (!minor)
++					return 0;
++				minor++;
++				end = minor;
++				while (isdigit(*end))
++					end++;
++				if (end == minor)
++					return 0;
++				copy = end - minor;
++				memcpy(buf, minor, copy);
++				if (kstrtouint(buf, 10, &patchlevel) ||
++				    patchlevel > UINT_MAX - 60)
++					return 0;
++				v = patchlevel + 60;
++				if (identity_release[0] == '3' &&
++				    identity_release[1] == '.')
++					v = patchlevel + 40;
++				rest = identity_release;
++			}
++		}
++
+ 		while (*rest) {
+ 			if (*rest == '.' && ++ndots >= 3)
+ 				break;
+@@ -1340,7 +1378,6 @@ static int override_release(char __user *release, size_t len)
+ 				break;
+ 			rest++;
+ 		}
+-		v = LINUX_VERSION_PATCHLEVEL + 60;
+ 		copy = clamp_t(size_t, len, 1, sizeof(buf));
+ 		copy = scnprintf(buf, copy, "2.6.%u%s", v, rest);
+ 		ret = copy_to_user(release, buf, copy + 1);
+diff --git a/kernel/utsname.c b/kernel/utsname.c
+index ebbfc578a..9638a908c 100644
+--- a/kernel/utsname.c
++++ b/kernel/utsname.c
+@@ -15,6 +15,11 @@
+ #include <linux/proc_ns.h>
+ #include <linux/nstree.h>
+ #include <linux/sched/task.h>
++#ifdef CONFIG_UTS_NS_IDENTITY
++#include <linux/nsfs.h>
++#include <linux/pid_namespace.h>
++#include <linux/uaccess.h>
++#endif
+ 
+ static struct kmem_cache *uts_ns_cache __ro_after_init;
+ 
+@@ -57,6 +62,9 @@ static struct uts_namespace *clone_uts_ns(struct user_namespace *user_ns,
+ 	ns->ucounts = ucounts;
+ 	down_read(&uts_sem);
+ 	memcpy(&ns->name, &old_ns->name, sizeof(ns->name));
++#ifdef CONFIG_UTS_NS_IDENTITY
++	ns->identity_id = old_ns->identity_id;
++#endif
+ 	ns->user_ns = get_user_ns(user_ns);
+ 	up_read(&uts_sem);
+ 	ns_tree_add(ns);
+@@ -124,6 +132,90 @@ static void utsns_put(struct ns_common *ns)
+ 	put_uts_ns(to_uts_ns(ns));
+ }
+ 
++#ifdef CONFIG_UTS_NS_IDENTITY
++static bool uts_identity_admin(void)
++{
++	return current_user_ns() == &init_user_ns &&
++		task_active_pid_ns(current) == &init_pid_ns &&
++		capable(CAP_SYS_ADMIN);
++}
++
++/* Possession of a namespace FD does not allow leaving an identity family. */
++static bool uts_identity_accessible(struct uts_namespace *ns)
++{
++	u64 current_id = current->nsproxy->uts_ns->identity_id;
++
++	return current_id == ns->identity_id;
++}
++
++static bool uts_identity_string_valid(const char *str, bool release)
++{
++	size_t len = strnlen(str, __NEW_UTS_LEN + 1);
++	size_t i;
++
++	if (!len || len > __NEW_UTS_LEN)
++		return false;
++
++	for (i = 0; i < len; i++) {
++		if (str[i] < (release ? '!' : ' ') || str[i] > '~')
++			return false;
++	}
++
++	return true;
++}
++
++long uts_identity_ioctl(struct uts_namespace *ns, unsigned int cmd,
++			unsigned long arg)
++{
++	struct uts_ns_identity identity = {};
++	void __user *argp = (void __user *)arg;
++	bool admin = uts_identity_admin();
++	int ret = 0;
++
++	if (cmd == NS_UTS_GET_IDENTITY) {
++		down_read(&uts_sem);
++		if (!admin && !uts_identity_accessible(ns)) {
++			up_read(&uts_sem);
++			return -EPERM;
++		}
++
++		identity.abi_version = UTS_NS_IDENTITY_VERSION;
++		identity.flags = ns->identity_id ? UTS_NS_IDENTITY_SEALED : 0;
++		strscpy(identity.release, ns->name.release);
++		strscpy(identity.version, ns->name.version);
++		up_read(&uts_sem);
++
++		return copy_to_user(argp, &identity, sizeof(identity)) ? -EFAULT : 0;
++	}
++
++	if (!admin || ns == &init_uts_ns)
++		return -EPERM;
++
++	if (copy_from_user(&identity, argp, sizeof(identity)))
++		return -EFAULT;
++
++	if (identity.abi_version != UTS_NS_IDENTITY_VERSION || identity.flags ||
++	    memchr_inv(identity.reserved, 0, sizeof(identity.reserved)) ||
++	    !uts_identity_string_valid(identity.release, true) ||
++	    !uts_identity_string_valid(identity.version, false))
++		return -EINVAL;
++
++	down_write(&uts_sem);
++	if (ns->identity_id) {
++		ret = -EBUSY;
++	} else {
++		/* uname copies full arrays, so clear any old host identity bytes. */
++		strscpy_pad(ns->name.release, identity.release);
++		strscpy_pad(ns->name.version, identity.version);
++		/* Descendants retain this boot-unique identity family ID. */
++		ns->identity_id = ns->ns.ns_id;
++	}
++	up_write(&uts_sem);
++
++	return ret;
++}
++#endif
++
+ static int utsns_install(struct nsset *nsset, struct ns_common *new)
+ {
+ 	struct nsproxy *nsproxy = nsset->nsproxy;
+@@ -133,6 +225,18 @@ static int utsns_install(struct nsset *nsset, struct ns_common *new)
+ 	    !ns_capable(nsset->cred->user_ns, CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
++#ifdef CONFIG_UTS_NS_IDENTITY
++	if (!uts_identity_admin()) {
++		bool accessible;
++
++		down_read(&uts_sem);
++		accessible = uts_identity_accessible(ns);
++		up_read(&uts_sem);
++		if (!accessible)
++			return -EPERM;
++	}
++#endif
++
+ 	get_uts_ns(ns);
+ 	put_uts_ns(nsproxy->uts_ns);
+ 	nsproxy->uts_ns = ns;
+diff --git a/tools/testing/selftests/filesystems/nsfs/Makefile b/tools/testing/selftests/filesystems/nsfs/Makefile
+index 231aaa7df..6c632bc2e 100644
+--- a/tools/testing/selftests/filesystems/nsfs/Makefile
++++ b/tools/testing/selftests/filesystems/nsfs/Makefile
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-TEST_GEN_PROGS := owner pidns iterate_mntns
++TEST_GEN_PROGS := owner pidns iterate_mntns uts_identity
+ 
+ CFLAGS := -Wall -Werror
+ 
+diff --git a/tools/testing/selftests/filesystems/nsfs/config b/tools/testing/selftests/filesystems/nsfs/config
+index 598d0a225..cf35353cd 100644
+--- a/tools/testing/selftests/filesystems/nsfs/config
++++ b/tools/testing/selftests/filesystems/nsfs/config
+@@ -1,3 +1,4 @@
+ CONFIG_USER_NS=y
+ CONFIG_UTS_NS=y
+ CONFIG_PID_NS=y
++CONFIG_UTS_NS_IDENTITY=y
+diff --git a/tools/testing/selftests/filesystems/nsfs/uts_identity.c b/tools/testing/selftests/filesystems/nsfs/uts_identity.c
+new file mode 100644
+index 000000000..b32d16ecc
+--- /dev/null
++++ b/tools/testing/selftests/filesystems/nsfs/uts_identity.c
+@@ -0,0 +1,283 @@
++// SPDX-License-Identifier: GPL-2.0
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/capability.h>
++#include <linux/nsfs.h>
++#include <sched.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/personality.h>
++#include <sys/syscall.h>
++#include <sys/utsname.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include "../../kselftest.h"
++
++static void require(int ok, const char *what)
++{
++	if (!ok)
++		ksft_exit_fail_msg("%s: %s\n", what, strerror(errno));
++}
++
++static int nsfd(const char *name)
++{
++	char path[64];
++	int fd;
++
++	snprintf(path, sizeof(path), "/proc/self/ns/%s", name);
++	fd = open(path, O_RDONLY);
++	require(fd >= 0, "open namespace");
++	return fd;
++}
++
++static void wait_ok(pid_t pid)
++{
++	int status;
++
++	require(waitpid(pid, &status, 0) == pid, "waitpid");
++	require(WIFEXITED(status) && !WEXITSTATUS(status), "child result");
++}
++
++static void text(const char *path, char *buf, size_t size)
++{
++	int fd = open(path, O_RDONLY);
++	ssize_t len;
++
++	require(fd >= 0, path);
++	len = read(fd, buf, size - 1);
++	require(len > 0, "read proc");
++	buf[len] = 0;
++	if (buf[len - 1] == '\n')
++		buf[len - 1] = 0;
++	close(fd);
++}
++
++static void check_tail(const char *str, size_t size)
++{
++	size_t len = strlen(str);
++
++	while (++len < size)
++		require(!str[len], "uname tail is cleared");
++}
++
++static void check_views(const struct uts_ns_identity *expected)
++{
++	struct utsname libc_name, raw;
++	char value[512], banner[256];
++	unsigned long saved;
++
++	require(!uname(&libc_name), "libc uname");
++	memset(&raw, 0xa5, sizeof(raw));
++	require(!syscall(SYS_uname, &raw), "raw uname");
++	require(!memcmp(&raw, &libc_name, sizeof(raw)), "libc and raw uname agree");
++	require(!strcmp(raw.release, expected->release), "release");
++	require(!strcmp(raw.version, expected->version), "version");
++	check_tail(raw.release, sizeof(raw.release));
++	check_tail(raw.version, sizeof(raw.version));
++	text("/proc/sys/kernel/osrelease", value, sizeof(value));
++	require(!strcmp(value, raw.release), "release sysctl");
++	text("/proc/sys/kernel/version", value, sizeof(value));
++	require(!strcmp(value, raw.version), "version sysctl");
++	errno = 0;
++	require(open("/proc/sys/kernel/osrelease", O_WRONLY) == -1 && errno == EACCES,
++		"release sysctl remains read-only");
++	text("/proc/sys/kernel/ostype", value, sizeof(value));
++	require(!strcmp(value, raw.sysname), "ostype sysctl");
++	text("/proc/version", value, sizeof(value));
++	snprintf(banner, sizeof(banner), "%s version %s %s", raw.sysname,
++		 raw.release, raw.version);
++	require(!strcmp(value, banner), "proc banner has no host build identity");
++
++	saved = personality(0xffffffffUL);
++	require(saved != (unsigned long)-1, "get personality");
++	require(personality(saved | UNAME26) != -1, "set UNAME26");
++	require(!syscall(SYS_uname, &raw), "raw UNAME26");
++	require(!strcmp(raw.release, "2.6.70-lupine"), "UNAME26 uses instance release");
++	require(personality(saved) != -1, "restore personality");
++}
++
++static void check_guest(int own, int sibling, int host,
++			const struct uts_ns_identity *expected, const char *compat)
++{
++	struct uts_ns_identity actual;
++	int descendant;
++	pid_t pid;
++
++	require(!setns(own, CLONE_NEWUTS), "enter instance before new PID namespace");
++	require(!unshare(CLONE_NEWPID), "new PID namespace");
++	pid = fork();
++	require(pid >= 0, "fork guest");
++	if (pid) {
++		wait_ok(pid);
++		return;
++	}
++
++	check_views(expected);
++	require(!ioctl(own, NS_UTS_GET_IDENTITY, &actual), "get identity");
++	require(actual.flags == UTS_NS_IDENTITY_SEALED, "sealed status");
++	require(ioctl(own, NS_UTS_SET_IDENTITY, expected) == -1 && errno == EPERM,
++		"guest root cannot configure identity");
++	require(ioctl(host, NS_UTS_GET_IDENTITY, &actual) == -1 && errno == EPERM,
++		"host FD cannot disclose host identity");
++	require(ioctl(sibling, NS_UTS_GET_IDENTITY, &actual) == -1 && errno == EPERM,
++		"sibling FD cannot disclose sibling identity");
++	require(setns(host, CLONE_NEWUTS) == -1 && errno == EPERM,
++		"host FD cannot escape identity");
++	require(setns(sibling, CLONE_NEWUTS) == -1 && errno == EPERM,
++		"identical strings do not allow switching identity families");
++	require(!unshare(CLONE_NEWUTS), "clone descendant UTS");
++	descendant = nsfd("uts");
++	require(!ioctl(descendant, NS_UTS_GET_IDENTITY, &actual), "get descendant");
++	require(actual.flags == UTS_NS_IDENTITY_SEALED, "descendant remains sealed");
++	check_views(expected);
++	require(!setns(own, CLONE_NEWUTS), "same family setns");
++	require(!setns(descendant, CLONE_NEWUTS), "descendant setns");
++	require(!sethostname("guest", 5), "standard hostname remains writable");
++
++	if (compat) {
++		pid = fork();
++		require(pid >= 0, "fork compat");
++		if (!pid) {
++			execl(compat, compat, NULL);
++			_exit(1);
++		}
++		wait_ok(pid);
++	}
++
++	/* A child user namespace cannot regain host management authority. */
++	require(!unshare(CLONE_NEWUSER), "new user namespace");
++	require(ioctl(own, NS_UTS_SET_IDENTITY, expected) == -1 && errno == EPERM,
++		"user namespace root cannot configure identity");
++	_exit(0);
++}
++
++int main(int argc, char **argv)
++{
++	struct uts_ns_identity identity = {
++		.abi_version = UTS_NS_IDENTITY_VERSION,
++		.release = "5.10.66-lupine",
++		.version = "#1 SMP PREEMPT",
++	}, actual, invalid;
++	struct utsname before, after;
++	char banner_before[512], banner_after[512];
++	int host, a, b, wrong;
++	pid_t pid;
++
++	ksft_print_header();
++	host = nsfd("uts");
++	if (ioctl(host, NS_UTS_GET_IDENTITY, &actual)) {
++		if (errno == ENOTTY)
++			ksft_exit_skip("UTS_NS_IDENTITY is unavailable\n");
++		ksft_exit_fail_msg("GET identity: %s\n", strerror(errno));
++	}
++	if (geteuid())
++		ksft_exit_skip("requires initial namespace root\n");
++	ksft_set_plan(5);
++	require(sizeof(identity) == 144, "fixed compat ABI size");
++	require(actual.abi_version == 1 && !actual.flags, "host unconfigured");
++	require(!uname(&before), "host uname");
++	text("/proc/version", banner_before, sizeof(banner_before));
++	require(ioctl(host, NS_UTS_SET_IDENTITY, &identity) == -1 && errno == EPERM,
++		"initial UTS is immutable");
++	wrong = nsfd("pid");
++	require(ioctl(wrong, NS_UTS_GET_IDENTITY, &actual) == -1 && errno == EINVAL,
++		"reject wrong namespace type");
++	close(wrong);
++	require(!unshare(CLONE_NEWUTS), "new UTS A");
++	a = nsfd("uts");
++	require(ioctl(a, NS_UTS_SET_IDENTITY, NULL) == -1 && errno == EFAULT,
++		"reject bad pointer");
++	invalid = identity;
++	invalid.abi_version++;
++	require(ioctl(a, NS_UTS_SET_IDENTITY, &invalid) == -1 && errno == EINVAL,
++		"reject ABI mismatch");
++	invalid = identity;
++	invalid.flags = UTS_NS_IDENTITY_SEALED;
++	require(ioctl(a, NS_UTS_SET_IDENTITY, &invalid) == -1 && errno == EINVAL,
++		"reject input flags");
++	invalid = identity;
++	invalid.reserved[0] = 1;
++	require(ioctl(a, NS_UTS_SET_IDENTITY, &invalid) == -1 && errno == EINVAL,
++		"reject reserved bytes");
++	invalid = identity;
++	memset(invalid.release, 'x', sizeof(invalid.release));
++	require(ioctl(a, NS_UTS_SET_IDENTITY, &invalid) == -1 && errno == EINVAL,
++		"reject unterminated release");
++	invalid = identity;
++	invalid.version[2] = '\n';
++	require(ioctl(a, NS_UTS_SET_IDENTITY, &invalid) == -1 && errno == EINVAL,
++		"reject injected banner line");
++	invalid = identity;
++	invalid.release[0] = 0;
++	require(ioctl(a, NS_UTS_SET_IDENTITY, &invalid) == -1 && errno == EINVAL,
++		"reject empty release");
++	require(!ioctl(a, NS_UTS_SET_IDENTITY, &identity), "seal UTS A");
++	require(ioctl(a, NS_UTS_SET_IDENTITY, &identity) == -1 && errno == EBUSY,
++		"reject reconfiguration");
++	ksft_test_result_pass("ABI validation and one-time sealing\n");
++
++	require(!setns(host, CLONE_NEWUTS), "host administrator can leave family");
++	require(!unshare(CLONE_NEWUTS), "new UTS B");
++	b = nsfd("uts");
++	require(!ioctl(b, NS_UTS_SET_IDENTITY, &identity), "seal UTS B");
++	require(!setns(host, CLONE_NEWUTS), "restore host UTS");
++	pid = fork();
++	require(pid >= 0, "fork instance A");
++	if (!pid) {
++		check_guest(a, b, host, &identity, argc > 1 ? argv[1] : NULL);
++		_exit(0);
++	}
++	wait_ok(pid);
++	ksft_test_result_pass("instance A views, inheritance and escape rejection\n");
++
++	pid = fork();
++	require(pid >= 0, "fork instance B");
++	if (!pid) {
++		check_guest(b, a, host, &identity, NULL);
++		_exit(0);
++	}
++	wait_ok(pid);
++	ksft_test_result_pass("sibling identity family isolation\n");
++
++	require(!uname(&after) && !memcmp(&before, &after, sizeof(before)),
++		"host uname unchanged");
++	text("/proc/version", banner_after, sizeof(banner_after));
++	require(!strcmp(banner_before, banner_after), "host banner unchanged");
++	ksft_test_result_pass("host identity unchanged\n");
++
++	pid = fork();
++	require(pid >= 0, "fork capability test");
++	if (!pid) {
++		struct __user_cap_header_struct header = {
++			.version = _LINUX_CAPABILITY_VERSION_3,
++		};
++		struct __user_cap_data_struct caps[2] = {};
++		pid_t child;
++
++		require(!unshare(CLONE_NEWPID), "new unconfigured guest PID namespace");
++		child = fork();
++		require(child >= 0, "fork unconfigured guest");
++		if (!child) {
++			require(ioctl(a, NS_UTS_GET_IDENTITY, &actual) == -1 && errno == EPERM,
++				"unconfigured guest cannot inspect a sealed family");
++			require(setns(a, CLONE_NEWUTS) == -1 && errno == EPERM,
++				"unconfigured guest cannot enter a sealed family");
++			_exit(0);
++		}
++		wait_ok(child);
++		require(!syscall(SYS_capset, &header, caps), "drop capabilities");
++		require(ioctl(a, NS_UTS_SET_IDENTITY, &identity) == -1 && errno == EPERM,
++			"initial namespace without capability cannot configure");
++		_exit(0);
++	}
++	wait_ok(pid);
++	ksft_test_result_pass("initial namespace capability requirement\n");
++	close(a);
++	close(b);
++	close(host);
++	ksft_exit_pass();
++}
+-- 
+2.47.3
+

@@ -1,0 +1,953 @@
+From 4eb21b9fe58cd8669eede92b3362eb33b59db361 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Sun, 1 Nov 2026 23:34:21 +0800
+Subject: [PATCH] sysfs: Add private instance CPU network and device trees
+
+---
+ fs/sysfs/Makefile      |   1 +
+ fs/sysfs/mount.c       |  35 +-
+ fs/sysfs/native.c      | 755 +++++++++++++++++++++++++++++++++++++++++
+ fs/sysfs/native.h      |  52 +++
+ kernel/cgroup/cpuset.c |   5 +
+ 5 files changed, 847 insertions(+), 1 deletion(-)
+ create mode 100644 fs/sysfs/native.c
+ create mode 100644 fs/sysfs/native.h
+
+diff --git a/fs/sysfs/Makefile b/fs/sysfs/Makefile
+index 0906b9e52..b2088e29c 100644
+--- a/fs/sysfs/Makefile
++++ b/fs/sysfs/Makefile
+@@ -4,3 +4,4 @@
+ #
+ 
+ obj-y		:= file.o dir.o symlink.o mount.o group.o
++obj-$(CONFIG_UTS_NS_VIEWS) += native.o
+diff --git a/fs/sysfs/mount.c b/fs/sysfs/mount.c
+index 98467bb76..91b1dc1cf 100644
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@ -16,6 +16,8 @@
+ #include <linux/slab.h>
+ #include <linux/user_namespace.h>
+ #include <linux/fs_context.h>
++#include <linux/uts_views.h>
++#include <linux/uts_resources.h>
+ #include <net/net_namespace.h>
+ 
+ #include "sysfs.h"
+@@ -28,10 +30,19 @@ static int sysfs_get_tree(struct fs_context *fc)
+ 	struct kernfs_fs_context *kfc = fc->fs_private;
+ 	int ret;
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++	struct uts_resource_view *view = uts_sysfs_resources(kfc->root);
++
++	/* A failed new superblock also runs sysfs_kill_sb(). */
++	uts_resources_get(view);
++#endif
+ 	ret = kernfs_get_tree(fc);
++#ifdef CONFIG_UTS_NS_VIEWS
++	if (!kfc->new_sb_created)
++		uts_resources_release(view);
++#endif
+ 	if (ret)
+ 		return ret;
+-
+ 	if (kfc->new_sb_created)
+ 		fc->root->d_sb->s_iflags |= SB_I_USERNS_VISIBLE;
+ 	return 0;
+@@ -43,6 +54,9 @@ static void sysfs_fs_context_free(struct fs_context *fc)
+ 
+ 	if (kfc->ns_tag)
+ 		kobj_ns_drop(KOBJ_NS_TYPE_NET, kfc->ns_tag);
++#ifdef CONFIG_UTS_NS_VIEWS
++	uts_resources_release(uts_sysfs_resources(kfc->root));
++#endif
+ 	kernfs_free_fs_context(fc);
+ 	kfree(kfc);
+ }
+@@ -68,6 +82,19 @@ static int sysfs_init_fs_context(struct fs_context *fc)
+ 
+ 	kfc->ns_tag = netns = kobj_ns_grab_current(KOBJ_NS_TYPE_NET);
+ 	kfc->root = sysfs_root;
++#ifdef CONFIG_UTS_NS_VIEWS
++	{
++		struct kernfs_root *root = uts_sysfs_get_root(netns);
++
++		if (IS_ERR(root)) {
++			kobj_ns_drop(KOBJ_NS_TYPE_NET, kfc->ns_tag);
++			kfree(kfc);
++			return PTR_ERR(root);
++		}
++		if (root)
++			kfc->root = root;
++	}
++#endif
+ 	kfc->magic = SYSFS_MAGIC;
+ 	fc->fs_private = kfc;
+ 	fc->ops = &sysfs_fs_context_ops;
+@@ -82,9 +109,15 @@ static int sysfs_init_fs_context(struct fs_context *fc)
+ static void sysfs_kill_sb(struct super_block *sb)
+ {
+ 	void *ns = (void *)kernfs_super_ns(sb);
++#ifdef CONFIG_UTS_NS_VIEWS
++	struct uts_resource_view *view = uts_sysfs_resources(kernfs_root_from_sb(sb));
++#endif
+ 
+ 	kernfs_kill_sb(sb);
+ 	kobj_ns_drop(KOBJ_NS_TYPE_NET, ns);
++#ifdef CONFIG_UTS_NS_VIEWS
++	uts_resources_release(view);
++#endif
+ }
+ 
+ static struct file_system_type sysfs_fs_type = {
+diff --git a/fs/sysfs/native.c b/fs/sysfs/native.c
+new file mode 100644
+index 000000000..5584a4ad9
+--- /dev/null
++++ b/fs/sysfs/native.c
+@@ -0,0 +1,755 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/cpuset.h>
++#include <linux/device.h>
++#include <linux/pci.h>
++#include <linux/etherdevice.h>
++#include <linux/fs.h>
++#include <linux/sched/signal.h>
++#include <linux/init.h>
++#include <linux/kernfs.h>
++#include <linux/netdevice.h>
++#include <linux/rtnetlink.h>
++#include <linux/slab.h>
++#include <linux/utsname.h>
++#include <linux/uts_resources.h>
++#include <net/net_namespace.h>
++#include <media/v4l2-dev.h>
++#include "native.h"
++#include "sysfs.h"
++
++static LIST_HEAD(uts_sysfs_roots);
++static DEFINE_MUTEX(uts_sysfs_lock);
++
++static const char *const cpu_files[] = { "online", "possible", "present",
++					 "offline", "kernel_max" };
++static const char *const net_files[] = {
++	"address", "addr_len", "ifindex",   "iflink",  "mtu",
++	"flags",   "type",     "operstate", "carrier", "uevent",
++};
++static const char *const stats_files[] = { "rx_bytes",	 "tx_bytes",
++					   "rx_packets", "tx_packets",
++					   "rx_errors",	 "tx_errors",
++					   "rx_dropped", "tx_dropped" };
++
++static ssize_t device_show(struct uts_sysfs_node *node, const char *name,
++			   char *buf);
++static int create_devices(struct uts_sysfs *tree);
++
++static void node_release(struct kobject *kobj)
++{
++	kfree(container_of(kobj, struct uts_sysfs_node, kobj));
++}
++
++static const void *node_namespace(const struct kobject *kobj)
++{
++	struct uts_sysfs_node *node =
++		container_of(kobj, struct uts_sysfs_node, kobj);
++
++	return node->net;
++}
++
++static const struct kobj_ns_type_operations *
++node_child_namespace(const struct kobject *kobj)
++{
++	struct uts_sysfs_node *node =
++		container_of(kobj, struct uts_sysfs_node, kobj);
++
++	return node->net_children ? &net_ns_type_operations : NULL;
++}
++
++struct uts_sysfs_attribute {
++	struct attribute attr;
++	struct list_head list;
++};
++
++static ssize_t net_show(struct uts_sysfs_node *node, const char *name,
++			char *buf)
++{
++	struct net_device *dev = node->netdev;
++	ssize_t result = -EINVAL;
++
++	if (!dev)
++		return -EINVAL;
++	if (node->kind == UV_NET_STATS) {
++		struct rtnl_link_stats64 storage, *stats;
++		u64 value;
++
++		stats = dev_get_stats(dev, &storage);
++		if (!strcmp(name, "rx_bytes"))
++			value = stats->rx_bytes;
++		else if (!strcmp(name, "tx_bytes"))
++			value = stats->tx_bytes;
++		else if (!strcmp(name, "rx_packets"))
++			value = stats->rx_packets;
++		else if (!strcmp(name, "tx_packets"))
++			value = stats->tx_packets;
++		else if (!strcmp(name, "rx_errors"))
++			value = stats->rx_errors;
++		else if (!strcmp(name, "tx_errors"))
++			value = stats->tx_errors;
++		else if (!strcmp(name, "rx_dropped"))
++			value = stats->rx_dropped;
++		else
++			value = stats->tx_dropped;
++		return sysfs_emit(buf, "%llu\n", value);
++	}
++	if (!strcmp(name, "uevent"))
++		return sysfs_emit(buf, "INTERFACE=%s\nIFINDEX=%d\n", dev->name,
++				  dev->ifindex);
++	if (!strcmp(name, "address"))
++		return sysfs_emit(buf, "%*phC\n", dev->addr_len, dev->dev_addr);
++	if (!strcmp(name, "addr_len"))
++		return sysfs_emit(buf, "%u\n", dev->addr_len);
++	if (!strcmp(name, "ifindex"))
++		return sysfs_emit(buf, "%d\n", dev->ifindex);
++	if (!strcmp(name, "iflink"))
++		return sysfs_emit(buf, "%d\n", dev_get_iflink(dev));
++	if (!strcmp(name, "mtu"))
++		return sysfs_emit(buf, "%u\n", READ_ONCE(dev->mtu));
++	if (!strcmp(name, "flags"))
++		return sysfs_emit(buf, "0x%x\n", netif_get_flags(dev));
++	if (!strcmp(name, "type"))
++		return sysfs_emit(buf, "%u\n", dev->type);
++	if (!strcmp(name, "carrier"))
++		return sysfs_emit(buf, "%u\n", netif_carrier_ok(dev));
++	if (!strcmp(name, "operstate")) {
++		static const char *const states[] = {
++			"unknown", "notpresent", "down", "lowerlayerdown",
++			"testing", "dormant",	 "up"
++		};
++		unsigned int state = READ_ONCE(dev->operstate);
++
++		return sysfs_emit(buf, "%s\n",
++				  state < ARRAY_SIZE(states) ? states[state] :
++								     "unknown");
++	}
++	return result;
++}
++
++/* Attribute storage is freed after kernfs has drained active callbacks. */
++static ssize_t node_show(struct kobject *kobj, struct attribute *attr,
++			 char *buf)
++{
++	struct uts_sysfs_node *node =
++		container_of(kobj, struct uts_sysfs_node, kobj);
++	struct uts_resource_view *view = node->native->resources;
++	const char *name = attr->name;
++	cpumask_var_t cpus;
++	ssize_t result = -EINVAL;
++
++	if (!uts_resources_live(view))
++		return -ENODEV;
++	if (node->kind == UV_DEVICE || node->kind == UV_GPU)
++		return device_show(node, name, buf);
++	if (node->kind == UV_CPU_LIST) {
++		if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
++			return -ENOMEM;
++		cpuset_cgroup_cpus(uts_resources_cgroup(view), cpus);
++		if (!strcmp(name, "kernel_max"))
++			result = sysfs_emit(buf, "%u\n", cpumask_last(cpus));
++		else if (!strcmp(name, "offline"))
++			result = sysfs_emit(buf, "\n");
++		else
++			result = sysfs_emit(buf, "%*pbl\n",
++					    cpumask_pr_args(cpus));
++		free_cpumask_var(cpus);
++		return result;
++	}
++	if (node->kind == UV_CPU)
++		return sysfs_emit(buf, "%d\n",
++				  uts_resources_cpu_visible_in(view,
++							       node->cpu) > 0);
++	if (!rtnl_trylock())
++		return restart_syscall();
++	result = net_show(node, name, buf);
++	rtnl_unlock();
++	return result;
++}
++
++static ssize_t node_store(struct kobject *kobj, struct attribute *attr,
++			  const char *buf, size_t count)
++{
++	struct uts_sysfs_node *node =
++		container_of(kobj, struct uts_sysfs_node, kobj);
++	const struct uts_event_info *info =
++		uts_resources_event_info(node->native->resources);
++	const struct uts_event_device *device = NULL;
++	int ret;
++
++	if (strcmp(attr->name, "uevent"))
++		return -EACCES;
++	if (node->kind == UV_DEVICE)
++		device = &info->devices[node->device_index];
++	else if (node->kind != UV_NET)
++		return -EACCES;
++	ret = uts_views_emit_event(node->native->resources,
++				   current->nsproxy->net_ns, device,
++				   node->netdev, buf, count);
++	return ret ? ret : count;
++}
++
++static const struct sysfs_ops native_ops = { .show = node_show,
++					     .store = node_store };
++static const struct kobj_type native_type = {
++	.release = node_release,
++	.sysfs_ops = &native_ops,
++	.namespace = node_namespace,
++	.child_ns_type = node_child_namespace,
++};
++
++/* Keep dynamic attribute pointers with their node, until its files are removed. */
++struct node_attributes {
++	struct uts_sysfs_node node;
++	struct list_head attributes;
++};
++
++struct uts_sysfs_node *uts_sysfs_node(struct uts_sysfs *tree,
++				      struct uts_sysfs_node *parent,
++				      const char *name,
++				      enum uts_sysfs_kind kind,
++				      struct net_device *dev)
++{
++	struct node_attributes *storage;
++	struct uts_sysfs_node *node;
++	int ret;
++
++	storage = kzalloc(sizeof(*storage), GFP_KERNEL);
++	if (!storage)
++		return ERR_PTR(-ENOMEM);
++	INIT_LIST_HEAD(&storage->attributes);
++	node = &storage->node;
++	node->native = tree->native;
++	node->kind = kind;
++	node->netdev = dev;
++	node->net = dev ? dev_net(dev) : NULL;
++	kobject_init(&node->kobj, &native_type);
++	ret = kobject_add(&node->kobj, &parent->kobj, "%s", name);
++	if (ret) {
++		kobject_put(&node->kobj);
++		return ERR_PTR(ret);
++	}
++	list_add_tail(&node->list, &tree->nodes);
++	return node;
++}
++
++int uts_sysfs_files(struct uts_sysfs_node *node, const char *const *names,
++		    size_t count)
++{
++	struct node_attributes *storage =
++		container_of(node, struct node_attributes, node);
++	struct uts_sysfs_attribute *attr;
++	size_t i;
++	int ret;
++
++	for (i = 0; i < count; i++) {
++		attr = kzalloc(sizeof(*attr), GFP_KERNEL);
++		if (!attr)
++			return -ENOMEM;
++		sysfs_attr_init(&attr->attr);
++		attr->attr.name = names[i];
++		attr->attr.mode = !strcmp(names[i], "uevent") &&
++						  node->kind != UV_GPU ?
++						0644 :
++						0444;
++		ret = sysfs_create_file(&node->kobj, &attr->attr);
++		if (ret) {
++			kfree(attr);
++			return ret;
++		}
++		list_add_tail(&attr->list, &storage->attributes);
++	}
++	return 0;
++}
++
++static void remove_node(struct uts_sysfs_node *node)
++{
++	struct node_attributes *storage =
++		container_of(node, struct node_attributes, node);
++	struct uts_sysfs_attribute *attr, *next;
++
++	list_del(&node->list);
++	kobject_del(&node->kobj);
++	list_for_each_entry_safe(attr, next, &storage->attributes, list) {
++		list_del(&attr->list);
++		kfree(attr);
++	}
++	kobject_put(&node->kobj);
++}
++
++static int sync_cpus(struct uts_sysfs *tree)
++{
++	struct uts_sysfs_node *node, *next;
++	cpumask_var_t cpus, existing;
++	char name[32];
++	int cpu, ret = 0;
++
++	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
++		return -ENOMEM;
++	if (!zalloc_cpumask_var(&existing, GFP_KERNEL)) {
++		free_cpumask_var(cpus);
++		return -ENOMEM;
++	}
++	cpuset_cgroup_cpus(uts_resources_cgroup(tree->native->resources), cpus);
++	list_for_each_entry_safe_reverse(node, next, &tree->nodes, list) {
++		if (node->kind != UV_CPU)
++			continue;
++		if (!cpumask_test_cpu(node->cpu, cpus))
++			remove_node(node);
++		else
++			cpumask_set_cpu(node->cpu, existing);
++	}
++	for_each_cpu(cpu, cpus) {
++		if (cpumask_test_cpu(cpu, existing))
++			continue;
++		snprintf(name, sizeof(name), "cpu%d", cpu);
++		node = uts_sysfs_node(tree, tree->cpus, name, UV_CPU, NULL);
++		if (IS_ERR(node)) {
++			ret = PTR_ERR(node);
++			break;
++		}
++		node->cpu = cpu;
++		ret = uts_sysfs_files(node, cpu_files, 1);
++		if (ret)
++			break;
++	}
++	free_cpumask_var(cpus);
++	free_cpumask_var(existing);
++	return ret;
++}
++
++void uts_sysfs_refresh_cpus(void)
++{
++	struct uts_sysfs *tree;
++
++	mutex_lock(&uts_sysfs_lock);
++	list_for_each_entry(tree, &uts_sysfs_roots, global)
++		if (sync_cpus(tree))
++			WRITE_ONCE(tree->native->dead, true);
++	mutex_unlock(&uts_sysfs_lock);
++}
++
++static int add_net(struct uts_sysfs *tree, struct net_device *dev)
++{
++	struct uts_sysfs_node *node, *stats;
++	int ret;
++
++	node = uts_sysfs_node(tree, tree->net, dev->name, UV_NET, dev);
++	if (IS_ERR(node))
++		return PTR_ERR(node);
++	ret = uts_sysfs_files(node, net_files, ARRAY_SIZE(net_files));
++	if (ret)
++		return ret;
++	ret = sysfs_create_link(&tree->class_net->kobj, &node->kobj, dev->name);
++	if (ret)
++		return ret;
++	ret = sysfs_create_link(&node->kobj, &tree->class_net->kobj,
++				"subsystem");
++	if (ret)
++		return ret;
++	stats = uts_sysfs_node(tree, node, "statistics", UV_NET_STATS, dev);
++	return IS_ERR(stats) ? PTR_ERR(stats) :
++				     uts_sysfs_files(stats, stats_files,
++					       ARRAY_SIZE(stats_files));
++}
++
++static void remove_net(struct uts_sysfs *tree, struct net_device *dev)
++{
++	struct uts_sysfs_node *node, *next;
++
++	list_for_each_entry_safe_reverse(node, next, &tree->nodes, list) {
++		if (node->netdev != dev)
++			continue;
++		if (node->kind == UV_NET)
++			sysfs_delete_link(&tree->class_net->kobj, &node->kobj,
++					  kobject_name(&node->kobj));
++		remove_node(node);
++	}
++}
++
++static int net_notify(struct notifier_block *nb, unsigned long event, void *ptr)
++{
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++	struct uts_resource_view *view;
++	struct uts_native_view *native;
++	int ret = 0;
++
++	if (event != NETDEV_REGISTER && event != NETDEV_UNREGISTER &&
++	    event != NETDEV_CHANGENAME)
++		return NOTIFY_DONE;
++	view = uts_uevent_resources(dev_net(dev));
++	native = uts_resources_native(view);
++	if (native) {
++		mutex_lock(&uts_sysfs_lock);
++		if (event != NETDEV_REGISTER)
++			remove_net(native->sysfs_data, dev);
++		if (event != NETDEV_UNREGISTER)
++			ret = add_net(native->sysfs_data, dev);
++		if (ret)
++			WRITE_ONCE(native->dead, true);
++		mutex_unlock(&uts_sysfs_lock);
++	}
++	uts_resources_release(view);
++	return notifier_from_errno(ret);
++}
++
++static struct notifier_block net_notifier = { .notifier_call = net_notify };
++
++void uts_sysfs_destroy(struct uts_native_view *native)
++{
++	struct uts_sysfs *tree;
++	struct uts_sysfs_node *node;
++
++	if (!native || !native->sysfs_data)
++		return;
++	tree = native->sysfs_data;
++	mutex_lock(&uts_sysfs_lock);
++	list_del_init(&tree->global);
++	while (!list_empty(&tree->nodes)) {
++		node = list_last_entry(&tree->nodes, struct uts_sysfs_node,
++				       list);
++		remove_node(node);
++	}
++	tree->anchor->kobj.sd = NULL;
++	kernfs_destroy_root(native->sysfs);
++	kobject_put(&tree->anchor->kobj);
++	mutex_unlock(&uts_sysfs_lock);
++	kfree(tree);
++}
++
++int uts_sysfs_create(struct uts_native_view *native, struct net *net)
++{
++	struct uts_sysfs *tree;
++	struct node_attributes *anchor;
++	struct uts_sysfs_node *devices, *system, *fs, *dev, *node;
++	struct net_device *netdev;
++	int ret;
++
++	ASSERT_RTNL();
++	tree = kzalloc(sizeof(*tree), GFP_KERNEL);
++	anchor = kzalloc(sizeof(*anchor), GFP_KERNEL);
++	if (!tree || !anchor) {
++		kfree(tree);
++		kfree(anchor);
++		return -ENOMEM;
++	}
++	INIT_LIST_HEAD(&tree->nodes);
++	INIT_LIST_HEAD(&tree->global);
++	INIT_LIST_HEAD(&anchor->attributes);
++	tree->anchor = &anchor->node;
++	tree->native = native;
++	anchor->node.native = native;
++	kobject_init(&anchor->node.kobj, &native_type);
++	native->sysfs = kernfs_create_root(
++		NULL, KERNFS_ROOT_EXTRA_OPEN_PERM_CHECK, NULL);
++	if (IS_ERR(native->sysfs)) {
++		ret = PTR_ERR(native->sysfs);
++		kobject_put(&anchor->node.kobj);
++		kfree(tree);
++		return ret;
++	}
++	anchor->node.kobj.sd = kernfs_root_to_node(native->sysfs);
++	anchor->node.kobj.sd->priv = &anchor->node.kobj;
++	native->sysfs_data = tree;
++#define DIR(dst, parent, name)                                               \
++	do {                                                                 \
++		(dst) = uts_sysfs_node(tree, (parent), (name), UV_DIRECTORY, \
++				       NULL);                                \
++		if (IS_ERR(dst))                                             \
++			return PTR_ERR(dst);                                 \
++	} while (0)
++	DIR(devices, tree->anchor, "devices");
++	DIR(system, devices, "system");
++	DIR(tree->cpus, system, "cpu");
++	tree->cpus->kind = UV_CPU_LIST;
++	ret = uts_sysfs_files(tree->cpus, cpu_files, ARRAY_SIZE(cpu_files));
++	if (ret)
++		return ret;
++	DIR(tree->virtual, devices, "virtual");
++	DIR(tree->net, tree->virtual, "net");
++	tree->net->net_children = true;
++	sysfs_enable_ns(tree->net->kobj.sd);
++	DIR(tree->classes, tree->anchor, "class");
++	DIR(tree->class_net, tree->classes, "net");
++	tree->class_net->net_children = true;
++	sysfs_enable_ns(tree->class_net->kobj.sd);
++	DIR(fs, tree->anchor, "fs");
++	DIR(node, fs, "cgroup");
++	DIR(node, fs, "bpf");
++	DIR(node, fs, "selinux");
++	DIR(dev, tree->anchor, "dev");
++	DIR(tree->dev_char, dev, "char");
++#undef DIR
++	ret = sync_cpus(tree);
++	if (ret)
++		return ret;
++	for_each_netdev(net, netdev) {
++		ret = add_net(tree, netdev);
++		if (ret)
++			return ret;
++	}
++	ret = create_devices(tree);
++	if (ret)
++		return ret;
++	mutex_lock(&uts_sysfs_lock);
++	list_add_tail(&tree->global, &uts_sysfs_roots);
++	mutex_unlock(&uts_sysfs_lock);
++	return 0;
++}
++
++struct uts_resource_view *uts_sysfs_resources(struct kernfs_root *root)
++{
++	struct kernfs_node *kn = kernfs_root_to_node(root);
++	struct uts_sysfs_node *anchor;
++
++	if (!kn->priv)
++		return NULL;
++	anchor = container_of(kn->priv, struct uts_sysfs_node, kobj);
++	return anchor->native->resources;
++}
++
++struct kernfs_root *uts_sysfs_get_root(struct net *net)
++{
++	struct uts_resource_view *view =
++		uts_resources_acquire(current->nsproxy->uts_ns);
++	struct uts_native_view *native = uts_resources_native(view);
++	struct kernfs_root *root = NULL;
++
++	if (native) {
++		if (!uts_resources_live(view))
++			root = ERR_PTR(-ENODEV);
++		else if (!uts_uevent_matches(view, net))
++			root = ERR_PTR(-EPERM);
++		else
++			return native
++				->sysfs; /* The fs_context owns this reference. */
++	}
++	uts_resources_release(view);
++	return root;
++}
++
++static int __init uts_sysfs_init(void)
++{
++	return register_netdevice_notifier(&net_notifier);
++}
++subsys_initcall(uts_sysfs_init);
++
++static ssize_t device_show(struct uts_sysfs_node *node, const char *name,
++			   char *buf)
++{
++	const struct uts_event_info *info =
++		uts_resources_event_info(node->native->resources);
++	const struct uts_event_device *entry =
++		&info->devices[node->device_index];
++	static const char *const pci_names[] = { "revision", "vendor", "device",
++						 "subsystem_vendor",
++						 "subsystem_device" };
++	unsigned int i;
++
++	if (node->kind == UV_GPU) {
++		if (!strcmp(name, "uevent")) {
++			if (!strcmp(node->bus, "pci"))
++				return sysfs_emit(
++					buf,
++					"PCI_SLOT_NAME=%s\nMODALIAS=pci:v%08Xd%08Xsv%08Xsd%08X\n",
++					kobject_name(&node->kobj), node->pci[1],
++					node->pci[2], node->pci[3],
++					node->pci[4]);
++			return sysfs_emit(buf, "MODALIAS=%s:lupine-%s\n",
++					  node->bus, kobject_name(&node->kobj));
++		}
++		for (i = 0; i < ARRAY_SIZE(pci_names); i++)
++			if (!strcmp(name, pci_names[i]))
++				return sysfs_emit(buf, "0x%x\n", node->pci[i]);
++		return -EINVAL;
++	}
++	if (!strcmp(name, "dev"))
++		return sysfs_emit(buf, "%u:%u\n", entry->major, entry->minor);
++	if (!strcmp(name, "uevent"))
++		return sysfs_emit(buf, "MAJOR=%u\nMINOR=%u\nDEVNAME=%s%s\n",
++				  entry->major, entry->minor,
++				  entry->class == UTS_EVENT_DRM ? "dri/" : "",
++				  entry->name);
++	if (!strcmp(name, "name") && entry->class == UTS_EVENT_VIDEO) {
++#if IS_ENABLED(CONFIG_VIDEO_DEV)
++		return sysfs_emit(buf, "%s\n",
++				  to_video_device(node->device)->name);
++#else
++		return -EOPNOTSUPP;
++#endif
++	}
++	return -EINVAL;
++}
++
++static struct uts_sysfs_node *directory(struct uts_sysfs *tree,
++					struct uts_sysfs_node *parent,
++					const char *name)
++{
++	struct uts_sysfs_node *node;
++
++	list_for_each_entry(node, &tree->nodes, list)
++		if (node->kobj.parent == &parent->kobj &&
++		    !strcmp(kobject_name(&node->kobj), name))
++			return node;
++	return uts_sysfs_node(tree, parent, name, UV_DIRECTORY, NULL);
++}
++
++static int gpu_parent(struct uts_sysfs *tree, struct uts_sysfs_node *node,
++		      struct device *real)
++{
++	struct uts_sysfs_node *bus, *busdev, *parent, *drm, *candidate;
++	struct device *source = real->parent;
++	char name[32];
++	unsigned int number = 0;
++	const char *type;
++	int ret;
++
++	if (!source || !source->bus)
++		return -ENODEV;
++	if (!strcmp(source->bus->name, "virtio"))
++		source = source->parent;
++	if (!source || !source->bus)
++		return -ENODEV;
++	tree->native->gpu_parents[node->device_index] = get_device(source);
++	type = source->bus->name;
++	if (strcmp(type, "pci") && strcmp(type, "platform") &&
++	    strcmp(type, "host1x"))
++		return -EOPNOTSUPP;
++	list_for_each_entry(candidate, &tree->nodes, list) {
++		if (candidate->kind != UV_GPU)
++			continue;
++		if (candidate->device == source) {
++			parent = candidate;
++			goto link;
++		}
++		number++;
++	}
++	bus = directory(tree, tree->anchor, "bus");
++	if (IS_ERR(bus))
++		return PTR_ERR(bus);
++	bus = directory(tree, bus, type);
++	if (IS_ERR(bus))
++		return PTR_ERR(bus);
++	busdev = directory(tree, bus, "devices");
++	if (IS_ERR(busdev))
++		return PTR_ERR(busdev);
++	if (!strcmp(type, "pci"))
++		snprintf(name, sizeof(name), "0000:%02x:00.0", number);
++	else
++		snprintf(name, sizeof(name), "gpu%u", number);
++	parent = uts_sysfs_node(tree, tree->virtual, name, UV_GPU, NULL);
++	if (IS_ERR(parent))
++		return PTR_ERR(parent);
++	parent->bus = type;
++	parent->device = source;
++	parent->device_index = node->device_index;
++#ifdef CONFIG_PCI
++	if (dev_is_pci(source)) {
++		struct pci_dev *pci = to_pci_dev(source);
++		static const char *const fields[] = { "revision", "vendor",
++						      "device",
++						      "subsystem_vendor",
++						      "subsystem_device" };
++
++		parent->pci[0] = pci->revision;
++		parent->pci[1] = pci->vendor;
++		parent->pci[2] = pci->device;
++		parent->pci[3] = pci->subsystem_vendor;
++		parent->pci[4] = pci->subsystem_device;
++		ret = uts_sysfs_files(parent, fields, ARRAY_SIZE(fields));
++		if (ret)
++			return ret;
++	}
++#endif
++	{
++		static const char *const files[] = { "uevent" };
++
++		ret = uts_sysfs_files(parent, files, ARRAY_SIZE(files));
++		if (ret)
++			return ret;
++	}
++	ret = sysfs_create_link(&parent->kobj, &bus->kobj, "subsystem");
++	if (ret)
++		return ret;
++	ret = sysfs_create_link(&busdev->kobj, &parent->kobj, name);
++	if (ret)
++		return ret;
++link:
++	drm = directory(tree, parent, "drm");
++	if (IS_ERR(drm))
++		return PTR_ERR(drm);
++	ret = sysfs_create_link(&node->kobj, &parent->kobj, "device");
++	if (ret)
++		return ret;
++	return sysfs_create_link(&drm->kobj, &node->kobj,
++				 kobject_name(&node->kobj));
++}
++
++static int create_devices(struct uts_sysfs *tree)
++{
++	const struct uts_event_info *info =
++		uts_resources_event_info(tree->native->resources);
++	struct uts_sysfs_node *base, *class, *virtual, *node;
++	struct device *device;
++	unsigned int i;
++	char number[32];
++	int ret;
++	static const char *const files[] = { "dev", "uevent" };
++	static const char *const name[] = { "name" };
++
++	base = directory(tree, tree->virtual, "lupine");
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++	for (i = 0; i < info->count; i++) {
++		const struct uts_event_device *entry = &info->devices[i];
++		const char *kind =
++			entry->class == UTS_EVENT_DRM ? "drm" : "video4linux";
++
++		device = uts_device_get_by_devt(
++			MKDEV(entry->major, entry->minor));
++		if (!device)
++			return -ENODEV;
++		tree->native->devices[i] = device;
++		if (!device->class || strcmp(device->class->name, kind) ||
++		    strcmp(dev_name(device), entry->name))
++			return -EINVAL;
++		tree->native->parents[i] = get_device(device->parent);
++		class = directory(tree, tree->classes, kind);
++		if (IS_ERR(class))
++			return PTR_ERR(class);
++		virtual = directory(tree, base, kind);
++		if (IS_ERR(virtual))
++			return PTR_ERR(virtual);
++		node = uts_sysfs_node(tree, virtual, entry->name, UV_DEVICE,
++				      NULL);
++		if (IS_ERR(node))
++			return PTR_ERR(node);
++		node->device = device;
++		node->device_index = i;
++		ret = uts_sysfs_files(node, files, ARRAY_SIZE(files));
++		if (ret)
++			return ret;
++		if (entry->class == UTS_EVENT_VIDEO) {
++			ret = uts_sysfs_files(node, name, ARRAY_SIZE(name));
++			if (ret)
++				return ret;
++		}
++		ret = sysfs_create_link(&class->kobj, &node->kobj, entry->name);
++		if (ret)
++			return ret;
++		ret = sysfs_create_link(&node->kobj, &class->kobj, "subsystem");
++		if (ret)
++			return ret;
++		snprintf(number, sizeof(number), "%u:%u", entry->major,
++			 entry->minor);
++		ret = sysfs_create_link(&tree->dev_char->kobj, &node->kobj,
++					number);
++		if (ret)
++			return ret;
++		if (entry->class == UTS_EVENT_DRM) {
++			ret = gpu_parent(tree, node, device);
++			if (ret)
++				return ret;
++		}
++	}
++	return 0;
++}
+diff --git a/fs/sysfs/native.h b/fs/sysfs/native.h
+new file mode 100644
+index 000000000..a0a1e0ff2
+--- /dev/null
++++ b/fs/sysfs/native.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _SYSFS_NATIVE_H
++#define _SYSFS_NATIVE_H
++
++#include <linux/kobject.h>
++#include <linux/list.h>
++#include <linux/uts_views.h>
++
++struct device;
++struct net_device;
++
++enum uts_sysfs_kind {
++	UV_DIRECTORY,
++	UV_CPU_LIST,
++	UV_CPU,
++	UV_NET,
++	UV_NET_STATS,
++	UV_DEVICE,
++	UV_GPU,
++};
++
++struct uts_sysfs_node {
++	struct kobject kobj;
++	struct list_head list;
++	struct uts_native_view *native;
++	enum uts_sysfs_kind kind;
++	bool net_children;
++	unsigned int cpu;
++	struct net *net;
++	struct net_device *netdev;
++	struct device *device;
++	unsigned int device_index;
++	const char *bus;
++	u32 pci[5];
++};
++
++struct uts_sysfs {
++	struct list_head global;
++	struct list_head nodes;
++	struct uts_native_view *native;
++	struct uts_sysfs_node *anchor, *cpus, *net, *class_net;
++	struct uts_sysfs_node *classes, *dev_char, *virtual;
++};
++
++struct uts_sysfs_node *uts_sysfs_node(struct uts_sysfs *tree,
++				      struct uts_sysfs_node *parent,
++				      const char *name,
++				      enum uts_sysfs_kind kind,
++				      struct net_device *netdev);
++int uts_sysfs_files(struct uts_sysfs_node *node, const char *const *names,
++		    size_t count);
++#endif
+diff --git a/kernel/cgroup/cpuset.c b/kernel/cgroup/cpuset.c
+index 40eefcd38..444c31a9f 100644
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@ -22,6 +22,7 @@
+  *  distribution for more details.
+  */
+ #include "cpuset-internal.h"
++#include <linux/uts_views.h>
+ 
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+@@ -3444,6 +3445,9 @@ ssize_t cpuset_write_resmask(struct kernfs_open_file *of,
+ 	cpuset_full_unlock();
+ 	if (of_cft(of)->private == FILE_MEMLIST)
+ 		schedule_flush_migrate_mm();
++	if (retval >= 0)
++		uts_sysfs_refresh_cpus();
++
+ 	return retval ?: nbytes;
+ }
+ 
+@@ -4178,6 +4182,7 @@ static void cpuset_handle_hotplug(void)
+ 		rebuild_sched_domains_cpuslocked();
+ 
+ 	free_tmpmasks(ptmp);
++	uts_sysfs_refresh_cpus();
+ }
+ 
+ void cpuset_update_active_cpus(void)

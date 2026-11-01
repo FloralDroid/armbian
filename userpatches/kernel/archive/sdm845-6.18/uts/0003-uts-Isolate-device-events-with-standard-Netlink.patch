@@ -1,0 +1,685 @@
+From 0a57951cfbae43770a10e358c9e0873bcf9b496a Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Sat, 31 Oct 2026 00:27:47 +0800
+Subject: [PATCH] uts: Isolate device events with standard Netlink
+
+Bind the receiving netns and approved DRM/V4L2 nodes to the immutable
+instance resource domain. Project only authorized device and own-network
+events, remove physical parent metadata and use an instance sequence.
+Inherit ownership into child netns and restrict cross-domain setns.
+
+Keep AF_NETLINK, socketcall and io_uring entry points and credentials
+unchanged. No private userspace event transport is required. Host-only
+fixed-layout nsfs ioctls bind once and report the sealed event view.
+
+Kernel base: e8694cdbd7db99fa26f6e8c80a2a337e0de29a2f (6.18.53)
+---
+ fs/nsfs.c                     |  11 ++
+ include/linux/uts_resources.h |  22 +++
+ include/uapi/linux/nsfs.h     |  38 ++++
+ kernel/uts_resources.c        |  50 ++++-
+ lib/kobject_uevent.c          | 342 +++++++++++++++++++++++++++++++++-
+ net/core/net_namespace.c      |   4 +
+ 6 files changed, 453 insertions(+), 14 deletions(-)
+
+diff --git a/fs/nsfs.c b/fs/nsfs.c
+index 9f144e913..f56a89157 100644
+--- a/fs/nsfs.c
++++ b/fs/nsfs.c
+@@ -179,6 +179,10 @@ static bool nsfs_ioctl_valid(unsigned int cmd)
+ 	case NS_GET_PID_IN_PIDNS:
+ 	case NS_GET_TGID_IN_PIDNS:
+ 	case NS_GET_ID:
++#if defined(CONFIG_UTS_NS_RESOURCES) && defined(CONFIG_NET)
++	case NS_UTS_BIND_EVENTS:
++	case NS_UTS_GET_EVENTS:
++#endif
+ #ifdef CONFIG_UTS_NS_RESOURCES
+ 	case NS_UTS_BIND_RESOURCES:
+ 	case NS_UTS_GET_RESOURCE_BINDING:
+@@ -236,6 +240,13 @@ static long ns_ioctl(struct file *filp, unsigned int ioctl,
+ 
+ 	ns = get_proc_ns(file_inode(filp));
+ 	switch (ioctl) {
++#if defined(CONFIG_UTS_NS_RESOURCES) && defined(CONFIG_NET)
++	case NS_UTS_BIND_EVENTS:
++	case NS_UTS_GET_EVENTS:
++		if (ns->ns_type != CLONE_NEWUTS)
++			return -EINVAL;
++		return uts_uevent_ioctl(to_uts_ns(ns), ioctl, arg);
++#endif
+ #ifdef CONFIG_UTS_NS_RESOURCES
+ 	case NS_UTS_BIND_RESOURCES:
+ 	case NS_UTS_GET_RESOURCE_BINDING:
+diff --git a/include/linux/uts_resources.h b/include/linux/uts_resources.h
+index 3cf3f709f..af143c60d 100644
+--- a/include/linux/uts_resources.h
++++ b/include/linux/uts_resources.h
+@@ -8,6 +8,9 @@
+ struct uts_namespace;
+ struct seq_file;
+ struct sysinfo;
++struct net;
++struct uts_resource_view;
++struct uts_event_projection;
+ 
+ 
+ enum uts_resource_proc {
+@@ -26,8 +29,17 @@ int uts_resources_sysinfo(struct sysinfo *info);
+ int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which);
+ bool uts_resources_active(void);
+ int uts_resources_cpu_visible(unsigned int cpu);
++bool uts_resources_admin(void);
++struct uts_resource_view *uts_resources_acquire(struct uts_namespace *ns);
++void uts_resources_release(struct uts_resource_view *view);
++const struct uts_resource_info *uts_resources_binding(struct uts_resource_view *view);
++bool uts_resources_live(struct uts_resource_view *view);
++struct uts_event_projection *uts_resources_events(struct uts_resource_view *view);
++void uts_resources_publish_events(struct uts_resource_view *view, struct uts_event_projection *events);
+ void memory_resource_watermarks(u64 managed, u64 watermarks[3]);
+ #else
++static inline struct uts_resource_view *uts_resources_acquire(struct uts_namespace *ns) { return NULL; }
++static inline void uts_resources_release(struct uts_resource_view *view) {}
+ static inline void uts_resources_copy(struct uts_namespace *ns, struct uts_namespace *old) {}
+ static inline void uts_resources_put(struct uts_namespace *ns) {}
+ static inline bool uts_resources_may_enter(struct uts_namespace *old, struct uts_namespace *new)
+@@ -39,4 +51,14 @@ static inline int uts_resources_proc(struct seq_file *m, enum uts_resource_proc
+ static inline bool uts_resources_active(void) { return false; }
+ static inline int uts_resources_cpu_visible(unsigned int cpu) { return 1; }
+ #endif
++
++#if defined(CONFIG_UTS_NS_RESOURCES) && defined(CONFIG_NET)
++long uts_uevent_ioctl(struct uts_namespace *ns, unsigned int cmd, unsigned long arg);
++bool uts_uevent_may_enter(struct uts_namespace *uts, struct net *net);
++#else
++static inline bool uts_uevent_may_enter(struct uts_namespace *uts, struct net *net)
++{
++	return true;
++}
++#endif
+ #endif
+diff --git a/include/uapi/linux/nsfs.h b/include/uapi/linux/nsfs.h
+index 05d6dd043..c9ad4ad2a 100644
+--- a/include/uapi/linux/nsfs.h
++++ b/include/uapi/linux/nsfs.h
+@@ -136,6 +136,44 @@ struct uts_resource_memory {
+ 
+ #define NS_UTS_GET_RESOURCE_MEMORY _IOR(NSIO, 0x85, struct uts_resource_memory)
+ 
++/* Host-owned device events retain the standard KOBJECT_UEVENT transport. */
++#define UTS_EVENT_MAX_DEVICES 64
++#define UTS_EVENT_DRM 1
++#define UTS_EVENT_VIDEO 2
++#define UTS_EVENT_BOUND (1U << 0)
++#define UTS_EVENT_UID_CPUTIME (1U << 1)
++
++struct uts_event_device {
++	__u32 major;
++	__u32 minor;
++	__u32 class;
++	__u32 reserved;
++	char name[48];
++};
++
++struct uts_event_binding {
++	__u32 abi;
++	__u32 flags;
++	__s32 netns_fd;
++	__u32 count;
++	__u64 generation[2];
++	struct uts_event_device devices[UTS_EVENT_MAX_DEVICES];
++};
++
++struct uts_event_info {
++	__u32 abi;
++	__u32 flags;
++	__u64 netns_inode;
++	__u64 cgroup_id;
++	__u64 generation[2];
++	__u32 count;
++	__u32 reserved;
++	struct uts_event_device devices[UTS_EVENT_MAX_DEVICES];
++};
++
++#define NS_UTS_BIND_EVENTS _IOW(NSIO, 0x86, struct uts_event_binding)
++#define NS_UTS_GET_EVENTS _IOR(NSIO, 0x87, struct uts_event_info)
++
+ enum init_ns_ino {
+ 	IPC_NS_INIT_INO		= 0xEFFFFFFFU,
+ 	UTS_NS_INIT_INO		= 0xEFFFFFFEU,
+diff --git a/kernel/uts_resources.c b/kernel/uts_resources.c
+index 2a04b8a3a..180d54e51 100644
+--- a/kernel/uts_resources.c
++++ b/kernel/uts_resources.c
+@@ -28,6 +28,7 @@ struct uts_resource_view {
+ 	struct mutex lock;
+ 	struct cgroup *root;
+ 	struct uts_resource_info binding;
++	struct uts_event_projection *events;
+ 	u64 load_sample;
+ 	unsigned long loads[3];
+ 	unsigned long previous_active;
+@@ -39,7 +40,7 @@ static struct uts_resource_view *current_resource_view(void)
+ 	return smp_load_acquire(&current->nsproxy->uts_ns->resources);
+ }
+ 
+-static bool resource_admin(void)
++bool uts_resources_admin(void)
+ {
+ 	return current_user_ns() == &init_user_ns &&
+ 		task_active_pid_ns(current) == &init_pid_ns && capable(CAP_SYS_ADMIN);
+@@ -52,22 +53,59 @@ void uts_resources_copy(struct uts_namespace *ns, struct uts_namespace *old)
+ 		refcount_inc(&ns->resources->refs);
+ }
+ 
+-void uts_resources_put(struct uts_namespace *ns)
++struct uts_resource_view *uts_resources_acquire(struct uts_namespace *ns)
+ {
+-	struct uts_resource_view *view = ns->resources;
++	struct uts_resource_view *view;
++
++	down_read(&uts_sem);
++	view = ns->resources;
++	if (view)
++		refcount_inc(&view->refs);
++	up_read(&uts_sem);
++	return view;
++}
+ 
++void uts_resources_release(struct uts_resource_view *view)
++{
+ 	if (view && refcount_dec_and_test(&view->refs)) {
+ 		cgroup_put(view->root);
++		kfree(view->events);
+ 		kfree(view);
+ 	}
+ }
+ 
++void uts_resources_put(struct uts_namespace *ns)
++{
++	uts_resources_release(ns->resources);
++}
++
++const struct uts_resource_info *uts_resources_binding(struct uts_resource_view *view)
++{
++	return &view->binding;
++}
++
++bool uts_resources_live(struct uts_resource_view *view)
++{
++	return !css_is_dying(&view->root->self);
++}
++
++struct uts_event_projection *uts_resources_events(struct uts_resource_view *view)
++{
++	return smp_load_acquire(&view->events);
++}
++
++/* The uevent socket mutex serializes this one-time publication. */
++void uts_resources_publish_events(struct uts_resource_view *view, struct uts_event_projection *events)
++{
++	smp_store_release(&view->events, events);
++}
++
+ bool uts_resources_may_enter(struct uts_namespace *old, struct uts_namespace *new)
+ {
+ 	bool allowed;
+ 
+ 	down_read(&uts_sem);
+-	allowed = old->resources == new->resources || resource_admin();
++	allowed = old->resources == new->resources || uts_resources_admin();
+ 	up_read(&uts_sem);
+ 	return allowed;
+ }
+@@ -314,7 +352,7 @@ long uts_resources_ioctl(struct uts_namespace *ns, unsigned int cmd, unsigned lo
+ 	long ret;
+ 
+ 	if (cmd == NS_UTS_BIND_RESOURCES) {
+-		if (!resource_admin() || ns == &init_uts_ns)
++		if (!uts_resources_admin() || ns == &init_uts_ns)
+ 			return -EPERM;
+ 		if (copy_from_user(&binding, argp, sizeof(binding)))
+ 			return -EFAULT;
+@@ -357,7 +395,7 @@ long uts_resources_ioctl(struct uts_namespace *ns, unsigned int cmd, unsigned lo
+ 	}
+ 	down_read(&uts_sem);
+ 	view = ns->resources;
+-	if (!resource_admin() && current->nsproxy->uts_ns->resources != view) {
++	if (!uts_resources_admin() && current->nsproxy->uts_ns->resources != view) {
+ 		up_read(&uts_sem);
+ 		return -EPERM;
+ 	}
+diff --git a/lib/kobject_uevent.c b/lib/kobject_uevent.c
+index 78e16b95d..0cc358061 100644
+--- a/lib/kobject_uevent.c
++++ b/lib/kobject_uevent.c
+@@ -25,6 +25,11 @@
+ #include <linux/uidgid.h>
+ #include <linux/uuid.h>
+ #include <linux/ctype.h>
++#include <linux/kdev_t.h>
++#include <linux/nsproxy.h>
++#include <linux/uaccess.h>
++#include <linux/uts_namespace.h>
++#include <linux/uts_resources.h>
+ #include <net/sock.h>
+ #include <net/netlink.h>
+ #include <net/net_namespace.h>
+@@ -38,6 +43,7 @@ char uevent_helper[UEVENT_HELPER_PATH_LEN] = CONFIG_UEVENT_HELPER_PATH;
+ struct uevent_sock {
+ 	struct list_head list;
+ 	struct sock *sk;
++	struct uts_resource_view *view;
+ };
+ 
+ #ifdef CONFIG_NET
+@@ -305,6 +311,305 @@ static struct sk_buff *alloc_uevent_skb(struct kobj_uevent_env *env,
+ 	return skb;
+ }
+ 
++static int uevent_net_deliver(struct sock *usk, struct kobj_uevent_env *env,
++			      const char *action_string, const char *devpath);
++
++#ifdef CONFIG_UTS_NS_RESOURCES
++struct uts_event_projection {
++	struct uts_event_info info;
++	atomic64_t sequence;
++};
++
++static const char *uevent_value(const struct kobj_uevent_env *env, const char *key)
++{
++	size_t length = strlen(key);
++	unsigned int i;
++
++	for (i = 0; i < env->envp_idx; i++)
++		if (!strncmp(env->envp[i], key, length) && env->envp[i][length] == '=')
++			return env->envp[i] + length + 1;
++	return NULL;
++}
++
++static bool uevent_name_valid(const char *name, size_t size)
++{
++	size_t i, length = strnlen(name, size);
++
++	if (!length || length == size || !isalnum(name[0]))
++		return false;
++	for (i = 0; i < length; i++)
++		if (!isalnum(name[i]) && name[i] != '_' && name[i] != '-' && name[i] != '.')
++			return false;
++	return !memchr_inv(name + length, 0, size - length);
++}
++
++bool uts_uevent_may_enter(struct uts_namespace *uts, struct net *net)
++{
++	struct uts_resource_view *view = uts_resources_acquire(uts);
++	bool allowed = uts_resources_admin() ||
++		view == smp_load_acquire(&net->uevent_sock->view);
++
++	uts_resources_release(view);
++	return allowed;
++}
++
++long uts_uevent_ioctl(struct uts_namespace *ns, unsigned int cmd, unsigned long arg)
++{
++	struct uts_resource_view *view, *caller;
++	struct uts_event_projection *projection = NULL;
++	struct uts_event_binding *binding = NULL;
++	struct uts_event_info *info;
++	const struct uts_resource_info *resources;
++	struct net *net = NULL;
++	void __user *argp = (void __user *)arg;
++	unsigned int i, j;
++	long ret = 0;
++
++	if (cmd == NS_UTS_BIND_EVENTS && (!uts_resources_admin() || ns == &init_uts_ns))
++		return -EPERM;
++	view = uts_resources_acquire(ns);
++	caller = uts_resources_acquire(current->nsproxy->uts_ns);
++	if (!uts_resources_admin() && view != caller)
++		ret = -EPERM;
++	uts_resources_release(caller);
++	if (ret)
++		goto out;
++	if (cmd == NS_UTS_GET_EVENTS) {
++		info = kzalloc(sizeof(*info), GFP_KERNEL);
++		if (!info) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		info->abi = 1;
++		if (IS_ENABLED(CONFIG_ANDROID_UID_CPUTIME))
++			info->flags = UTS_EVENT_UID_CPUTIME;
++		if (view) {
++			projection = uts_resources_events(view);
++			if (!uts_resources_live(view))
++				ret = -ENODEV;
++			else if (projection)
++				*info = projection->info;
++		}
++		if (!ret && copy_to_user(argp, info, sizeof(*info)))
++			ret = -EFAULT;
++		kfree(info);
++		projection = NULL;
++		goto out;
++	}
++	if (!view) {
++		ret = -ENODATA;
++		goto out;
++	}
++	binding = memdup_user(argp, sizeof(*binding));
++	if (IS_ERR(binding)) {
++		ret = PTR_ERR(binding);
++		binding = NULL;
++		goto out;
++	}
++	resources = uts_resources_binding(view);
++	if (binding->abi != 1 || binding->flags || binding->count > UTS_EVENT_MAX_DEVICES ||
++	    memcmp(binding->generation, resources->generation, sizeof(binding->generation)) ||
++	    memchr_inv(binding->devices + binding->count, 0,
++		       (UTS_EVENT_MAX_DEVICES - binding->count) * sizeof(binding->devices[0]))) {
++		ret = -EINVAL;
++		goto out;
++	}
++	for (i = 0; i < binding->count; i++) {
++		struct uts_event_device *device = &binding->devices[i];
++		dev_t dev = MKDEV(device->major, device->minor);
++
++		if (device->reserved || MAJOR(dev) != device->major || MINOR(dev) != device->minor ||
++		    !uevent_name_valid(device->name, sizeof(device->name)) ||
++		    !((device->class == UTS_EVENT_DRM &&
++		       (!strncmp(device->name, "card", 4) || !strncmp(device->name, "renderD", 7))) ||
++		      (device->class == UTS_EVENT_VIDEO && !strncmp(device->name, "video", 5)))) {
++			ret = -EINVAL;
++			goto out;
++		}
++		for (j = 0; j < i; j++)
++			if ((device->major == binding->devices[j].major &&
++			     device->minor == binding->devices[j].minor) ||
++			    (device->class == binding->devices[j].class &&
++			     !strcmp(device->name, binding->devices[j].name))) {
++				ret = -EINVAL;
++				goto out;
++			}
++	}
++	net = get_net_ns_by_fd(binding->netns_fd);
++	if (IS_ERR(net)) {
++		ret = PTR_ERR(net);
++		net = NULL;
++		goto out;
++	}
++	if (net == &init_net) {
++		ret = -EPERM;
++		goto out;
++	}
++	projection = kzalloc(sizeof(*projection), GFP_KERNEL);
++	if (!projection) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	projection->info.abi = 1;
++	projection->info.flags = UTS_EVENT_BOUND;
++	if (IS_ENABLED(CONFIG_ANDROID_UID_CPUTIME))
++		projection->info.flags |= UTS_EVENT_UID_CPUTIME;
++	projection->info.netns_inode = net->ns.inum;
++	projection->info.cgroup_id = resources->cgroup_id;
++	memcpy(projection->info.generation, resources->generation, sizeof(resources->generation));
++	projection->info.count = binding->count;
++	memcpy(projection->info.devices, binding->devices, sizeof(binding->devices));
++	atomic64_set(&projection->sequence, 0);
++	mutex_lock(&uevent_sock_mutex);
++	if (!uts_resources_live(view))
++		ret = -ENODEV;
++	else if (uts_resources_events(view) ||
++		 (net->uevent_sock->view && net->uevent_sock->view != view))
++		ret = -EBUSY;
++	else {
++		uts_resources_publish_events(view, projection);
++		projection = NULL;
++		if (!net->uevent_sock->view) {
++			smp_store_release(&net->uevent_sock->view, view);
++			view = NULL; /* The netns now owns this reference. */
++		}
++		if (list_empty(&net->uevent_sock->list))
++			list_add_tail(&net->uevent_sock->list, &uevent_sock_list);
++	}
++	mutex_unlock(&uevent_sock_mutex);
++out:
++	if (net)
++		put_net(net);
++	uts_resources_release(view);
++	kfree(projection);
++	kfree(binding);
++	return ret;
++}
++
++static int uevent_project(struct uevent_sock *socket, struct kobj_uevent_env *source,
++			 bool tagged)
++{
++	struct uts_resource_view *view = smp_load_acquire(&socket->view);
++	struct uts_event_projection *projection = uts_resources_events(view);
++	const struct uts_event_device *device = NULL;
++	struct kobj_uevent_env *env;
++	const char *action = uevent_value(source, "ACTION");
++	const char *subsystem = uevent_value(source, "SUBSYSTEM");
++	const char *name, *major, *minor;
++	char path[128];
++	unsigned int i, maj, min, index;
++	int ret = 0;
++
++	/* A newly inherited netns cannot leak before the host seals its view. */
++	if (!projection || !uts_resources_live(view) || !action || !subsystem)
++		return 0;
++	for (i = 0; i < ARRAY_SIZE(kobject_actions); i++)
++		if (!strcmp(action, kobject_actions[i]))
++			break;
++	if (i == ARRAY_SIZE(kobject_actions))
++		return 0;
++	if (tagged && !strcmp(subsystem, "net")) {
++		name = uevent_value(source, "INTERFACE");
++		minor = uevent_value(source, "IFINDEX");
++		if (!name || !minor || !*name || strlen(name) >= IFNAMSIZ ||
++		    strchr(name, '/') || kstrtouint(minor, 10, &index) || !index)
++			return 0;
++		snprintf(path, sizeof(path), "/devices/virtual/net/%s", name);
++	} else {
++		major = uevent_value(source, "MAJOR");
++		minor = uevent_value(source, "MINOR");
++		if (!major || !minor || kstrtouint(major, 10, &maj) || kstrtouint(minor, 10, &min))
++			return 0;
++		for (i = 0; i < projection->info.count; i++) {
++			const struct uts_event_device *candidate = &projection->info.devices[i];
++			const char *class = candidate->class == UTS_EVENT_DRM ? "drm" : "video4linux";
++
++			if (candidate->major == maj && candidate->minor == min && !strcmp(class, subsystem)) {
++				device = candidate;
++				break;
++			}
++		}
++		if (!device)
++			return 0;
++		snprintf(path, sizeof(path), "/devices/virtual/lupine/%s/%s", subsystem, device->name);
++	}
++	env = kzalloc(sizeof(*env), GFP_KERNEL);
++	if (!env)
++		return -ENOMEM;
++	ret = add_uevent_var(env, "ACTION=%s", action);
++	ret = ret ?: add_uevent_var(env, "DEVPATH=%s", path);
++	ret = ret ?: add_uevent_var(env, "SUBSYSTEM=%s", subsystem);
++	if (device) {
++		ret = ret ?: add_uevent_var(env, "MAJOR=%u", device->major);
++		ret = ret ?: add_uevent_var(env, "MINOR=%u", device->minor);
++		ret = ret ?: add_uevent_var(env, "DEVNAME=%s%s",
++			device->class == UTS_EVENT_DRM ? "dri/" : "", device->name);
++		/* These DRM UAPI payloads carry object IDs, not physical parent paths. */
++		if (device->class == UTS_EVENT_DRM) {
++			const char *keys[] = { "HOTPLUG", "CONNECTOR", "PROPERTY", "LEASE" };
++
++			ret = ret ?: add_uevent_var(env, "DEVTYPE=drm_minor");
++			for (i = 0; !ret && i < ARRAY_SIZE(keys); i++) {
++				const char *value = uevent_value(source, keys[i]);
++				unsigned int number;
++
++				if (value && !kstrtouint(value, 10, &number))
++					ret = add_uevent_var(env, "%s=%u", keys[i], number);
++			}
++		}
++	} else {
++		ret = ret ?: add_uevent_var(env, "INTERFACE=%s", name);
++		ret = ret ?: add_uevent_var(env, "IFINDEX=%u", index);
++	}
++	ret = ret ?: add_uevent_var(env, "SEQNUM=%llu", atomic64_inc_return(&projection->sequence));
++	if (!ret)
++		ret = uevent_net_deliver(socket->sk, env, action, path);
++	kfree(env);
++	return ret;
++}
++
++static int uevent_project_user(struct uevent_sock *socket, struct sk_buff *skb)
++{
++	struct nlmsghdr *nlh = nlmsg_hdr(skb);
++	struct kobj_uevent_env *env;
++	const char *text = nlmsg_data(nlh), *end = text + nlmsg_len(nlh);
++	int ret = 0;
++
++	if (!nlmsg_ok(nlh, skb->len))
++		return -EINVAL;
++	env = kzalloc(sizeof(*env), GFP_KERNEL);
++	if (!env)
++		return -ENOMEM;
++	while (text < end) {
++		size_t length = strnlen(text, end - text);
++
++		if (length == end - text) {
++			ret = -EINVAL;
++			break;
++		}
++		if (strchr(text, '=')) {
++			ret = add_uevent_var(env, "%s", text);
++			if (ret)
++				break;
++		}
++		text += length + 1;
++	}
++	if (!ret)
++		ret = uevent_project(socket, env, true);
++	kfree(env);
++	return ret;
++}
++#else
++static int uevent_project(struct uevent_sock *socket, struct kobj_uevent_env *source, bool tagged)
++{
++	return 0;
++}
++static int uevent_project_user(struct uevent_sock *socket, struct sk_buff *skb)
++{
++	return 0;
++}
++#endif
++
+ static int uevent_net_broadcast_untagged(struct kobj_uevent_env *env,
+ 					 const char *action_string,
+ 					 const char *devpath)
+@@ -321,6 +626,10 @@ static int uevent_net_broadcast_untagged(struct kobj_uevent_env *env,
+ 		if (!netlink_has_listeners(uevent_sock, 1))
+ 			continue;
+ 
++		if (smp_load_acquire(&ue_sk->view)) {
++			retval = uevent_project(ue_sk, env, false);
++			continue;
++		}
+ 		if (!skb) {
+ 			retval = -ENOMEM;
+ 			skb = alloc_uevent_skb(env, action_string, devpath);
+@@ -340,7 +649,7 @@ static int uevent_net_broadcast_untagged(struct kobj_uevent_env *env,
+ 	return retval;
+ }
+ 
+-static int uevent_net_broadcast_tagged(struct sock *usk,
++static int uevent_net_deliver(struct sock *usk,
+ 				       struct kobj_uevent_env *env,
+ 				       const char *action_string,
+ 				       const char *devpath)
+@@ -379,6 +688,18 @@ static int uevent_net_broadcast_tagged(struct sock *usk,
+ }
+ #endif
+ 
++#ifdef CONFIG_NET
++static int uevent_net_broadcast_tagged(struct sock *usk, struct kobj_uevent_env *env,
++				       const char *action, const char *path)
++{
++	struct uevent_sock *socket = sock_net(usk)->uevent_sock;
++
++	if (smp_load_acquire(&socket->view))
++		return uevent_project(socket, env, true);
++	return uevent_net_deliver(usk, env, action, path);
++}
++#endif
++
+ static int kobject_uevent_net_broadcast(struct kobject *kobj,
+ 					struct kobj_uevent_env *env,
+ 					const char *action_string,
+@@ -701,6 +1022,9 @@ static int uevent_net_broadcast(struct sock *usk, struct sk_buff *skb,
+ 	struct sk_buff *skbc;
+ 	int ret;
+ 
++	if (smp_load_acquire(&sock_net(usk)->uevent_sock->view))
++		return uevent_project_user(sock_net(usk)->uevent_sock, skb);
++
+ 	/* bump and prepare sequence number */
+ 	ret = snprintf(buf, sizeof(buf), "SEQNUM=%llu",
+ 		       atomic64_inc_return(&uevent_seqnum));
+@@ -787,10 +1111,13 @@ static int uevent_net_init(struct net *net)
+ 		return -ENODEV;
+ 	}
+ 
++	INIT_LIST_HEAD(&ue_sk->list);
++	if (net != &init_net)
++		ue_sk->view = uts_resources_acquire(current->nsproxy->uts_ns);
+ 	net->uevent_sock = ue_sk;
+ 
+-	/* Restrict uevents to initial user namespace. */
+-	if (sock_net(ue_sk->sk)->user_ns == &init_user_ns) {
++	/* Bound instance namespaces receive projected events, including in userns. */
++	if (ue_sk->view || sock_net(ue_sk->sk)->user_ns == &init_user_ns) {
+ 		mutex_lock(&uevent_sock_mutex);
+ 		list_add_tail(&ue_sk->list, &uevent_sock_list);
+ 		mutex_unlock(&uevent_sock_mutex);
+@@ -803,12 +1130,11 @@ static void uevent_net_exit(struct net *net)
+ {
+ 	struct uevent_sock *ue_sk = net->uevent_sock;
+ 
+-	if (sock_net(ue_sk->sk)->user_ns == &init_user_ns) {
+-		mutex_lock(&uevent_sock_mutex);
+-		list_del(&ue_sk->list);
+-		mutex_unlock(&uevent_sock_mutex);
+-	}
++	mutex_lock(&uevent_sock_mutex);
++	list_del_init(&ue_sk->list);
++	mutex_unlock(&uevent_sock_mutex);
+ 
++	uts_resources_release(ue_sk->view);
+ 	netlink_kernel_release(ue_sk->sk);
+ 	kfree(ue_sk);
+ }
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index 4bece5eda..53a8b22aa 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -21,6 +21,7 @@
+ #include <linux/uidgid.h>
+ #include <linux/proc_fs.h>
+ #include <linux/nstree.h>
++#include <linux/uts_resources.h>
+ 
+ #include <net/aligned_data.h>
+ #include <net/sock.h>
+@@ -1532,6 +1533,9 @@ static int netns_install(struct nsset *nsset, struct ns_common *ns)
+ 	    !ns_capable(nsset->cred->user_ns, CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
++	if (!uts_uevent_may_enter(nsproxy->uts_ns, net))
++		return -EPERM;
++
+ 	put_net(nsproxy->net_ns);
+ 	nsproxy->net_ns = get_net(net);
+ 	return 0;

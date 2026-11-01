@@ -1,0 +1,1774 @@
+From 7bf51f4458ce3de0b3f7b675a9c4fd5567521542 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Sat, 31 Oct 2026 00:27:47 +0800
+Subject: [PATCH] uts: Add host-managed instance resource view
+
+Bind an instance cgroup once to a noninitial UTS namespace. Use the same
+accounting for native/compat sysinfo, proc and host snapshots; fail when
+the bound cgroup goes offline. Keep the original 48/48/512-byte ABI.
+
+Add a separate 256-byte memory snapshot for reclaim, refault and virtual
+zone watermarks. Supply the fields and text structure consumed by LMKD
+without exposing host zone, IRQ, slab, block or swap identities.
+Unbound namespaces retain their original behavior.
+
+Kernel base: e8694cdbd7db99fa26f6e8c80a2a337e0de29a2f (6.18.53)
+---
+ arch/arm64/kernel/cpuinfo.c                   |  19 +-
+ block/blk-cgroup.c                            |  41 ++
+ block/genhd.c                                 |   4 +
+ fs/nsfs.c                                     |  16 +
+ fs/proc/interrupts.c                          |   3 +
+ fs/proc/loadavg.c                             |   6 +
+ fs/proc/meminfo.c                             |   6 +
+ fs/proc/stat.c                                |   6 +
+ fs/proc/uptime.c                              |   6 +
+ include/linux/blk-cgroup.h                    |   2 +
+ include/linux/cgroup.h                        |   1 +
+ include/linux/cpuset.h                        |   2 +
+ include/linux/memcontrol.h                    |   1 +
+ include/linux/psi.h                           |   1 +
+ include/linux/uts_namespace.h                 |   4 +
+ include/linux/uts_resources.h                 |  42 ++
+ include/uapi/linux/nsfs.h                     |  76 +++
+ init/Kconfig                                  |  10 +
+ kernel/Makefile                               |   2 +
+ kernel/cgroup/cpuset.c                        |  18 +
+ kernel/cgroup/rstat.c                         |  10 +
+ kernel/sched/psi.c                            |  40 +-
+ kernel/sys.c                                  |  14 +-
+ kernel/uts_resources.c                        | 519 ++++++++++++++++++
+ kernel/utsname.c                              |   6 +
+ mm/memcontrol.c                               |   1 +
+ mm/page_alloc.c                               |  18 +
+ mm/slab_common.c                              |   3 +
+ mm/swapfile.c                                 |   5 +
+ mm/vmscan.c                                   |   1 +
+ mm/vmstat.c                                   |  44 +-
+ tools/testing/selftests/Makefile              |   1 +
+ .../testing/selftests/uts_resources/Makefile  |   4 +
+ .../selftests/uts_resources/uts_resources.c   | 203 +++++++
+ 34 files changed, 1122 insertions(+), 13 deletions(-)
+ create mode 100644 include/linux/uts_resources.h
+ create mode 100644 kernel/uts_resources.c
+ create mode 100644 tools/testing/selftests/uts_resources/Makefile
+ create mode 100644 tools/testing/selftests/uts_resources/uts_resources.c
+
+diff --git a/arch/arm64/kernel/cpuinfo.c b/arch/arm64/kernel/cpuinfo.c
+index c44e6d94f..803d58d31 100644
+--- a/arch/arm64/kernel/cpuinfo.c
++++ b/arch/arm64/kernel/cpuinfo.c
+@@ -21,6 +21,7 @@
+ #include <linux/preempt.h>
+ #include <linux/printk.h>
+ #include <linux/seq_file.h>
++#include <linux/uts_resources.h>
+ #include <linux/sched.h>
+ #include <linux/smp.h>
+ #include <linux/delay.h>
+@@ -217,6 +218,11 @@ static int c_show(struct seq_file *m, void *v)
+ 	bool compat = personality(current->personality) == PER_LINUX32;
+ 	struct cpuinfo_arm64 *cpuinfo = v;
+ 	u32 midr = cpuinfo->reg_midr;
++	bool instance = uts_resources_active();
++	int visible = uts_resources_cpu_visible(cpu);
++
++	if (visible <= 0)
++		return visible;
+ 
+ 	/*
+ 	 * glibc reads /proc/cpuinfo to determine the number of
+@@ -224,13 +230,14 @@ static int c_show(struct seq_file *m, void *v)
+ 	 * "processor".  Give glibc what it expects.
+ 	 */
+ 	seq_printf(m, "processor\t: %d\n", cpu);
+-	if (compat)
++	if (compat && !instance)
+ 		seq_printf(m, "model name\t: ARMv8 Processor rev %d (%s)\n",
+ 			   MIDR_REVISION(midr), COMPAT_ELF_PLATFORM);
+ 
+-	seq_printf(m, "BogoMIPS\t: %lu.%02lu\n",
+-		   loops_per_jiffy / (500000UL/HZ),
+-		   loops_per_jiffy / (5000UL/HZ) % 100);
++	if (!instance)
++		seq_printf(m, "BogoMIPS\t: %lu.%02lu\n",
++			   loops_per_jiffy / (500000UL/HZ),
++			   loops_per_jiffy / (5000UL/HZ) % 100);
+ 
+ 	/*
+ 	 * Dump out the common processor features in a single line.
+@@ -265,6 +272,10 @@ static int c_show(struct seq_file *m, void *v)
+ 	}
+ 	seq_puts(m, "\n");
+ 
++	if (instance) {
++		seq_putc(m, '\n');
++		return 0;
++	}
+ 	seq_printf(m, "CPU implementer\t: 0x%02x\n",
+ 		   MIDR_IMPLEMENTOR(midr));
+ 	seq_puts(m, "CPU architecture: 8\n");
+diff --git a/block/blk-cgroup.c b/block/blk-cgroup.c
+index 171efbbd3..caca5d571 100644
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -1231,6 +1231,47 @@ static void blkcg_print_one_stat(struct blkcg_gq *blkg, struct seq_file *s)
+ 	seq_puts(s, "\n");
+ }
+ 
++/* Aggregate the same hierarchical counters exported by io.stat. */
++int blkcg_resource_stats(struct cgroup *cgrp, u64 values[4])
++{
++	struct cgroup_subsys_state *css;
++	struct blkcg *blkcg;
++	struct blkcg_gq *blkg;
++	unsigned int seq;
++	u64 sample[4];
++	int i;
++
++	css = cgroup_get_e_css(cgrp, &io_cgrp_subsys);
++	if (!css)
++		return -ENODEV;
++	if (css->cgroup != cgrp) {
++		css_put(css);
++		return -ENODEV;
++	}
++	blkcg = css_to_blkcg(css);
++	css_rstat_flush(css);
++	memset(values, 0, sizeof(sample));
++	spin_lock_irq(&blkcg->lock);
++	hlist_for_each_entry(blkg, &blkcg->blkg_list, blkcg_node) {
++		struct blkg_iostat_set *bis = &blkg->iostat;
++
++		if (!blkg->online)
++			continue;
++		do {
++			seq = u64_stats_fetch_begin(&bis->sync);
++			sample[0] = bis->cur.bytes[BLKG_IOSTAT_READ];
++			sample[1] = bis->cur.bytes[BLKG_IOSTAT_WRITE];
++			sample[2] = bis->cur.ios[BLKG_IOSTAT_READ];
++			sample[3] = bis->cur.ios[BLKG_IOSTAT_WRITE];
++		} while (u64_stats_fetch_retry(&bis->sync, seq));
++		for (i = 0; i < ARRAY_SIZE(sample); i++)
++			values[i] += sample[i];
++	}
++	spin_unlock_irq(&blkcg->lock);
++	css_put(css);
++	return 0;
++}
++
+ static int blkcg_print_stat(struct seq_file *sf, void *v)
+ {
+ 	struct blkcg *blkcg = css_to_blkcg(seq_css(sf));
+diff --git a/block/genhd.c b/block/genhd.c
+index bbcfbd1a3..064e4185b 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -11,6 +11,7 @@
+ #include <linux/kdev_t.h>
+ #include <linux/kernel.h>
+ #include <linux/blkdev.h>
++#include <linux/uts_resources.h>
+ #include <linux/backing-dev.h>
+ #include <linux/init.h>
+ #include <linux/spinlock.h>
+@@ -1366,6 +1367,9 @@ static int diskstats_show(struct seq_file *seqf, void *v)
+ 	struct disk_stats stat;
+ 	unsigned long idx;
+ 
++	if (uts_resources_active())
++		return 0;
++
+ 	/*
+ 	if (&disk_to_dev(gp)->kobj.entry == block_class.devices.next)
+ 		seq_puts(seqf,	"major minor name"
+diff --git a/fs/nsfs.c b/fs/nsfs.c
+index 36e1e2cdb..9f144e913 100644
+--- a/fs/nsfs.c
++++ b/fs/nsfs.c
+@@ -16,6 +16,7 @@
+ #include <linux/ipc_namespace.h>
+ #include <linux/time_namespace.h>
+ #include <linux/utsname.h>
++#include <linux/uts_resources.h>
+ #include <linux/exportfs.h>
+ #include <linux/nstree.h>
+ #include <net/net_namespace.h>
+@@ -178,6 +179,12 @@ static bool nsfs_ioctl_valid(unsigned int cmd)
+ 	case NS_GET_PID_IN_PIDNS:
+ 	case NS_GET_TGID_IN_PIDNS:
+ 	case NS_GET_ID:
++#ifdef CONFIG_UTS_NS_RESOURCES
++	case NS_UTS_BIND_RESOURCES:
++	case NS_UTS_GET_RESOURCE_BINDING:
++	case NS_UTS_GET_RESOURCE_SNAPSHOT:
++	case NS_UTS_GET_RESOURCE_MEMORY:
++#endif
+ #ifdef CONFIG_UTS_NS_IDENTITY
+ 	case NS_UTS_GET_IDENTITY:
+ 	case NS_UTS_SET_IDENTITY:
+@@ -229,6 +236,15 @@ static long ns_ioctl(struct file *filp, unsigned int ioctl,
+ 
+ 	ns = get_proc_ns(file_inode(filp));
+ 	switch (ioctl) {
++#ifdef CONFIG_UTS_NS_RESOURCES
++	case NS_UTS_BIND_RESOURCES:
++	case NS_UTS_GET_RESOURCE_BINDING:
++	case NS_UTS_GET_RESOURCE_SNAPSHOT:
++	case NS_UTS_GET_RESOURCE_MEMORY:
++		if (ns->ns_type != CLONE_NEWUTS)
++			return -EINVAL;
++		return uts_resources_ioctl(to_uts_ns(ns), ioctl, arg);
++#endif
+ #ifdef CONFIG_UTS_NS_IDENTITY
+ 	case NS_UTS_GET_IDENTITY:
+ 	case NS_UTS_SET_IDENTITY:
+diff --git a/fs/proc/interrupts.c b/fs/proc/interrupts.c
+index 714a22ded..ed56f9e4c 100644
+--- a/fs/proc/interrupts.c
++++ b/fs/proc/interrupts.c
+@@ -5,12 +5,15 @@
+ #include <linux/irqnr.h>
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
++#include <linux/uts_resources.h>
+ 
+ /*
+  * /proc/interrupts
+  */
+ static void *int_seq_start(struct seq_file *f, loff_t *pos)
+ {
++	if (uts_resources_active())
++		return NULL;
+ 	return *pos <= irq_get_nr_irqs() ? pos : NULL;
+ }
+ 
+diff --git a/fs/proc/loadavg.c b/fs/proc/loadavg.c
+index 817981e57..a1a3e4008 100644
+--- a/fs/proc/loadavg.c
++++ b/fs/proc/loadavg.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/fs.h>
++#include <linux/uts_resources.h>
+ #include <linux/init.h>
+ #include <linux/pid_namespace.h>
+ #include <linux/proc_fs.h>
+@@ -13,6 +14,11 @@
+ 
+ static int loadavg_proc_show(struct seq_file *m, void *v)
+ {
++	int resource_ret = uts_resources_proc(m, UR_PROC_LOADAVG);
++
++	if (resource_ret)
++		return resource_ret < 0 ? resource_ret : 0;
++
+ 	unsigned long avnrun[3];
+ 
+ 	get_avenrun(avnrun, FIXED_1/200, 0);
+diff --git a/fs/proc/meminfo.c b/fs/proc/meminfo.c
+index a458f1e11..abbb48bd6 100644
+--- a/fs/proc/meminfo.c
++++ b/fs/proc/meminfo.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/fs.h>
++#include <linux/uts_resources.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+@@ -33,6 +34,11 @@ static void show_val_kb(struct seq_file *m, const char *s, unsigned long num)
+ 
+ static int meminfo_proc_show(struct seq_file *m, void *v)
+ {
++	int resource_ret = uts_resources_proc(m, UR_PROC_MEMINFO);
++
++	if (resource_ret)
++		return resource_ret < 0 ? resource_ret : 0;
++
+ 	struct sysinfo i;
+ 	unsigned long committed;
+ 	long cached;
+diff --git a/fs/proc/stat.c b/fs/proc/stat.c
+index 8b444e862..62a34dd31 100644
+--- a/fs/proc/stat.c
++++ b/fs/proc/stat.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/cpumask.h>
+ #include <linux/fs.h>
++#include <linux/uts_resources.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/kernel_stat.h>
+@@ -81,6 +82,11 @@ static void show_all_irqs(struct seq_file *p)
+ 
+ static int show_stat(struct seq_file *p, void *v)
+ {
++	int resource_ret = uts_resources_proc(p, UR_PROC_STAT);
++
++	if (resource_ret)
++		return resource_ret < 0 ? resource_ret : 0;
++
+ 	int i, j;
+ 	u64 user, nice, system, idle, iowait, irq, softirq, steal;
+ 	u64 guest, guest_nice;
+diff --git a/fs/proc/uptime.c b/fs/proc/uptime.c
+index b5343d209..a35e40bc6 100644
+--- a/fs/proc/uptime.c
++++ b/fs/proc/uptime.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/fs.h>
++#include <linux/uts_resources.h>
+ #include <linux/init.h>
+ #include <linux/proc_fs.h>
+ #include <linux/sched.h>
+@@ -11,6 +12,11 @@
+ 
+ static int uptime_proc_show(struct seq_file *m, void *v)
+ {
++	int resource_ret = uts_resources_proc(m, UR_PROC_UPTIME);
++
++	if (resource_ret)
++		return resource_ret < 0 ? resource_ret : 0;
++
+ 	struct timespec64 uptime;
+ 	struct timespec64 idle;
+ 	u64 idle_nsec;
+diff --git a/include/linux/blk-cgroup.h b/include/linux/blk-cgroup.h
+index dd5841a42..1c2e5625e 100644
+--- a/include/linux/blk-cgroup.h
++++ b/include/linux/blk-cgroup.h
+@@ -16,6 +16,7 @@
+ 
+ #include <linux/types.h>
+ 
++struct cgroup;
+ struct bio;
+ struct cgroup_subsys_state;
+ struct gendisk;
+@@ -24,6 +25,7 @@ struct gendisk;
+ 
+ #ifdef CONFIG_BLK_CGROUP
+ extern struct cgroup_subsys_state * const blkcg_root_css;
++int blkcg_resource_stats(struct cgroup *cgrp, u64 values[4]);
+ 
+ void blkcg_schedule_throttle(struct gendisk *disk, bool use_memdelay);
+ void blkcg_maybe_throttle_current(void);
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 7b2807009..3cbce00ac 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -715,6 +715,7 @@ static inline void cgroup_path_from_kernfs_id(u64 id, char *buf, size_t buflen)
+  */
+ void __css_rstat_updated(struct cgroup_subsys_state *css, int cpu);
+ void css_rstat_updated(struct cgroup_subsys_state *css, int cpu);
++void cgroup_resource_cputime(struct cgroup *cgrp, struct task_cputime *time);
+ void css_rstat_flush(struct cgroup_subsys_state *css);
+ 
+ /*
+diff --git a/include/linux/cpuset.h b/include/linux/cpuset.h
+index 75283991e..d933a2187 100644
+--- a/include/linux/cpuset.h
++++ b/include/linux/cpuset.h
+@@ -74,6 +74,8 @@ extern void inc_dl_tasks_cs(struct task_struct *task);
+ extern void dec_dl_tasks_cs(struct task_struct *task);
+ extern void cpuset_lock(void);
+ extern void cpuset_unlock(void);
++struct cgroup;
++void cpuset_cgroup_cpus(struct cgroup *cgroup, struct cpumask *mask);
+ extern void cpuset_cpus_allowed(struct task_struct *p, struct cpumask *mask);
+ extern bool cpuset_cpus_allowed_fallback(struct task_struct *p);
+ extern bool cpuset_cpu_is_isolated(int cpu);
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 706ddda4a..7b72aaeb6 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -949,6 +949,7 @@ static inline void mod_memcg_page_state(struct page *page,
+ }
+ 
+ unsigned long memcg_page_state(struct mem_cgroup *memcg, int idx);
++unsigned long memcg_events(struct mem_cgroup *memcg, int event);
+ unsigned long lruvec_page_state(struct lruvec *lruvec, enum node_stat_item idx);
+ unsigned long lruvec_page_state_local(struct lruvec *lruvec,
+ 				      enum node_stat_item idx);
+diff --git a/include/linux/psi.h b/include/linux/psi.h
+index 7966e3ac0..d12b62c09 100644
+--- a/include/linux/psi.h
++++ b/include/linux/psi.h
+@@ -18,6 +18,7 @@ extern struct static_key_false psi_disabled;
+ extern struct psi_group psi_system;
+ 
+ void psi_init(void);
++int psi_resource_totals(struct cgroup *cgrp, u64 totals[3]);
+ 
+ void psi_memstall_enter(unsigned long *flags);
+ void psi_memstall_leave(unsigned long *flags);
+diff --git a/include/linux/uts_namespace.h b/include/linux/uts_namespace.h
+index a43404e76..9d0556657 100644
+--- a/include/linux/uts_namespace.h
++++ b/include/linux/uts_namespace.h
+@@ -5,11 +5,15 @@
+ #include <linux/ns_common.h>
+ #include <uapi/linux/utsname.h>
+ 
++struct uts_resource_view;
+ struct user_namespace;
+ extern struct user_namespace init_user_ns;
+ 
+ struct uts_namespace {
+ 	struct new_utsname name;
++#ifdef CONFIG_UTS_NS_RESOURCES
++	struct uts_resource_view *resources;
++#endif
+ #ifdef CONFIG_UTS_NS_IDENTITY
+ 	u64 identity_id;
+ #endif
+diff --git a/include/linux/uts_resources.h b/include/linux/uts_resources.h
+new file mode 100644
+index 000000000..3cf3f709f
+--- /dev/null
++++ b/include/linux/uts_resources.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_UTS_RESOURCES_H
++#define _LINUX_UTS_RESOURCES_H
++
++#include <linux/types.h>
++#include <uapi/linux/nsfs.h>
++
++struct uts_namespace;
++struct seq_file;
++struct sysinfo;
++
++
++enum uts_resource_proc {
++	UR_PROC_MEMINFO, UR_PROC_STAT, UR_PROC_LOADAVG, UR_PROC_UPTIME,
++	UR_PROC_VMSTAT, UR_PROC_PSI_CPU, UR_PROC_PSI_MEM, UR_PROC_PSI_IO,
++	UR_PROC_ZONEINFO,
++};
++
++#ifdef CONFIG_UTS_NS_RESOURCES
++long uts_resources_ioctl(struct uts_namespace *ns, unsigned int cmd,
++			 unsigned long arg);
++void uts_resources_copy(struct uts_namespace *ns, struct uts_namespace *old);
++void uts_resources_put(struct uts_namespace *ns);
++bool uts_resources_may_enter(struct uts_namespace *old, struct uts_namespace *new);
++int uts_resources_sysinfo(struct sysinfo *info);
++int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which);
++bool uts_resources_active(void);
++int uts_resources_cpu_visible(unsigned int cpu);
++void memory_resource_watermarks(u64 managed, u64 watermarks[3]);
++#else
++static inline void uts_resources_copy(struct uts_namespace *ns, struct uts_namespace *old) {}
++static inline void uts_resources_put(struct uts_namespace *ns) {}
++static inline bool uts_resources_may_enter(struct uts_namespace *old, struct uts_namespace *new)
++{
++	return true;
++}
++static inline int uts_resources_sysinfo(struct sysinfo *info) { return 0; }
++static inline int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which) { return 0; }
++static inline bool uts_resources_active(void) { return false; }
++static inline int uts_resources_cpu_visible(unsigned int cpu) { return 1; }
++#endif
++#endif
+diff --git a/include/uapi/linux/nsfs.h b/include/uapi/linux/nsfs.h
+index 61ef1665f..05d6dd043 100644
+--- a/include/uapi/linux/nsfs.h
++++ b/include/uapi/linux/nsfs.h
+@@ -60,6 +60,82 @@ struct uts_ns_identity {
+ #define NS_UTS_GET_IDENTITY	_IOR(NSIO, 0x80, struct uts_ns_identity)
+ #define NS_UTS_SET_IDENTITY	_IOW(NSIO, 0x81, struct uts_ns_identity)
+ 
++/* Optional host-managed instance resource view, native/compat identical. */
++#define UTS_RESOURCE_ABI 1
++#define UTS_RESOURCE_BOUND (1U << 0)
++#define UTS_RESOURCE_FIELDS 48
++
++enum uts_resource_field {
++	UR_RAM_TOTAL, UR_RAM_CURRENT, UR_RAM_FREE, UR_RAM_AVAILABLE,
++	UR_ANON, UR_FILE, UR_FILE_MAPPED, UR_SHMEM, UR_DIRTY, UR_WRITEBACK,
++	UR_INACTIVE_ANON, UR_ACTIVE_ANON, UR_INACTIVE_FILE, UR_ACTIVE_FILE,
++	UR_SLAB_RECLAIMABLE, UR_SLAB_UNRECLAIMABLE, UR_KERNEL_STACK,
++	UR_PAGETABLES, UR_SOCK, UR_SWAP_TOTAL, UR_SWAP_CURRENT, UR_SWAP_FREE,
++	UR_SWAP_CACHED, UR_PGFAULT, UR_PGMAJFAULT, UR_PGPGIN, UR_PGPGOUT,
++	UR_PGSCAN, UR_PGSTEAL, UR_CPU_USAGE, UR_CPU_USER, UR_CPU_SYSTEM,
++	UR_CPUS, UR_THREADS, UR_RUNNING, UR_UNINTERRUPTIBLE,
++	UR_LOAD1, UR_LOAD5, UR_LOAD15, UR_UPTIME, UR_IDLE,
++	UR_READ_BYTES, UR_WRITE_BYTES, UR_READ_OPS, UR_WRITE_OPS,
++	UR_CPU_PRESSURE, UR_MEM_PRESSURE, UR_IO_PRESSURE,
++};
++
++struct uts_resource_binding {
++	__u32 abi;
++	__u32 flags;
++	__s32 cgroup_fd;
++	__u32 reserved0;
++	__u64 generation[2];
++	__u64 start_boottime_ns;
++	__u64 reserved1;
++};
++
++struct uts_resource_info {
++	__u32 abi;
++	__u32 flags;
++	__u64 cgroup_id;
++	__u64 generation[2];
++	__u64 start_boottime_ns;
++	__u64 reserved;
++};
++
++struct uts_resource_snapshot {
++	__u32 abi;
++	__u32 size;
++	__u64 valid;
++	__u64 sample_boottime_ns;
++	__u64 cgroup_id;
++	__u64 generation[2];
++	__u64 start_boottime_ns;
++	__u64 values[48];
++	__u64 reserved[9];
++};
++
++#define NS_UTS_BIND_RESOURCES _IOW(NSIO, 0x82, struct uts_resource_binding)
++#define NS_UTS_GET_RESOURCE_BINDING _IOR(NSIO, 0x83, struct uts_resource_info)
++#define NS_UTS_GET_RESOURCE_SNAPSHOT _IOR(NSIO, 0x84, struct uts_resource_snapshot)
++
++/* Page and reclaim counters supplement the unchanged resource ABI v1. */
++enum uts_resource_memory_field {
++	URM_FREE, URM_INACTIVE_FILE, URM_ACTIVE_FILE,
++	URM_REFAULT_ANON, URM_REFAULT_FILE, URM_SCAN_KSWAPD, URM_SCAN_DIRECT,
++	URM_DIRECT_THROTTLE, URM_STEAL_KSWAPD, URM_STEAL_DIRECT,
++	URM_MIN, URM_LOW, URM_HIGH, URM_MANAGED, URM_FILE, URM_SHMEM,
++};
++
++struct uts_resource_memory {
++	__u32 abi;
++	__u32 size;
++	__u64 valid;
++	__u64 sample_boottime_ns;
++	__u64 cgroup_id;
++	__u64 generation[2];
++	__u64 start_boottime_ns;
++	__u64 values[16];
++	__u64 reserved[9];
++};
++
++#define NS_UTS_GET_RESOURCE_MEMORY _IOR(NSIO, 0x85, struct uts_resource_memory)
++
+ enum init_ns_ino {
+ 	IPC_NS_INIT_INO		= 0xEFFFFFFFU,
+ 	UTS_NS_INIT_INO		= 0xEFFFFFFEU,
+diff --git a/init/Kconfig b/init/Kconfig
+index 20d082d0a..b0e59d995 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1374,6 +1374,16 @@ config UTS_NS_IDENTITY
+ 	  inherit the identity, including restrictions on namespace switching.
+ 	  Unconfigured namespaces retain the normal kernel identity.
+ 
++config UTS_NS_RESOURCES
++	bool "Host-managed UTS instance resource views"
++	depends on UTS_NS && PID_NS && CGROUPS && MEMCG && CPUSETS
++	help
++	  Allow an initial-namespace administrator to bind one cgroup v2 root
++	  to a noninitial UTS namespace. Descendants share immutable ownership
++	  and native/compat sysinfo and proc resource data use that root.
++	  Unbound namespaces retain the original kernel behavior.
++
++
+ config TIME_NS
+ 	bool "TIME namespace"
+ 	depends on GENERIC_GETTIMEOFDAY
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 2cf7909a7..58f4033ad 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -207,3 +207,5 @@ $(obj)/kheaders.md5: $(obj)/kheaders-srclist FORCE
+ 	$(call filechk,kheaders_md5sum)
+ 
+ clean-files := kheaders.md5 kheaders-srclist kheaders-objlist
++
++obj-$(CONFIG_UTS_NS_RESOURCES) += uts_resources.o
+diff --git a/kernel/cgroup/cpuset.c b/kernel/cgroup/cpuset.c
+index 6ab677c00..40eefcd38 100644
+--- a/kernel/cgroup/cpuset.c
++++ b/kernel/cgroup/cpuset.c
+@@ -4236,6 +4236,24 @@ void __init cpuset_init_smp(void)
+  * tasks cpuset, except when the task is in the top cpuset.
+  **/
+ 
++void cpuset_cgroup_cpus(struct cgroup *cgroup, struct cpumask *mask)
++{
++	struct cgroup_subsys_state *css;
++	struct cpuset *cs;
++	unsigned long flags;
++
++	css = cgroup_get_e_css(cgroup, &cpuset_cgrp_subsys);
++	if (!css) {
++		cpumask_clear(mask);
++		return;
++	}
++	cs = css_cs(css);
++	spin_lock_irqsave(&callback_lock, flags);
++	cpumask_and(mask, cs->effective_cpus, cpu_online_mask);
++	spin_unlock_irqrestore(&callback_lock, flags);
++	css_put(css);
++}
++
+ void cpuset_cpus_allowed(struct task_struct *tsk, struct cpumask *pmask)
+ {
+ 	unsigned long flags;
+diff --git a/kernel/cgroup/rstat.c b/kernel/cgroup/rstat.c
+index de816a43d..7002a0fb1 100644
+--- a/kernel/cgroup/rstat.c
++++ b/kernel/cgroup/rstat.c
+@@ -719,6 +719,16 @@ static void cgroup_force_idle_show(struct seq_file *seq, struct cgroup_base_stat
+ #endif
+ }
+ 
++void cgroup_resource_cputime(struct cgroup *cgrp, struct task_cputime *time)
++{
++	css_rstat_flush(&cgrp->self);
++	__css_rstat_lock(&cgrp->self, -1);
++	*time = cgrp->bstat.cputime;
++	cputime_adjust(&cgrp->bstat.cputime, &cgrp->prev_cputime,
++		       &time->utime, &time->stime);
++	__css_rstat_unlock(&cgrp->self, -1);
++}
++
+ void cgroup_base_stat_cputime_show(struct seq_file *seq)
+ {
+ 	struct cgroup *cgrp = seq_css(seq)->cgroup;
+diff --git a/kernel/sched/psi.c b/kernel/sched/psi.c
+index 7650f6b99..dd2db8c75 100644
+--- a/kernel/sched/psi.c
++++ b/kernel/sched/psi.c
+@@ -139,6 +139,7 @@
+ #include <linux/sched/clock.h>
+ #include <linux/workqueue.h>
+ #include <linux/psi.h>
++#include <linux/uts_resources.h>
+ #include "sched.h"
+ 
+ static int psi_bug __read_mostly;
+@@ -1248,6 +1249,28 @@ void psi_cgroup_restart(struct psi_group *group)
+ }
+ #endif /* CONFIG_CGROUPS */
+ 
++#ifdef CONFIG_CGROUPS
++int psi_resource_totals(struct cgroup *cgrp, u64 totals[3])
++{
++	struct psi_group *group = cgroup_psi(cgrp);
++	u64 now;
++
++	if (static_branch_likely(&psi_disabled) || !group || !group->enabled)
++		return -EOPNOTSUPP;
++	mutex_lock(&group->avgs_lock);
++	now = sched_clock();
++	collect_percpu_times(group, PSI_AVGS, NULL);
++	if (now >= group->avg_next_update)
++		group->avg_next_update = update_averages(group, now);
++	totals[0] = div_u64(group->total[PSI_AVGS][PSI_CPU_SOME], NSEC_PER_USEC);
++	totals[1] = div_u64(group->total[PSI_AVGS][PSI_MEM_SOME], NSEC_PER_USEC);
++	totals[2] = div_u64(group->total[PSI_AVGS][PSI_IO_SOME], NSEC_PER_USEC);
++	mutex_unlock(&group->avgs_lock);
++	return 0;
++}
++
++#endif
++
+ int psi_show(struct seq_file *m, struct psi_group *group, enum psi_res res)
+ {
+ 	bool only_full = false;
+@@ -1537,17 +1560,23 @@ __poll_t psi_trigger_poll(void **trigger_ptr,
+ #ifdef CONFIG_PROC_FS
+ static int psi_io_show(struct seq_file *m, void *v)
+ {
+-	return psi_show(m, &psi_system, PSI_IO);
++	int ret = uts_resources_proc(m, UR_PROC_PSI_IO);
++
++	return ret ? (ret < 0 ? ret : 0) : psi_show(m, &psi_system, PSI_IO);
+ }
+ 
+ static int psi_memory_show(struct seq_file *m, void *v)
+ {
+-	return psi_show(m, &psi_system, PSI_MEM);
++	int ret = uts_resources_proc(m, UR_PROC_PSI_MEM);
++
++	return ret ? (ret < 0 ? ret : 0) : psi_show(m, &psi_system, PSI_MEM);
+ }
+ 
+ static int psi_cpu_show(struct seq_file *m, void *v)
+ {
+-	return psi_show(m, &psi_system, PSI_CPU);
++	int ret = uts_resources_proc(m, UR_PROC_PSI_CPU);
++
++	return ret ? (ret < 0 ? ret : 0) : psi_show(m, &psi_system, PSI_CPU);
+ }
+ 
+ static int psi_io_open(struct inode *inode, struct file *file)
+@@ -1598,6 +1627,11 @@ static ssize_t psi_write(struct file *file, const char __user *user_buf,
+ 		return -EBUSY;
+ 	}
+ 
++	if (uts_resources_active()) {
++		mutex_unlock(&seq->lock);
++		return -EOPNOTSUPP;
++	}
++
+ 	new = psi_trigger_create(&psi_system, buf, res, file, NULL,
+ 				 &need_rtpoll_worker);
+ 	if (IS_ERR(new)) {
+diff --git a/kernel/sys.c b/kernel/sys.c
+index fc88230dc..631cc05ad 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -9,6 +9,7 @@
+ #include <linux/mm.h>
+ #include <linux/mm_inline.h>
+ #include <linux/utsname.h>
++#include <linux/uts_resources.h>
+ #include <linux/mman.h>
+ #include <linux/reboot.h>
+ #include <linux/prctl.h>
+@@ -2936,6 +2937,11 @@ static int do_sysinfo(struct sysinfo *info)
+ 	unsigned int mem_unit, bitcount;
+ 	struct timespec64 tp;
+ 
++	int resource_ret = uts_resources_sysinfo(info);
++
++	if (resource_ret)
++		return resource_ret < 0 ? resource_ret : 0;
++
+ 	memset(info, 0, sizeof(struct sysinfo));
+ 
+ 	ktime_get_boottime_ts64(&tp);
+@@ -2996,8 +3002,10 @@ static int do_sysinfo(struct sysinfo *info)
+ SYSCALL_DEFINE1(sysinfo, struct sysinfo __user *, info)
+ {
+ 	struct sysinfo val;
++	int ret = do_sysinfo(&val);
+ 
+-	do_sysinfo(&val);
++	if (ret)
++		return ret;
+ 
+ 	if (copy_to_user(info, &val, sizeof(struct sysinfo)))
+ 		return -EFAULT;
+@@ -3027,8 +3035,10 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
+ {
+ 	struct sysinfo s;
+ 	struct compat_sysinfo s_32;
++	int ret = do_sysinfo(&s);
+ 
+-	do_sysinfo(&s);
++	if (ret)
++		return ret;
+ 
+ 	/* Check to see if any memory value is too large for 32-bit and scale
+ 	 *  down if needed
+diff --git a/kernel/uts_resources.c b/kernel/uts_resources.c
+new file mode 100644
+index 000000000..2a04b8a3a
+--- /dev/null
++++ b/kernel/uts_resources.c
+@@ -0,0 +1,519 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/blk-cgroup.h>
++#include <linux/cgroup.h>
++#include <linux/psi.h>
++#include <linux/cpuset.h>
++#include <linux/cred.h>
++#include <linux/ktime.h>
++#include <linux/memcontrol.h>
++#include <linux/mm.h>
++#include <linux/nsproxy.h>
++#include <linux/pid_namespace.h>
++#include <linux/refcount.h>
++#include <linux/sched/loadavg.h>
++#include <linux/sched/cputime.h>
++#include <linux/sched/signal.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/swap.h>
++#include <linux/sysinfo.h>
++#include <linux/uaccess.h>
++#include <linux/user_namespace.h>
++#include <linux/uts_namespace.h>
++#include <linux/uts_resources.h>
++#include <linux/utsname.h>
++
++struct uts_resource_view {
++	refcount_t refs;
++	struct mutex lock;
++	struct cgroup *root;
++	struct uts_resource_info binding;
++	u64 load_sample;
++	unsigned long loads[3];
++	unsigned long previous_active;
++};
++
++static struct uts_resource_view *current_resource_view(void)
++{
++	/* Pair with the host's one-time publication of fully initialized fields. */
++	return smp_load_acquire(&current->nsproxy->uts_ns->resources);
++}
++
++static bool resource_admin(void)
++{
++	return current_user_ns() == &init_user_ns &&
++		task_active_pid_ns(current) == &init_pid_ns && capable(CAP_SYS_ADMIN);
++}
++
++void uts_resources_copy(struct uts_namespace *ns, struct uts_namespace *old)
++{
++	ns->resources = old->resources;
++	if (ns->resources)
++		refcount_inc(&ns->resources->refs);
++}
++
++void uts_resources_put(struct uts_namespace *ns)
++{
++	struct uts_resource_view *view = ns->resources;
++
++	if (view && refcount_dec_and_test(&view->refs)) {
++		cgroup_put(view->root);
++		kfree(view);
++	}
++}
++
++bool uts_resources_may_enter(struct uts_namespace *old, struct uts_namespace *new)
++{
++	bool allowed;
++
++	down_read(&uts_sem);
++	allowed = old->resources == new->resources || resource_admin();
++	up_read(&uts_sem);
++	return allowed;
++}
++
++bool uts_resources_active(void)
++{
++	return current_resource_view() != NULL;
++}
++
++int uts_resources_cpu_visible(unsigned int cpu)
++{
++	struct uts_resource_view *view = current_resource_view();
++	cpumask_var_t cpus;
++	bool visible;
++
++	if (!view)
++		return 1;
++	if (css_is_dying(&view->root->self))
++		return -ENODEV;
++	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
++		return -ENOMEM;
++	cpuset_cgroup_cpus(view->root, cpus);
++	visible = cpumask_test_cpu(cpu, cpus);
++	free_cpumask_var(cpus);
++	return visible;
++}
++
++static void field(struct uts_resource_snapshot *s, unsigned int n, u64 value)
++{
++	s->values[n] = value;
++	s->valid |= BIT_ULL(n);
++}
++
++/* Counts charged to this memcg include its descendants, not a calling app leaf. */
++static int memory_snapshot(struct uts_resource_view *view, struct uts_resource_snapshot *s,
++			   struct uts_resource_memory *memory)
++{
++	struct cgroup_subsys_state *css;
++	struct mem_cgroup *memcg, *parent;
++	u64 total, used, swap, swap_used, free, reclaim;
++	const int states[] = {
++		NR_ANON_MAPPED, NR_FILE_PAGES, NR_FILE_MAPPED, NR_SHMEM,
++		NR_FILE_DIRTY, NR_WRITEBACK, NR_INACTIVE_ANON, NR_ACTIVE_ANON,
++		NR_INACTIVE_FILE, NR_ACTIVE_FILE,
++	};
++	unsigned int i;
++
++	css = cgroup_get_e_css(view->root, &memory_cgrp_subsys);
++	if (!css)
++		return -ENODEV;
++	if (css->cgroup != view->root) {
++		css_put(css);
++		return -ENODEV;
++	}
++	memcg = mem_cgroup_from_css(css);
++	mem_cgroup_flush_stats(memcg);
++	total = (u64)totalram_pages() << PAGE_SHIFT;
++	swap = (u64)total_swap_pages << PAGE_SHIFT;
++	for (parent = memcg; parent; parent = parent_mem_cgroup(parent)) {
++		total = min(total, (u64)READ_ONCE(parent->memory.max) << PAGE_SHIFT);
++		swap = min(swap, (u64)READ_ONCE(parent->swap.max) << PAGE_SHIFT);
++	}
++	used = (u64)page_counter_read(&memcg->memory) << PAGE_SHIFT;
++	swap_used = (u64)page_counter_read(&memcg->swap) << PAGE_SHIFT;
++	free = total > used ? total - used : 0;
++	field(s, UR_RAM_TOTAL, total);
++	field(s, UR_RAM_CURRENT, used);
++	field(s, UR_RAM_FREE, free);
++	for (i = 0; i < ARRAY_SIZE(states); i++)
++		field(s, UR_ANON + i, (u64)memcg_page_state(memcg, states[i]) << PAGE_SHIFT);
++	field(s, UR_SLAB_RECLAIMABLE, memcg_page_state(memcg, NR_SLAB_RECLAIMABLE_B));
++	field(s, UR_SLAB_UNRECLAIMABLE, memcg_page_state(memcg, NR_SLAB_UNRECLAIMABLE_B));
++	field(s, UR_KERNEL_STACK, (u64)memcg_page_state(memcg, NR_KERNEL_STACK_KB) * 1024);
++	field(s, UR_PAGETABLES, (u64)memcg_page_state(memcg, NR_PAGETABLE) << PAGE_SHIFT);
++	field(s, UR_SOCK, (u64)memcg_page_state(memcg, MEMCG_SOCK) << PAGE_SHIFT);
++	field(s, UR_SWAP_CACHED, (u64)memcg_page_state(memcg, NR_SWAPCACHE) << PAGE_SHIFT);
++	field(s, UR_SWAP_TOTAL, swap);
++	field(s, UR_SWAP_CURRENT, swap_used);
++	field(s, UR_SWAP_FREE, swap > swap_used ? swap - swap_used : 0);
++	reclaim = s->values[UR_FILE] > s->values[UR_SHMEM] ?
++		s->values[UR_FILE] - s->values[UR_SHMEM] : 0;
++	field(s, UR_RAM_AVAILABLE, min(total, free + reclaim + s->values[UR_SLAB_RECLAIMABLE]));
++	field(s, UR_PGFAULT, memcg_events(memcg, PGFAULT));
++	field(s, UR_PGMAJFAULT, memcg_events(memcg, PGMAJFAULT));
++	field(s, UR_PGSCAN, memcg_events(memcg, PGSCAN_KSWAPD) + memcg_events(memcg, PGSCAN_DIRECT));
++	field(s, UR_PGSTEAL, memcg_events(memcg, PGSTEAL_KSWAPD) + memcg_events(memcg, PGSTEAL_DIRECT));
++	if (memory) {
++		u64 *v = memory->values;
++
++		v[URM_FREE] = free >> PAGE_SHIFT;
++		v[URM_INACTIVE_FILE] = s->values[UR_INACTIVE_FILE] >> PAGE_SHIFT;
++		v[URM_ACTIVE_FILE] = s->values[UR_ACTIVE_FILE] >> PAGE_SHIFT;
++		v[URM_REFAULT_ANON] = memcg_page_state(memcg, WORKINGSET_REFAULT_ANON);
++		v[URM_REFAULT_FILE] = memcg_page_state(memcg, WORKINGSET_REFAULT_FILE);
++		v[URM_SCAN_KSWAPD] = memcg_events(memcg, PGSCAN_KSWAPD);
++		v[URM_SCAN_DIRECT] = memcg_events(memcg, PGSCAN_DIRECT);
++		v[URM_DIRECT_THROTTLE] = memcg_events(memcg, PGSCAN_DIRECT_THROTTLE);
++		v[URM_STEAL_KSWAPD] = memcg_events(memcg, PGSTEAL_KSWAPD);
++		v[URM_STEAL_DIRECT] = memcg_events(memcg, PGSTEAL_DIRECT);
++		v[URM_MANAGED] = total >> PAGE_SHIFT;
++		v[URM_FILE] = s->values[UR_FILE] >> PAGE_SHIFT;
++		v[URM_SHMEM] = s->values[UR_SHMEM] >> PAGE_SHIFT;
++		memory_resource_watermarks(v[URM_MANAGED], &v[URM_MIN]);
++		memory->valid = GENMASK_ULL(15, 0);
++	}
++	css_put(css);
++	return 0;
++}
++
++static void task_snapshot(struct uts_resource_view *view, struct uts_resource_snapshot *s)
++{
++	struct cgroup_subsys_state *css;
++	struct css_task_iter iter;
++	struct task_struct *task;
++	u64 threads = 0, running = 0, blocked = 0;
++	unsigned int state;
++
++	rcu_read_lock();
++	css_for_each_descendant_pre(css, &view->root->self) {
++		if (!css_tryget_online(css))
++			continue;
++		rcu_read_unlock();
++		css_task_iter_start(css, 0, &iter);
++		while ((task = css_task_iter_next(&iter))) {
++			state = READ_ONCE(task->__state);
++			threads++;
++			running += state == TASK_RUNNING;
++			blocked += !!(state & TASK_UNINTERRUPTIBLE);
++		}
++		css_task_iter_end(&iter);
++		rcu_read_lock();
++		css_put(css);
++	}
++	rcu_read_unlock();
++	field(s, UR_THREADS, threads);
++	field(s, UR_RUNNING, running);
++	field(s, UR_UNINTERRUPTIBLE, blocked);
++}
++
++static int resource_snapshot(struct uts_resource_view *view, struct uts_resource_snapshot *s)
++{
++	struct task_cputime cpu;
++	u64 elapsed, unused;
++	unsigned long active, count;
++	cpumask_var_t cpus;
++	int ret, i;
++	static const unsigned long exps[] = { 2014, 2041, 2046 };
++
++	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
++		return -ENOMEM;
++	mutex_lock(&view->lock);
++	if (css_is_dying(&view->root->self)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	memset(s, 0, sizeof(*s));
++	s->abi = 1;
++	s->size = sizeof(*s);
++	s->sample_boottime_ns = ktime_get_boottime_ns();
++	s->cgroup_id = view->binding.cgroup_id;
++	memcpy(s->generation, view->binding.generation, sizeof(s->generation));
++	s->start_boottime_ns = view->binding.start_boottime_ns;
++	ret = memory_snapshot(view, s, NULL);
++	if (ret)
++		goto out;
++	cgroup_resource_cputime(view->root, &cpu);
++	field(s, UR_CPU_USAGE, cpu.sum_exec_runtime);
++	field(s, UR_CPU_USER, cpu.utime);
++	field(s, UR_CPU_SYSTEM, cpu.stime);
++	cpuset_cgroup_cpus(view->root, cpus);
++	field(s, UR_CPUS, cpumask_weight(cpus));
++	task_snapshot(view, s);
++	elapsed = s->sample_boottime_ns - s->start_boottime_ns;
++	field(s, UR_UPTIME, elapsed);
++	unused = elapsed * s->values[UR_CPUS];
++	field(s, UR_IDLE, unused > s->values[UR_CPU_USAGE] ? unused - s->values[UR_CPU_USAGE] : 0);
++	count = div_u64(s->sample_boottime_ns - view->load_sample, NSEC_PER_SEC);
++	if (count) {
++		active = view->previous_active;
++		for (i = 0; i < 3; i++)
++			view->loads[i] = calc_load_n(view->loads[i], exps[i], active, count);
++		view->load_sample += (u64)count * NSEC_PER_SEC;
++	}
++	view->previous_active = (s->values[UR_RUNNING] + s->values[UR_UNINTERRUPTIBLE]) * FIXED_1;
++	for (i = 0; i < 3; i++)
++		field(s, UR_LOAD1 + i, view->loads[i] << (SI_LOAD_SHIFT - FSHIFT));
++#ifdef CONFIG_BLK_CGROUP
++	{
++		u64 io[4];
++
++		if (!blkcg_resource_stats(view->root, io))
++			for (i = 0; i < ARRAY_SIZE(io); i++)
++				field(s, UR_READ_BYTES + i, io[i]);
++	}
++#endif
++#ifdef CONFIG_PSI
++	{
++		u64 totals[3];
++
++		if (!psi_resource_totals(view->root, totals))
++			for (i = 0; i < ARRAY_SIZE(totals); i++)
++				field(s, UR_CPU_PRESSURE + i, totals[i]);
++	}
++#endif
++
++out:
++	mutex_unlock(&view->lock);
++	free_cpumask_var(cpus);
++	return ret;
++}
++
++static int resource_memory_snapshot(struct uts_resource_view *view,
++				    struct uts_resource_memory *memory)
++{
++	struct uts_resource_snapshot primary = {};
++	int ret;
++
++	mutex_lock(&view->lock);
++	if (css_is_dying(&view->root->self)) {
++		ret = -ENODEV;
++		goto out;
++	}
++	memset(memory, 0, sizeof(*memory));
++	memory->abi = 1;
++	memory->size = sizeof(*memory);
++	memory->sample_boottime_ns = ktime_get_boottime_ns();
++	memory->cgroup_id = view->binding.cgroup_id;
++	memcpy(memory->generation, view->binding.generation, sizeof(memory->generation));
++	memory->start_boottime_ns = view->binding.start_boottime_ns;
++	ret = memory_snapshot(view, &primary, memory);
++out:
++	mutex_unlock(&view->lock);
++	return ret;
++}
++
++long uts_resources_ioctl(struct uts_namespace *ns, unsigned int cmd, unsigned long arg)
++{
++	void __user *argp = (void __user *)arg;
++	struct uts_resource_view *view;
++	struct uts_resource_binding binding;
++	struct uts_resource_info info = { .abi = 1 };
++	struct uts_resource_snapshot *snapshot;
++	struct cgroup *cgroup;
++	long ret;
++
++	if (cmd == NS_UTS_BIND_RESOURCES) {
++		if (!resource_admin() || ns == &init_uts_ns)
++			return -EPERM;
++		if (copy_from_user(&binding, argp, sizeof(binding)))
++			return -EFAULT;
++		if (binding.abi != 1 || binding.flags || binding.reserved0 || binding.reserved1 ||
++		    !binding.start_boottime_ns || binding.start_boottime_ns > ktime_get_boottime_ns() ||
++		    !(binding.generation[0] | binding.generation[1]))
++			return -EINVAL;
++		cgroup = cgroup_get_from_fd(binding.cgroup_fd);
++		if (IS_ERR(cgroup))
++			return PTR_ERR(cgroup);
++		if (!cgroup_parent(cgroup) || cgroup->root != &cgrp_dfl_root || css_is_dying(&cgroup->self)) {
++			cgroup_put(cgroup);
++			return -EINVAL;
++		}
++		view = kzalloc(sizeof(*view), GFP_KERNEL);
++		if (!view) {
++			cgroup_put(cgroup);
++			return -ENOMEM;
++		}
++		refcount_set(&view->refs, 1);
++		mutex_init(&view->lock);
++		view->root = cgroup;
++		view->binding.abi = 1;
++		view->binding.flags = 1;
++		view->binding.cgroup_id = cgroup_id(cgroup);
++		memcpy(view->binding.generation, binding.generation, sizeof(binding.generation));
++		view->binding.start_boottime_ns = binding.start_boottime_ns;
++		view->load_sample = binding.start_boottime_ns;
++		down_write(&uts_sem);
++		ret = ns->resources ? -EBUSY : 0;
++		if (!ret)
++			/* Publish immutable binding fields to the lockless readers. */
++			smp_store_release(&ns->resources, view);
++		up_write(&uts_sem);
++		if (ret) {
++			cgroup_put(cgroup);
++			kfree(view);
++		}
++		return ret;
++	}
++	down_read(&uts_sem);
++	view = ns->resources;
++	if (!resource_admin() && current->nsproxy->uts_ns->resources != view) {
++		up_read(&uts_sem);
++		return -EPERM;
++	}
++	if (cmd == NS_UTS_GET_RESOURCE_BINDING) {
++		if (view)
++			info = view->binding;
++		up_read(&uts_sem);
++		return copy_to_user(argp, &info, sizeof(info)) ? -EFAULT : 0;
++	}
++	up_read(&uts_sem);
++	if (!view)
++		return -ENODATA;
++	if (cmd == NS_UTS_GET_RESOURCE_MEMORY) {
++		struct uts_resource_memory memory;
++
++		ret = resource_memory_snapshot(view, &memory);
++		if (!ret && copy_to_user(argp, &memory, sizeof(memory)))
++			ret = -EFAULT;
++		return ret;
++	}
++	snapshot = kmalloc(sizeof(*snapshot), GFP_KERNEL);
++	if (!snapshot)
++		return -ENOMEM;
++	ret = resource_snapshot(view, snapshot);
++	if (!ret && copy_to_user(argp, snapshot, sizeof(*snapshot)))
++		ret = -EFAULT;
++	kfree(snapshot);
++	return ret;
++}
++
++int uts_resources_sysinfo(struct sysinfo *info)
++{
++	struct uts_resource_view *view = current_resource_view();
++	struct uts_resource_snapshot s;
++	int ret;
++
++	if (!view)
++		return 0;
++	ret = resource_snapshot(view, &s);
++	if (ret)
++		return ret;
++	memset(info, 0, sizeof(*info));
++	info->mem_unit = PAGE_SIZE;
++	info->totalram = s.values[UR_RAM_TOTAL] >> PAGE_SHIFT;
++	info->freeram = s.values[UR_RAM_FREE] >> PAGE_SHIFT;
++	info->sharedram = s.values[UR_SHMEM] >> PAGE_SHIFT;
++	info->totalswap = s.values[UR_SWAP_TOTAL] >> PAGE_SHIFT;
++	info->freeswap = s.values[UR_SWAP_FREE] >> PAGE_SHIFT;
++	info->uptime = DIV_ROUND_UP_ULL(s.values[UR_UPTIME], NSEC_PER_SEC);
++	info->procs = min_t(u64, s.values[UR_THREADS], USHRT_MAX);
++	info->loads[0] = s.values[UR_LOAD1];
++	info->loads[1] = s.values[UR_LOAD5];
++	info->loads[2] = s.values[UR_LOAD15];
++	return 1;
++}
++
++int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which)
++{
++	struct uts_resource_view *view = current_resource_view();
++	struct uts_resource_snapshot s;
++	const u64 *v = s.values;
++	int ret;
++	static const struct { const char *name; unsigned int n; } memory[] = {
++		{ "MemTotal", UR_RAM_TOTAL }, { "MemFree", UR_RAM_FREE },
++		{ "MemAvailable", UR_RAM_AVAILABLE }, { "Cached", UR_FILE },
++		{ "SwapCached", UR_SWAP_CACHED }, { "AnonPages", UR_ANON },
++		{ "Mapped", UR_FILE_MAPPED }, { "Shmem", UR_SHMEM },
++		{ "Active(anon)", UR_ACTIVE_ANON }, { "Inactive(anon)", UR_INACTIVE_ANON },
++		{ "Active(file)", UR_ACTIVE_FILE }, { "Inactive(file)", UR_INACTIVE_FILE },
++		{ "SwapTotal", UR_SWAP_TOTAL }, { "SwapFree", UR_SWAP_FREE },
++		{ "Dirty", UR_DIRTY }, { "Writeback", UR_WRITEBACK },
++		{ "SReclaimable", UR_SLAB_RECLAIMABLE }, { "SUnreclaim", UR_SLAB_UNRECLAIMABLE },
++		{ "KernelStack", UR_KERNEL_STACK }, { "PageTables", UR_PAGETABLES },
++	};
++	int i;
++
++	if (!view)
++		return 0;
++	#ifdef CONFIG_PSI
++	if (which >= UR_PROC_PSI_CPU && which <= UR_PROC_PSI_IO) {
++		static const enum psi_res resources[] = { PSI_CPU, PSI_MEM, PSI_IO };
++		struct psi_group *group = cgroup_psi(view->root);
++
++		if (css_is_dying(&view->root->self) || !group || !group->enabled)
++			return -ENODEV;
++		ret = psi_show(m, group, resources[which - UR_PROC_PSI_CPU]);
++		return ret ? ret : 1;
++	}
++#endif
++	if (which == UR_PROC_VMSTAT || which == UR_PROC_ZONEINFO) {
++		struct uts_resource_memory memory;
++		const u64 *values = memory.values;
++
++		ret = resource_memory_snapshot(view, &memory);
++		if (ret)
++			return ret;
++		if (which == UR_PROC_ZONEINFO) {
++			seq_printf(m, "Node 0, zone Normal\n  per-node stats\n"
++				   "      nr_inactive_file %llu\n      nr_active_file %llu\n"
++				   "  pages free %llu\n        nr_free_pages %llu\n"
++				   "        min %llu\n        low %llu\n        high %llu\n"
++				   "        spanned %llu\n        present %llu\n        managed %llu\n"
++				   "        nr_free_cma 0\n        protection: (0)\n  pagesets\n",
++				   values[URM_INACTIVE_FILE], values[URM_ACTIVE_FILE],
++				   values[URM_FREE], values[URM_FREE],
++				   values[URM_MIN], values[URM_LOW], values[URM_HIGH],
++				   values[URM_MANAGED], values[URM_MANAGED], values[URM_MANAGED]);
++			return 1;
++		}
++		seq_printf(m, "nr_free_pages %llu\nnr_inactive_file %llu\nnr_active_file %llu\n"
++			   "nr_file_pages %llu\nnr_shmem %llu\nworkingset_refault %llu\n"
++			   "workingset_refault_anon %llu\nworkingset_refault_file %llu\n"
++			   "pgscan_kswapd %llu\npgscan_direct %llu\npgscan_direct_throttle %llu\n"
++			   "pgsteal_kswapd %llu\npgsteal_direct %llu\n",
++			   values[URM_FREE], values[URM_INACTIVE_FILE], values[URM_ACTIVE_FILE],
++			   values[URM_FILE], values[URM_SHMEM],
++			   values[URM_REFAULT_ANON] + values[URM_REFAULT_FILE],
++			   values[URM_REFAULT_ANON], values[URM_REFAULT_FILE],
++			   values[URM_SCAN_KSWAPD], values[URM_SCAN_DIRECT], values[URM_DIRECT_THROTTLE],
++			   values[URM_STEAL_KSWAPD], values[URM_STEAL_DIRECT]);
++	}
++	ret = resource_snapshot(view, &s);
++	if (ret)
++		return ret;
++	switch (which) {
++	case UR_PROC_MEMINFO:
++		for (i = 0; i < ARRAY_SIZE(memory); i++)
++			seq_printf(m, "%s: %8llu kB\n", memory[i].name, v[memory[i].n] / 1024);
++		seq_printf(m, "Buffers: %8u kB\nSlab: %8llu kB\nActive: %8llu kB\nInactive: %8llu kB\n",
++			0, (v[UR_SLAB_RECLAIMABLE] + v[UR_SLAB_UNRECLAIMABLE]) / 1024,
++			(v[UR_ACTIVE_ANON] + v[UR_ACTIVE_FILE]) / 1024,
++			(v[UR_INACTIVE_ANON] + v[UR_INACTIVE_FILE]) / 1024);
++		break;
++	case UR_PROC_STAT:
++		seq_printf(m, "cpu  %llu 0 %llu %llu 0 0 0 0 0 0\nprocs_running %llu\nprocs_blocked %llu\n",
++			nsec_to_clock_t(v[UR_CPU_USER]), nsec_to_clock_t(v[UR_CPU_SYSTEM]),
++			nsec_to_clock_t(v[UR_IDLE]), v[UR_RUNNING], v[UR_UNINTERRUPTIBLE]);
++		break;
++	case UR_PROC_UPTIME:
++		seq_printf(m, "%llu.%02llu %llu.%02llu\n",
++			v[UR_UPTIME] / NSEC_PER_SEC, (v[UR_UPTIME] % NSEC_PER_SEC) / (NSEC_PER_SEC / 100),
++			v[UR_IDLE] / NSEC_PER_SEC, (v[UR_IDLE] % NSEC_PER_SEC) / (NSEC_PER_SEC / 100));
++		break;
++	case UR_PROC_VMSTAT:
++		seq_printf(m, "pgfault %llu\npgmajfault %llu\npgscan %llu\npgsteal %llu\n",
++			v[UR_PGFAULT], v[UR_PGMAJFAULT], v[UR_PGSCAN], v[UR_PGSTEAL]);
++		break;
++	case UR_PROC_LOADAVG:
++		for (i = UR_LOAD1; i <= UR_LOAD15; i++)
++			seq_printf(m, "%llu.%02llu ", v[i] >> SI_LOAD_SHIFT,
++				((v[i] & ((1 << SI_LOAD_SHIFT) - 1)) * 100) >> SI_LOAD_SHIFT);
++		seq_printf(m, "%llu/%llu %d\n", v[UR_RUNNING], v[UR_THREADS],
++			idr_get_cursor(&task_active_pid_ns(current)->idr) - 1);
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++	return 1;
++}
+diff --git a/kernel/utsname.c b/kernel/utsname.c
+index 9638a908c..28d2b8dbf 100644
+--- a/kernel/utsname.c
++++ b/kernel/utsname.c
+@@ -8,6 +8,7 @@
+ #include <linux/export.h>
+ #include <linux/uts.h>
+ #include <linux/utsname.h>
++#include <linux/uts_resources.h>
+ #include <linux/err.h>
+ #include <linux/slab.h>
+ #include <linux/cred.h>
+@@ -65,6 +66,7 @@ static struct uts_namespace *clone_uts_ns(struct user_namespace *user_ns,
+ #ifdef CONFIG_UTS_NS_IDENTITY
+ 	ns->identity_id = old_ns->identity_id;
+ #endif
++	uts_resources_copy(ns, old_ns);
+ 	ns->user_ns = get_user_ns(user_ns);
+ 	up_read(&uts_sem);
+ 	ns_tree_add(ns);
+@@ -103,6 +105,7 @@ struct uts_namespace *copy_utsname(u64 flags,
+ 
+ void free_uts_ns(struct uts_namespace *ns)
+ {
++	uts_resources_put(ns);
+ 	ns_tree_remove(ns);
+ 	dec_uts_namespaces(ns->ucounts);
+ 	put_user_ns(ns->user_ns);
+@@ -237,6 +240,9 @@ static int utsns_install(struct nsset *nsset, struct ns_common *new)
+ 	}
+ #endif
+ 
++	if (!uts_resources_may_enter(nsproxy->uts_ns, ns))
++		return -EPERM;
++
+ 	get_uts_ns(ns);
+ 	put_uts_ns(nsproxy->uts_ns);
+ 	nsproxy->uts_ns = ns;
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index a4a3da6f2..113154190 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -442,6 +442,7 @@ static const unsigned int memcg_vm_event_stat[] = {
+ 	PSWPOUT,
+ 	PGSCAN_KSWAPD,
+ 	PGSCAN_DIRECT,
++	PGSCAN_DIRECT_THROTTLE,
+ 	PGSCAN_KHUGEPAGED,
+ 	PGSCAN_PROACTIVE,
+ 	PGSTEAL_KSWAPD,
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index ec5ca89cb..b3c061cfc 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -48,6 +48,7 @@
+ #include <linux/page_owner.h>
+ #include <linux/page_table_check.h>
+ #include <linux/memcontrol.h>
++#include <linux/uts_resources.h>
+ #include <linux/ftrace.h>
+ #include <linux/lockdep.h>
+ #include <linux/psi.h>
+@@ -6599,6 +6600,23 @@ int __meminit init_per_zone_wmark_min(void)
+ }
+ postcore_initcall(init_per_zone_wmark_min)
+ 
++#ifdef CONFIG_UTS_NS_RESOURCES
++/* Model one Normal zone using the instance capacity and the allocator policy. */
++void memory_resource_watermarks(u64 managed, u64 watermarks[3])
++{
++	u64 minimum, distance;
++
++	minimum = clamp_t(u64, int_sqrt64((managed << (PAGE_SHIFT - 10)) * 16),
++			  128, 262144) >> (PAGE_SHIFT - 10);
++	minimum = min(minimum, managed);
++	distance = max(minimum >> 2,
++		       mult_frac(managed, READ_ONCE(watermark_scale_factor), 10000));
++	watermarks[0] = minimum;
++	watermarks[1] = min(managed, minimum + distance);
++	watermarks[2] = min(managed, watermarks[1] + distance);
++}
++#endif
++
+ /*
+  * min_free_kbytes_sysctl_handler - just a wrapper around proc_dointvec() so
+  *	that we can call two helper functions whenever min_free_kbytes
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index edd49796b..5e63f7be2 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -5,6 +5,7 @@
+  * (C) 2012 Christoph Lameter <cl@gentwo.org>
+  */
+ #include <linux/slab.h>
++#include <linux/uts_resources.h>
+ 
+ #include <linux/mm.h>
+ #include <linux/poison.h>
+@@ -1172,6 +1173,8 @@ static int slab_show(struct seq_file *m, void *p)
+ 
+ 	if (p == slab_caches.next)
+ 		print_slabinfo_header(m);
++	if (uts_resources_active())
++		return 0;
+ 	cache_show(s, m);
+ 	return 0;
+ }
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index cf33c3b2c..1ed40f540 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -15,6 +15,7 @@
+ #include <linux/slab.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/swap.h>
++#include <linux/uts_resources.h>
+ #include <linux/vmalloc.h>
+ #include <linux/pagemap.h>
+ #include <linux/namei.h>
+@@ -3064,6 +3065,8 @@ static void *swap_start(struct seq_file *swap, loff_t *pos)
+ 
+ 	if (!l)
+ 		return SEQ_START_TOKEN;
++	if (uts_resources_active())
++		return NULL;
+ 
+ 	for (type = 0; (si = swap_type_to_info(type)); type++) {
+ 		if (!(si->flags & SWP_USED) || !si->swap_map)
+@@ -3086,6 +3089,8 @@ static void *swap_next(struct seq_file *swap, void *v, loff_t *pos)
+ 		type = si->type + 1;
+ 
+ 	++(*pos);
++	if (uts_resources_active())
++		return NULL;
+ 	for (; (si = swap_type_to_info(type)); type++) {
+ 		if (!(si->flags & SWP_USED) || !si->swap_map)
+ 			continue;
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 2c66fbcd6..a12d87088 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -6563,6 +6563,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
+ 
+ 	/* Account for the throttling */
+ 	count_vm_event(PGSCAN_DIRECT_THROTTLE);
++	count_memcg_event_mm(current->mm, PGSCAN_DIRECT_THROTTLE);
+ 
+ 	/*
+ 	 * If the caller cannot enter the filesystem, it's possible that it
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 98855f312..da0216c8c 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -18,6 +18,7 @@
+ #include <linux/cpu.h>
+ #include <linux/cpumask.h>
+ #include <linux/vmstat.h>
++#include <linux/uts_resources.h>
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+ #include <linux/debugfs.h>
+@@ -1510,6 +1511,9 @@ static void *frag_start(struct seq_file *m, loff_t *pos)
+ 	pg_data_t *pgdat;
+ 	loff_t node = *pos;
+ 
++	if (uts_resources_active())
++		return NULL;
++
+ 	for (pgdat = first_online_pgdat();
+ 	     pgdat && node;
+ 	     pgdat = next_online_pgdat(pgdat))
+@@ -1861,17 +1865,38 @@ static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
+  * set of all zones and userspace would not be aware of such zones if they are
+  * suppressed here (zoneinfo displays the effect of lowmem_reserve_ratio).
+  */
++static void *zoneinfo_start(struct seq_file *m, loff_t *pos)
++{
++	if (uts_resources_active())
++		return *pos ? NULL : SEQ_START_TOKEN;
++	return frag_start(m, pos);
++}
++
++static void *zoneinfo_next(struct seq_file *m, void *arg, loff_t *pos)
++{
++	if (uts_resources_active()) {
++		++*pos;
++		return NULL;
++	}
++	return frag_next(m, arg, pos);
++}
++
+ static int zoneinfo_show(struct seq_file *m, void *arg)
+ {
+ 	pg_data_t *pgdat = (pg_data_t *)arg;
++
++	if (uts_resources_active()) {
++		int ret = uts_resources_proc(m, UR_PROC_ZONEINFO);
++
++		return ret < 0 ? ret : 0;
++	}
+ 	walk_zones_in_node(m, pgdat, false, false, zoneinfo_show_print);
+ 	return 0;
+ }
+ 
+ static const struct seq_operations zoneinfo_op = {
+-	.start	= frag_start, /* iterate over all zones. The same as in
+-			       * fragmentation. */
+-	.next	= frag_next,
++	.start	= zoneinfo_start,
++	.next	= zoneinfo_next,
+ 	.stop	= frag_stop,
+ 	.show	= zoneinfo_show,
+ };
+@@ -1888,6 +1913,8 @@ static void *vmstat_start(struct seq_file *m, loff_t *pos)
+ 	unsigned long *v;
+ 	int i;
+ 
++	if (uts_resources_active())
++		return *pos ? NULL : SEQ_START_TOKEN;
+ 	if (*pos >= NR_VMSTAT_ITEMS)
+ 		return NULL;
+ 
+@@ -1931,6 +1958,8 @@ static void *vmstat_start(struct seq_file *m, loff_t *pos)
+ static void *vmstat_next(struct seq_file *m, void *arg, loff_t *pos)
+ {
+ 	(*pos)++;
++	if (uts_resources_active())
++		return NULL;
+ 	if (*pos >= NR_VMSTAT_ITEMS)
+ 		return NULL;
+ 	return (unsigned long *)m->private + *pos;
+@@ -1939,7 +1968,14 @@ static void *vmstat_next(struct seq_file *m, void *arg, loff_t *pos)
+ static int vmstat_show(struct seq_file *m, void *arg)
+ {
+ 	unsigned long *l = arg;
+-	unsigned long off = l - (unsigned long *)m->private;
++	unsigned long off;
++
++	if (uts_resources_active()) {
++		int ret = uts_resources_proc(m, UR_PROC_VMSTAT);
++
++		return ret < 0 ? ret : 0;
++	}
++	off = l - (unsigned long *)m->private;
+ 
+ 	seq_puts(m, vmstat_text[off]);
+ 	seq_put_decimal_ull(m, " ", *l);
+diff --git a/tools/testing/selftests/Makefile b/tools/testing/selftests/Makefile
+index dbf81e9a7..b3b978d7f 100644
+--- a/tools/testing/selftests/Makefile
++++ b/tools/testing/selftests/Makefile
+@@ -122,6 +122,7 @@ TARGETS += tpm2
+ TARGETS += tty
+ TARGETS += ublk
+ TARGETS += uevent
++TARGETS += uts_resources
+ TARGETS += user_events
+ TARGETS += vDSO
+ TARGETS += mm
+diff --git a/tools/testing/selftests/uts_resources/Makefile b/tools/testing/selftests/uts_resources/Makefile
+new file mode 100644
+index 000000000..bb26b142d
+--- /dev/null
++++ b/tools/testing/selftests/uts_resources/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++CFLAGS += -O2 -Wall -Wextra
++TEST_GEN_PROGS := uts_resources
++include ../lib.mk
+diff --git a/tools/testing/selftests/uts_resources/uts_resources.c b/tools/testing/selftests/uts_resources/uts_resources.c
+new file mode 100644
+index 000000000..e1f3ed16f
+--- /dev/null
++++ b/tools/testing/selftests/uts_resources/uts_resources.c
+@@ -0,0 +1,203 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/nsfs.h>
++#include <sched.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <sys/sysinfo.h>
++#include <sys/wait.h>
++#include <time.h>
++#include <unistd.h>
++
++_Static_assert(sizeof(struct uts_resource_binding) == 48, "binding ABI");
++_Static_assert(sizeof(struct uts_resource_info) == 48, "info ABI");
++_Static_assert(sizeof(struct uts_resource_snapshot) == 512, "snapshot ABI");
++
++static pid_t owner_pid, child_pid;
++static char cleanup_root[256], cleanup_leaf[280];
++
++static void cleanup(void)
++{
++	if (getpid() != owner_pid)
++		return;
++	if (child_pid > 0) {
++		kill(child_pid, SIGKILL);
++		waitpid(child_pid, NULL, 0);
++	}
++	if (*cleanup_leaf)
++		rmdir(cleanup_leaf);
++	if (*cleanup_root)
++		rmdir(cleanup_root);
++}
++
++#define CHECK(test) do { \
++	if (!(test)) { \
++		fprintf(stderr, "FAIL line %d: %s (%s)\n", __LINE__, #test, strerror(errno)); \
++		exit(1); \
++	} \
++} while (0)
++
++static void put(const char *path, const char *value)
++{
++	int fd = open(path, O_WRONLY | O_CLOEXEC);
++
++	CHECK(fd >= 0);
++	CHECK(write(fd, value, strlen(value)) == (ssize_t)strlen(value));
++	CHECK(!close(fd));
++}
++
++static void check_file(const char *path, const char *required, const char *forbidden)
++{
++	char data[16384];
++	int fd = open(path, O_RDONLY | O_CLOEXEC);
++	ssize_t size;
++
++	CHECK(fd >= 0);
++	size = read(fd, data, sizeof(data) - 1);
++	CHECK(size >= 0);
++	data[size] = 0;
++	if (required)
++		CHECK(strstr(data, required));
++	if (forbidden)
++		CHECK(!strstr(data, forbidden));
++	CHECK(!close(fd));
++}
++
++int main(int argc, char **argv)
++{
++	struct uts_resource_binding binding = { .abi = 1, .generation = { 1, 2 } };
++	struct uts_resource_info info;
++	struct uts_resource_snapshot snapshot;
++	struct uts_resource_memory memory;
++	struct sysinfo host, instance;
++	struct timespec now;
++	struct stat statbuf;
++	char root[256], leaf[280], path[320], text[64], byte;
++	int hostns, ns, cg, status, ready[2], finish[2];
++	pid_t child;
++
++	owner_pid = getpid();
++	CHECK(!atexit(cleanup));
++	CHECK(!syscall(SYS_sysinfo, &host));
++	hostns = open("/proc/self/ns/uts", O_RDONLY | O_CLOEXEC);
++	CHECK(hostns >= 0);
++	CHECK(!ioctl(hostns, NS_UTS_GET_RESOURCE_BINDING, &info));
++	CHECK(info.abi == 1 && !info.flags);
++	CHECK(!clock_gettime(CLOCK_BOOTTIME, &now));
++	binding.start_boottime_ns = (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
++	snprintf(root, sizeof(root), "/sys/fs/cgroup/uts-resource-test-%d", getpid());
++	CHECK(!mkdir(root, 0700));
++	strcpy(cleanup_root, root);
++	cg = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++	CHECK(cg >= 0 && !fstat(cg, &statbuf));
++	binding.cgroup_fd = cg;
++	CHECK(ioctl(hostns, NS_UTS_BIND_RESOURCES, &binding) == -1 && errno == EPERM);
++	snprintf(path, sizeof(path), "%s/memory.max", root);
++	put(path, "67108864");
++	snprintf(path, sizeof(path), "%s/memory.swap.max", root);
++	put(path, "33554432");
++	snprintf(path, sizeof(path), "%s/cgroup.subtree_control", root);
++	put(path, "+memory +cpu +cpuset +pids +io");
++	snprintf(leaf, sizeof(leaf), "%s/work", root);
++	CHECK(!mkdir(leaf, 0700));
++	strcpy(cleanup_leaf, leaf);
++	CHECK(!unshare(CLONE_NEWUTS));
++	ns = open("/proc/self/ns/uts", O_RDONLY | O_CLOEXEC);
++	CHECK(ns >= 0);
++	binding.flags = 2;
++	CHECK(ioctl(ns, NS_UTS_BIND_RESOURCES, &binding) == -1 && errno == EINVAL);
++	binding.flags = 0;
++	CHECK(!ioctl(ns, NS_UTS_BIND_RESOURCES, &binding));
++	CHECK(ioctl(ns, NS_UTS_BIND_RESOURCES, &binding) == -1 && errno == EBUSY);
++	CHECK(!ioctl(ns, NS_UTS_GET_RESOURCE_BINDING, &info));
++	CHECK(info.abi == 1 && info.flags == 1 && info.cgroup_id == statbuf.st_ino);
++	CHECK(info.generation[0] == 1 && info.generation[1] == 2);
++	CHECK(!pipe(ready) && !pipe(finish));
++	child = fork();
++	CHECK(child >= 0);
++	if (child > 0)
++		child_pid = child;
++	if (!child) {
++		/* Keep page touches observable so optimized tests still charge memory. */
++		volatile char *memory;
++		unsigned int i;
++
++		snprintf(path, sizeof(path), "%s/cgroup.procs", leaf);
++		snprintf(text, sizeof(text), "%d", getpid());
++		put(path, text);
++		memory = malloc(8 * 1024 * 1024);
++		CHECK(memory);
++		for (i = 0; i < 8 * 1024 * 1024; i++)
++			memory[i] = (char)i;
++		CHECK(write(ready[1], "x", 1) == 1);
++		CHECK(read(finish[0], &byte, 1) == 1);
++		_exit(0);
++	}
++	CHECK(read(ready[0], &byte, 1) == 1);
++	CHECK(!ioctl(ns, NS_UTS_GET_RESOURCE_SNAPSHOT, &snapshot));
++	CHECK(snapshot.abi == 1 && snapshot.size == 512 && snapshot.cgroup_id == info.cgroup_id);
++	CHECK(snapshot.values[UR_RAM_TOTAL] == 67108864);
++	CHECK(!ioctl(ns, NS_UTS_GET_RESOURCE_MEMORY, &memory));
++	CHECK(memory.abi == 1 && memory.size == 256 && memory.valid == 0xffff);
++	CHECK(memory.cgroup_id == info.cgroup_id && memory.values[URM_MANAGED] == 67108864ULL / (uint64_t)sysconf(_SC_PAGESIZE));
++	CHECK(memory.values[URM_MIN] <= memory.values[URM_LOW] &&
++	      memory.values[URM_LOW] <= memory.values[URM_HIGH]);
++	CHECK(snapshot.values[UR_RAM_CURRENT] >= 8 * 1024 * 1024);
++	CHECK(snapshot.values[UR_THREADS] >= 1 && snapshot.values[UR_CPUS] >= 1);
++	CHECK(snapshot.valid & (1ULL << UR_CPU_USAGE));
++	CHECK(!syscall(SYS_sysinfo, &instance));
++	CHECK((uint64_t)instance.totalram * instance.mem_unit == 67108864);
++	CHECK(instance.freeram <= instance.totalram && instance.bufferram == 0);
++	check_file("/proc/meminfo", "MemTotal:    65536 kB", NULL);
++	check_file("/proc/cpuinfo", "processor", "CPU implementer");
++	check_file("/proc/vmstat", "nr_free_pages ", NULL);
++	check_file("/proc/interrupts", NULL, "CPU");
++	check_file("/proc/zoneinfo", "Node 0, zone Normal", NULL);
++	check_file("/proc/buddyinfo", NULL, "Node");
++	check_file("/proc/swaps", "Filename", "/dev/");
++	if (argc > 1) {
++		pid_t compat = fork();
++
++		CHECK(compat >= 0);
++		if (!compat) {
++			execl(argv[1], argv[1], NULL);
++			_exit(127);
++		}
++		CHECK(waitpid(compat, &status, 0) == compat && WIFEXITED(status) && !WEXITSTATUS(status));
++	}
++	/* A guest root with CAP_SYS_ADMIN is still outside the initial PID namespace. */
++	CHECK(!unshare(CLONE_NEWPID));
++	{
++		pid_t guest = fork();
++
++		CHECK(guest >= 0);
++		if (!guest) {
++			CHECK(ioctl(ns, NS_UTS_BIND_RESOURCES, &binding) == -1 && errno == EPERM);
++			CHECK(setns(hostns, CLONE_NEWUTS) == -1 && errno == EPERM);
++			CHECK(!unshare(CLONE_NEWUTS));
++			CHECK(!syscall(SYS_sysinfo, &instance));
++			CHECK((uint64_t)instance.totalram * instance.mem_unit == 67108864);
++			_exit(0);
++		}
++		CHECK(waitpid(guest, &status, 0) == guest && WIFEXITED(status) && !WEXITSTATUS(status));
++	}
++	CHECK(write(finish[1], "x", 1) == 1);
++	CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
++	child_pid = 0;
++	CHECK(!rmdir(leaf) && !rmdir(root));
++	CHECK(ioctl(ns, NS_UTS_GET_RESOURCE_SNAPSHOT, &snapshot) == -1 && errno == ENODEV);
++	CHECK(syscall(SYS_sysinfo, &instance) == -1 && errno == ENODEV);
++	CHECK(!setns(hostns, CLONE_NEWUTS));
++	CHECK(!syscall(SYS_sysinfo, &instance));
++	CHECK(instance.totalram == host.totalram && instance.mem_unit == host.mem_unit);
++	puts("PASS: resource ABI, descendant accounting, raw sysinfo/proc, guest root permissions, inheritance and offline failure");
++	return 0;
++}

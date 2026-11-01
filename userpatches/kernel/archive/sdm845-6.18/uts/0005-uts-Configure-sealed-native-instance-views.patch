@@ -1,0 +1,900 @@
+From 2c6a002a510c629275d572b4a1b721ac3a90de45 Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Sun, 1 Nov 2026 23:34:17 +0800
+Subject: [PATCH] uts: Configure sealed native instance views
+
+---
+ fs/nsfs.c                      |  12 ++
+ include/linux/pid_namespace.h  |   4 +
+ include/linux/time_namespace.h |   5 +
+ include/linux/uts_resources.h  |  13 ++
+ include/linux/uts_views.h      |  74 +++++++++
+ include/uapi/linux/nsfs.h      |  45 +++++
+ kernel/Makefile                |   1 +
+ kernel/pid_namespace.c         |  16 ++
+ kernel/time/namespace.c        |  18 +-
+ kernel/uts_resources.c         |  72 ++++++--
+ kernel/uts_views.c             | 294 +++++++++++++++++++++++++++++++++
+ 11 files changed, 540 insertions(+), 14 deletions(-)
+ create mode 100644 include/linux/uts_views.h
+ create mode 100644 kernel/uts_views.c
+
+diff --git a/fs/nsfs.c b/fs/nsfs.c
+index f56a89157..fe4d645f9 100644
+--- a/fs/nsfs.c
++++ b/fs/nsfs.c
+@@ -17,6 +17,7 @@
+ #include <linux/time_namespace.h>
+ #include <linux/utsname.h>
+ #include <linux/uts_resources.h>
++#include <linux/uts_views.h>
+ #include <linux/exportfs.h>
+ #include <linux/nstree.h>
+ #include <net/net_namespace.h>
+@@ -183,6 +184,10 @@ static bool nsfs_ioctl_valid(unsigned int cmd)
+ 	case NS_UTS_BIND_EVENTS:
+ 	case NS_UTS_GET_EVENTS:
+ #endif
++#ifdef CONFIG_UTS_NS_VIEWS
++	case NS_UTS_CONFIG_VIEW:
++	case NS_UTS_GET_VIEW:
++#endif
+ #ifdef CONFIG_UTS_NS_RESOURCES
+ 	case NS_UTS_BIND_RESOURCES:
+ 	case NS_UTS_GET_RESOURCE_BINDING:
+@@ -240,6 +245,13 @@ static long ns_ioctl(struct file *filp, unsigned int ioctl,
+ 
+ 	ns = get_proc_ns(file_inode(filp));
+ 	switch (ioctl) {
++#ifdef CONFIG_UTS_NS_VIEWS
++	case NS_UTS_CONFIG_VIEW:
++	case NS_UTS_GET_VIEW:
++		if (ns->ns_type != CLONE_NEWUTS)
++			return -EINVAL;
++		return uts_views_ioctl(to_uts_ns(ns), ioctl, arg);
++#endif
+ #if defined(CONFIG_UTS_NS_RESOURCES) && defined(CONFIG_NET)
+ 	case NS_UTS_BIND_EVENTS:
+ 	case NS_UTS_GET_EVENTS:
+diff --git a/include/linux/pid_namespace.h b/include/linux/pid_namespace.h
+index 465b56ec3..a4e648de7 100644
+--- a/include/linux/pid_namespace.h
++++ b/include/linux/pid_namespace.h
+@@ -24,6 +24,10 @@ struct fs_pin;
+ #endif
+ 
+ struct pid_namespace {
++#ifdef CONFIG_UTS_NS_VIEWS
++	struct uts_resource_view *uts_view;
++	bool uts_view_dead;
++#endif
+ 	struct idr idr;
+ 	struct rcu_head rcu;
+ 	unsigned int pid_allocated;
+diff --git a/include/linux/time_namespace.h b/include/linux/time_namespace.h
+index 06a83e198..508d26c9c 100644
+--- a/include/linux/time_namespace.h
++++ b/include/linux/time_namespace.h
+@@ -16,12 +16,17 @@ extern struct user_namespace init_user_ns;
+ struct seq_file;
+ struct vm_area_struct;
+ 
++extern struct mutex timens_offset_lock;
++
+ struct timens_offsets {
+ 	struct timespec64 monotonic;
+ 	struct timespec64 boottime;
+ };
+ 
+ struct time_namespace {
++#ifdef CONFIG_UTS_NS_VIEWS
++	struct uts_resource_view *uts_view;
++#endif
+ 	struct user_namespace	*user_ns;
+ 	struct ucounts		*ucounts;
+ 	struct ns_common	ns;
+diff --git a/include/linux/uts_resources.h b/include/linux/uts_resources.h
+index af143c60d..f22d880a7 100644
+--- a/include/linux/uts_resources.h
++++ b/include/linux/uts_resources.h
+@@ -11,6 +11,7 @@ struct sysinfo;
+ struct net;
+ struct uts_resource_view;
+ struct uts_event_projection;
++struct uts_native_view;
+ 
+ 
+ enum uts_resource_proc {
+@@ -27,11 +28,18 @@ void uts_resources_put(struct uts_namespace *ns);
+ bool uts_resources_may_enter(struct uts_namespace *old, struct uts_namespace *new);
+ int uts_resources_sysinfo(struct sysinfo *info);
+ int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which);
++struct uts_resource_view *uts_resources_proc_source(struct seq_file *m);
++int uts_resources_cpu_visible_in(struct uts_resource_view *view, unsigned int cpu);
++int uts_resources_snapshot(struct uts_resource_view *view, struct uts_resource_snapshot *s);
+ bool uts_resources_active(void);
+ int uts_resources_cpu_visible(unsigned int cpu);
+ bool uts_resources_admin(void);
+ struct uts_resource_view *uts_resources_acquire(struct uts_namespace *ns);
+ void uts_resources_release(struct uts_resource_view *view);
++struct uts_resource_view *uts_resources_get(struct uts_resource_view *view);
++struct cgroup *uts_resources_cgroup(struct uts_resource_view *view);
++struct uts_native_view *uts_resources_native(struct uts_resource_view *view);
++void uts_resources_publish_native(struct uts_resource_view *view, struct uts_native_view *native);
+ const struct uts_resource_info *uts_resources_binding(struct uts_resource_view *view);
+ bool uts_resources_live(struct uts_resource_view *view);
+ struct uts_event_projection *uts_resources_events(struct uts_resource_view *view);
+@@ -49,10 +57,15 @@ static inline bool uts_resources_may_enter(struct uts_namespace *old, struct uts
+ static inline int uts_resources_sysinfo(struct sysinfo *info) { return 0; }
+ static inline int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which) { return 0; }
+ static inline bool uts_resources_active(void) { return false; }
++static inline struct uts_resource_view *uts_resources_proc_source(struct seq_file *m) { return NULL; }
++static inline int uts_resources_cpu_visible_in(struct uts_resource_view *view, unsigned int cpu) { return 1; }
+ static inline int uts_resources_cpu_visible(unsigned int cpu) { return 1; }
+ #endif
+ 
+ #if defined(CONFIG_UTS_NS_RESOURCES) && defined(CONFIG_NET)
++struct uts_resource_view *uts_uevent_resources(struct net *net);
++bool uts_uevent_matches(struct uts_resource_view *view, struct net *net);
++const struct uts_event_info *uts_resources_event_info(struct uts_resource_view *view);
+ long uts_uevent_ioctl(struct uts_namespace *ns, unsigned int cmd, unsigned long arg);
+ bool uts_uevent_may_enter(struct uts_namespace *uts, struct net *net);
+ #else
+diff --git a/include/linux/uts_views.h b/include/linux/uts_views.h
+new file mode 100644
+index 000000000..e7d2d96e9
+--- /dev/null
++++ b/include/linux/uts_views.h
+@@ -0,0 +1,74 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_UTS_VIEWS_H
++#define _LINUX_UTS_VIEWS_H
++
++#include <linux/types.h>
++#include <uapi/linux/nsfs.h>
++
++struct uts_resource_view;
++struct uts_namespace;
++struct pid_namespace;
++struct time_namespace;
++struct net;
++struct seq_file;
++struct inode;
++struct file;
++struct proc_dir_entry;
++struct kernfs_root;
++struct psi_group;
++struct uts_sysfs;
++struct device;
++struct net_device;
++struct uts_resource_snapshot;
++
++#ifdef CONFIG_UTS_NS_VIEWS
++struct uts_native_view {
++	struct uts_resource_view *resources;
++	struct uts_view_config config;
++	struct uts_view_info info;
++	struct kernfs_root *sysfs;
++	struct uts_sysfs *sysfs_data;
++	struct device *devices[UTS_EVENT_MAX_DEVICES];
++	struct device *parents[UTS_EVENT_MAX_DEVICES];
++	struct device *gpu_parents[UTS_EVENT_MAX_DEVICES];
++	s64 suspend_origin_ns;
++	bool dead;
++};
++
++long uts_views_ioctl(struct uts_namespace *ns, unsigned int cmd,
++		     unsigned long arg);
++void uts_views_destroy(struct uts_native_view *native);
++bool uts_views_live(struct uts_resource_view *view);
++bool uts_views_may_enter(struct uts_resource_view *old,
++			 struct uts_resource_view *target);
++void uts_views_copy(struct uts_resource_view **target,
++		    struct uts_resource_view **source);
++void uts_views_pid_exit(struct pid_namespace *ns);
++struct device *uts_device_get_by_devt(dev_t devt);
++int uts_views_emit_event(struct uts_resource_view *view, struct net *net,
++			 const struct uts_event_device *device,
++			 struct net_device *netdev, const char *action,
++			 size_t count);
++int uts_sysfs_create(struct uts_native_view *native, struct net *net);
++void uts_sysfs_destroy(struct uts_native_view *native);
++struct kernfs_root *uts_sysfs_get_root(struct net *net);
++struct uts_resource_view *uts_sysfs_resources(struct kernfs_root *root);
++void uts_sysfs_refresh_cpus(void);
++void uts_views_cpu_identity(struct seq_file *m);
++struct psi_group *uts_views_psi(struct file *file);
++int uts_views_stat(struct seq_file *m, struct uts_resource_view *view,
++		   struct uts_resource_snapshot *snapshot);
++#else
++struct uts_native_view;
++static inline void uts_sysfs_refresh_cpus(void)
++{
++}
++static inline bool uts_views_live(struct uts_resource_view *view)
++{
++	return true;
++}
++static inline void uts_views_destroy(struct uts_native_view *native)
++{
++}
++#endif
++#endif
+diff --git a/include/uapi/linux/nsfs.h b/include/uapi/linux/nsfs.h
+index c9ad4ad2a..ff0c9a919 100644
+--- a/include/uapi/linux/nsfs.h
++++ b/include/uapi/linux/nsfs.h
+@@ -174,6 +174,51 @@ struct uts_event_info {
+ #define NS_UTS_BIND_EVENTS _IOW(NSIO, 0x86, struct uts_event_binding)
+ #define NS_UTS_GET_EVENTS _IOR(NSIO, 0x87, struct uts_event_info)
+ 
++/* One-time host configuration of native instance filesystems. */
++struct uts_view_config {
++	__u32 abi;
++	__u32 flags;
++	__s32 pidns_fd;
++	__s32 netns_fd;
++	__s32 timens_fd;
++	__u32 reserved0;
++	__u64 generation[2];
++	__u8 profile_sha256[32];
++	char cpu_vendor[65];
++	char cpu_model[65];
++	__u8 reserved1[6];
++	char cmdline[4096];
++};
++
++#define UTS_VIEW_BOUND 1
++#define UTS_VIEW_LIVE  2
++#define UTS_VIEW_PROC (1ULL << 0)
++#define UTS_VIEW_SYSFS (1ULL << 1)
++#define UTS_VIEW_SYSINFO (1ULL << 2)
++#define UTS_VIEW_EVENTS (1ULL << 3)
++#define UTS_VIEW_UID_CPU (1ULL << 4)
++#define UTS_VIEW_PSI (1ULL << 5)
++#define UTS_VIEW_CPU_STAT (1ULL << 6)
++#define UTS_VIEW_PROC_FILTER (1ULL << 7)
++
++struct uts_view_info {
++	__u32 abi;
++	__u32 flags;
++	__u64 cgroup_id;
++	__u64 generation[2];
++	__u64 start_boottime_ns;
++	__u64 pidns_id;
++	__u64 netns_id;
++	__u64 timens_id;
++	__u8 boot_id[16];
++	__u8 profile_sha256[32];
++	__u64 capabilities;
++	__u64 reserved;
++};
++
++#define NS_UTS_CONFIG_VIEW _IOW(NSIO, 0x88, struct uts_view_config)
++#define NS_UTS_GET_VIEW _IOR(NSIO, 0x89, struct uts_view_info)
++
+ enum init_ns_ino {
+ 	IPC_NS_INIT_INO		= 0xEFFFFFFFU,
+ 	UTS_NS_INIT_INO		= 0xEFFFFFFEU,
+diff --git a/kernel/Makefile b/kernel/Makefile
+index fa0f5ba34..fde18567b 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -209,4 +209,5 @@ $(obj)/kheaders.md5: $(obj)/kheaders-srclist FORCE
+ clean-files := kheaders.md5 kheaders-srclist kheaders-objlist
+ 
+ obj-$(CONFIG_UTS_NS_RESOURCES) += uts_resources.o
++obj-$(CONFIG_UTS_NS_VIEWS) += uts_views.o
+ obj-$(CONFIG_ANDROID_UID_CPUTIME) += uid_cputime.o
+diff --git a/kernel/pid_namespace.c b/kernel/pid_namespace.c
+index 700299a3c..7fa08b4ca 100644
+--- a/kernel/pid_namespace.c
++++ b/kernel/pid_namespace.c
+@@ -11,6 +11,8 @@
+ 
+ #include <linux/pid.h>
+ #include <linux/pid_namespace.h>
++#include <linux/uts_resources.h>
++#include <linux/uts_views.h>
+ #include <linux/uid_cputime.h>
+ #include <linux/user_namespace.h>
+ #include <linux/syscalls.h>
+@@ -127,6 +129,9 @@ static struct pid_namespace *create_pid_namespace(struct user_namespace *user_ns
+ 	ns->memfd_noexec_scope = pidns_memfd_noexec_scope(parent_pid_ns);
+ #endif
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++	uts_views_copy(&ns->uts_view, &parent_pid_ns->uts_view);
++#endif
+ 	ns_tree_add(ns);
+ 	return ns;
+ 
+@@ -154,6 +159,9 @@ static void delayed_free_pidns(struct rcu_head *p)
+ 
+ static void destroy_pid_namespace(struct pid_namespace *ns)
+ {
++#ifdef CONFIG_UTS_NS_VIEWS
++	uts_resources_release(ns->uts_view);
++#endif
+ 	uid_cputime_ns_free(ns);
+ 	ns_tree_remove(ns);
+ 	unregister_pidns_sysctls(ns);
+@@ -203,6 +211,10 @@ void zap_pid_ns_processes(struct pid_namespace *pid_ns)
+ 	int init_pids = thread_group_leader(me) ? 1 : 2;
+ 	struct pid *pid;
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++	uts_views_pid_exit(pid_ns);
++#endif
++
+ 	/* Don't allow any more processes into the pid namespace */
+ 	disable_pid_allocation(pid_ns);
+ 
+@@ -425,6 +437,10 @@ static int pidns_install(struct nsset *nsset, struct ns_common *ns)
+ 	if (!pidns_is_ancestor(new, active))
+ 		return -EINVAL;
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++	if (!uts_views_may_enter(active->uts_view, new->uts_view))
++		return -EPERM;
++#endif
+ 	put_pid_ns(nsproxy->pid_ns_for_children);
+ 	nsproxy->pid_ns_for_children = get_pid_ns(new);
+ 	return 0;
+diff --git a/kernel/time/namespace.c b/kernel/time/namespace.c
+index 51d2fcba7..44e5e9486 100644
+--- a/kernel/time/namespace.c
++++ b/kernel/time/namespace.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #include <linux/time_namespace.h>
++#include <linux/uts_resources.h>
++#include <linux/uts_views.h>
+ #include <linux/user_namespace.h>
+ #include <linux/sched/signal.h>
+ #include <linux/sched/task.h>
+@@ -106,6 +108,9 @@ static struct time_namespace *clone_time_ns(struct user_namespace *user_ns,
+ 	ns->user_ns = get_user_ns(user_ns);
+ 	ns->offsets = old_ns->offsets;
+ 	ns->frozen_offsets = false;
++#ifdef CONFIG_UTS_NS_VIEWS
++	uts_views_copy(&ns->uts_view, &old_ns->uts_view);
++#endif
+ 	ns_tree_add(ns);
+ 	return ns;
+ 
+@@ -143,6 +148,9 @@ DEFINE_MUTEX(timens_offset_lock);
+ 
+ void free_time_ns(struct time_namespace *ns)
+ {
++#ifdef CONFIG_UTS_NS_VIEWS
++	uts_resources_release(ns->uts_view);
++#endif
+ 	ns_tree_remove(ns);
+ 	dec_time_namespaces(ns->ucounts);
+ 	put_user_ns(ns->user_ns);
+@@ -201,6 +209,10 @@ static int timens_install(struct nsset *nsset, struct ns_common *new)
+ 	    !ns_capable(nsset->cred->user_ns, CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++	if (!uts_views_may_enter(nsproxy->time_ns->uts_view, ns->uts_view))
++		return -EPERM;
++#endif
+ 	get_time_ns(ns);
+ 	put_time_ns(nsproxy->time_ns);
+ 	nsproxy->time_ns = ns;
+@@ -310,7 +322,11 @@ int proc_timens_set_offset(struct file *file, struct task_struct *p,
+ 	}
+ 
+ 	mutex_lock(&timens_offset_lock);
+-	if (time_ns->frozen_offsets) {
++	if (time_ns->frozen_offsets
++#ifdef CONFIG_UTS_NS_VIEWS
++	    || time_ns->uts_view
++#endif
++	   ) {
+ 		err = -EACCES;
+ 		goto out_unlock;
+ 	}
+diff --git a/kernel/uts_resources.c b/kernel/uts_resources.c
+index 180d54e51..2a0a2ed68 100644
+--- a/kernel/uts_resources.c
++++ b/kernel/uts_resources.c
+@@ -22,6 +22,9 @@
+ #include <linux/uts_namespace.h>
+ #include <linux/uts_resources.h>
+ #include <linux/utsname.h>
++#include <linux/uts_views.h>
++#include <linux/proc_fs.h>
++#include <linux/fs.h>
+ 
+ struct uts_resource_view {
+ 	refcount_t refs;
+@@ -29,6 +32,7 @@ struct uts_resource_view {
+ 	struct cgroup *root;
+ 	struct uts_resource_info binding;
+ 	struct uts_event_projection *events;
++	struct uts_native_view *native;
+ 	u64 load_sample;
+ 	unsigned long loads[3];
+ 	unsigned long previous_active;
+@@ -68,12 +72,35 @@ struct uts_resource_view *uts_resources_acquire(struct uts_namespace *ns)
+ void uts_resources_release(struct uts_resource_view *view)
+ {
+ 	if (view && refcount_dec_and_test(&view->refs)) {
++		uts_views_destroy(view->native);
+ 		cgroup_put(view->root);
+ 		kfree(view->events);
+ 		kfree(view);
+ 	}
+ }
+ 
++struct uts_resource_view *uts_resources_get(struct uts_resource_view *view)
++{
++	if (view)
++		refcount_inc(&view->refs);
++	return view;
++}
++
++struct cgroup *uts_resources_cgroup(struct uts_resource_view *view)
++{
++	return view->root;
++}
++
++struct uts_native_view *uts_resources_native(struct uts_resource_view *view)
++{
++	return view ? smp_load_acquire(&view->native) : NULL;
++}
++
++void uts_resources_publish_native(struct uts_resource_view *view, struct uts_native_view *native)
++{
++	smp_store_release(&view->native, native);
++}
++
+ void uts_resources_put(struct uts_namespace *ns)
+ {
+ 	uts_resources_release(ns->resources);
+@@ -86,7 +113,7 @@ const struct uts_resource_info *uts_resources_binding(struct uts_resource_view *
+ 
+ bool uts_resources_live(struct uts_resource_view *view)
+ {
+-	return !css_is_dying(&view->root->self);
++	return !css_is_dying(&view->root->self) && uts_views_live(view);
+ }
+ 
+ struct uts_event_projection *uts_resources_events(struct uts_resource_view *view)
+@@ -115,15 +142,25 @@ bool uts_resources_active(void)
+ 	return current_resource_view() != NULL;
+ }
+ 
+-int uts_resources_cpu_visible(unsigned int cpu)
++struct uts_resource_view *uts_resources_proc_source(struct seq_file *m)
++{
++#ifdef CONFIG_UTS_NS_VIEWS
++	struct uts_resource_view *view = proc_sb_info(file_inode(m->file)->i_sb)->uts_view;
++
++	if (view || uts_resources_native(current_resource_view()))
++		return view;
++#endif
++	return current_resource_view();
++}
++
++int uts_resources_cpu_visible_in(struct uts_resource_view *view, unsigned int cpu)
+ {
+-	struct uts_resource_view *view = current_resource_view();
+ 	cpumask_var_t cpus;
+ 	bool visible;
+ 
+ 	if (!view)
+ 		return 1;
+-	if (css_is_dying(&view->root->self))
++	if (!uts_resources_live(view))
+ 		return -ENODEV;
+ 	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
+ 		return -ENOMEM;
+@@ -133,6 +170,11 @@ int uts_resources_cpu_visible(unsigned int cpu)
+ 	return visible;
+ }
+ 
++int uts_resources_cpu_visible(unsigned int cpu)
++{
++	return uts_resources_cpu_visible_in(current_resource_view(), cpu);
++}
++
+ static void field(struct uts_resource_snapshot *s, unsigned int n, u64 value)
+ {
+ 	s->values[n] = value;
+@@ -245,7 +287,7 @@ static void task_snapshot(struct uts_resource_view *view, struct uts_resource_sn
+ 	field(s, UR_UNINTERRUPTIBLE, blocked);
+ }
+ 
+-static int resource_snapshot(struct uts_resource_view *view, struct uts_resource_snapshot *s)
++int uts_resources_snapshot(struct uts_resource_view *view, struct uts_resource_snapshot *s)
+ {
+ 	struct task_cputime cpu;
+ 	u64 elapsed, unused;
+@@ -257,7 +299,7 @@ static int resource_snapshot(struct uts_resource_view *view, struct uts_resource
+ 	if (!alloc_cpumask_var(&cpus, GFP_KERNEL))
+ 		return -ENOMEM;
+ 	mutex_lock(&view->lock);
+-	if (css_is_dying(&view->root->self)) {
++	if (!uts_resources_live(view)) {
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
+@@ -324,7 +366,7 @@ static int resource_memory_snapshot(struct uts_resource_view *view,
+ 	int ret;
+ 
+ 	mutex_lock(&view->lock);
+-	if (css_is_dying(&view->root->self)) {
++	if (!uts_resources_live(view)) {
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
+@@ -419,7 +461,7 @@ long uts_resources_ioctl(struct uts_namespace *ns, unsigned int cmd, unsigned lo
+ 	snapshot = kmalloc(sizeof(*snapshot), GFP_KERNEL);
+ 	if (!snapshot)
+ 		return -ENOMEM;
+-	ret = resource_snapshot(view, snapshot);
++	ret = uts_resources_snapshot(view, snapshot);
+ 	if (!ret && copy_to_user(argp, snapshot, sizeof(*snapshot)))
+ 		ret = -EFAULT;
+ 	kfree(snapshot);
+@@ -434,7 +476,7 @@ int uts_resources_sysinfo(struct sysinfo *info)
+ 
+ 	if (!view)
+ 		return 0;
+-	ret = resource_snapshot(view, &s);
++	ret = uts_resources_snapshot(view, &s);
+ 	if (ret)
+ 		return ret;
+ 	memset(info, 0, sizeof(*info));
+@@ -454,7 +496,7 @@ int uts_resources_sysinfo(struct sysinfo *info)
+ 
+ int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which)
+ {
+-	struct uts_resource_view *view = current_resource_view();
++	struct uts_resource_view *view = uts_resources_proc_source(m);
+ 	struct uts_resource_snapshot s;
+ 	const u64 *v = s.values;
+ 	int ret;
+@@ -479,7 +521,7 @@ int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which)
+ 		static const enum psi_res resources[] = { PSI_CPU, PSI_MEM, PSI_IO };
+ 		struct psi_group *group = cgroup_psi(view->root);
+ 
+-		if (css_is_dying(&view->root->self) || !group || !group->enabled)
++		if (!uts_resources_live(view) || !group || !group->enabled)
+ 			return -ENODEV;
+ 		ret = psi_show(m, group, resources[which - UR_PROC_PSI_CPU]);
+ 		return ret ? ret : 1;
+@@ -517,7 +559,7 @@ int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which)
+ 			   values[URM_SCAN_KSWAPD], values[URM_SCAN_DIRECT], values[URM_DIRECT_THROTTLE],
+ 			   values[URM_STEAL_KSWAPD], values[URM_STEAL_DIRECT]);
+ 	}
+-	ret = resource_snapshot(view, &s);
++	ret = uts_resources_snapshot(view, &s);
+ 	if (ret)
+ 		return ret;
+ 	switch (which) {
+@@ -530,6 +572,10 @@ int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which)
+ 			(v[UR_INACTIVE_ANON] + v[UR_INACTIVE_FILE]) / 1024);
+ 		break;
+ 	case UR_PROC_STAT:
++#ifdef CONFIG_UTS_NS_VIEWS
++		if (uts_resources_native(view))
++			return uts_views_stat(m, view, &s);
++#endif
+ 		seq_printf(m, "cpu  %llu 0 %llu %llu 0 0 0 0 0 0\nprocs_running %llu\nprocs_blocked %llu\n",
+ 			nsec_to_clock_t(v[UR_CPU_USER]), nsec_to_clock_t(v[UR_CPU_SYSTEM]),
+ 			nsec_to_clock_t(v[UR_IDLE]), v[UR_RUNNING], v[UR_UNINTERRUPTIBLE]);
+@@ -548,7 +594,7 @@ int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which)
+ 			seq_printf(m, "%llu.%02llu ", v[i] >> SI_LOAD_SHIFT,
+ 				((v[i] & ((1 << SI_LOAD_SHIFT) - 1)) * 100) >> SI_LOAD_SHIFT);
+ 		seq_printf(m, "%llu/%llu %d\n", v[UR_RUNNING], v[UR_THREADS],
+-			idr_get_cursor(&task_active_pid_ns(current)->idr) - 1);
++			idr_get_cursor(&proc_pid_ns(file_inode(m->file)->i_sb)->idr) - 1);
+ 		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+diff --git a/kernel/uts_views.c b/kernel/uts_views.c
+new file mode 100644
+index 000000000..482ded23d
+--- /dev/null
++++ b/kernel/uts_views.c
+@@ -0,0 +1,294 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/build_bug.h>
++#include <linux/cgroup.h>
++#include <linux/ctype.h>
++#include <linux/file.h>
++#include <linux/device.h>
++#include <linux/kobject.h>
++#include <linux/ktime.h>
++#include <linux/timekeeping.h>
++#include <linux/nsproxy.h>
++#include <linux/nsfs.h>
++#include <linux/pid_namespace.h>
++#include <linux/proc_ns.h>
++#include <linux/proc_fs.h>
++#include <linux/random.h>
++#include <linux/rtnetlink.h>
++#include <linux/psi.h>
++#include <linux/slab.h>
++#include <linux/time_namespace.h>
++#include <linux/uaccess.h>
++#include <linux/utsname.h>
++#include <linux/uts_resources.h>
++#include <linux/uts_views.h>
++#include <net/net_namespace.h>
++
++static DEFINE_MUTEX(uts_view_lock);
++
++static_assert(sizeof(struct uts_view_config) == 4304);
++static_assert(offsetof(struct uts_view_config, cmdline) == 208);
++static_assert(sizeof(struct uts_view_info) == 128);
++static_assert(offsetof(struct uts_view_info, capabilities) == 112);
++
++bool uts_views_live(struct uts_resource_view *view)
++{
++	struct uts_native_view *native = uts_resources_native(view);
++
++	unsigned int i;
++
++	if (!native)
++		return true;
++	for (i = 0; i < ARRAY_SIZE(native->devices); i++) {
++		if (native->devices[i] &&
++		    (!device_is_registered(native->devices[i]) ||
++		     (native->parents[i] &&
++		      !device_is_registered(native->parents[i])) ||
++		     (native->gpu_parents[i] &&
++		      !device_is_registered(native->gpu_parents[i])) ||
++		     READ_ONCE(native->devices[i]->parent) !=
++			     native->parents[i]))
++			WRITE_ONCE(native->dead, true);
++	}
++	return !READ_ONCE(native->dead);
++}
++
++bool uts_views_may_enter(struct uts_resource_view *old,
++			 struct uts_resource_view *new)
++{
++	return old == new || uts_resources_admin();
++}
++
++void uts_views_copy(struct uts_resource_view **target,
++		    struct uts_resource_view **source)
++{
++	mutex_lock(&uts_view_lock);
++	*target = uts_resources_get(*source);
++	mutex_unlock(&uts_view_lock);
++}
++
++void uts_views_pid_exit(struct pid_namespace *ns)
++{
++	struct uts_native_view *native;
++
++	mutex_lock(&uts_view_lock);
++	ns->uts_view_dead = true;
++	native = uts_resources_native(ns->uts_view);
++
++	if (native && native->info.pidns_id == ns->ns.ns_id)
++		WRITE_ONCE(native->dead, true);
++	mutex_unlock(&uts_view_lock);
++}
++
++void uts_views_destroy(struct uts_native_view *native)
++{
++	unsigned int i;
++
++	if (!native)
++		return;
++	uts_sysfs_destroy(native);
++	for (i = 0; i < ARRAY_SIZE(native->devices); i++) {
++		put_device(native->devices[i]);
++		put_device(native->parents[i]);
++		put_device(native->gpu_parents[i]);
++	}
++	kfree(native);
++}
++
++static struct ns_common *view_namespace(int fd, unsigned int type,
++					struct file **file)
++{
++	struct ns_common *ns;
++
++	*file = fget(fd);
++	if (!*file)
++		return ERR_PTR(-EBADF);
++	if (!proc_ns_file(*file))
++		return ERR_PTR(-EINVAL);
++	ns = get_proc_ns(file_inode(*file));
++	return ns->ns_type == type ? ns : ERR_PTR(-EINVAL);
++}
++
++static bool view_string(const char *value, size_t size, bool line)
++{
++	size_t length = strnlen(value, size), i;
++
++	if (length == size || memchr_inv(value + length, 0, size - length))
++		return false;
++	for (i = 0; i < length; i++)
++		if ((unsigned char)value[i] < ' ' || value[i] == 127)
++			return false;
++	return !line || length;
++}
++
++static int configure_view(struct uts_resource_view *view, void __user *argp)
++{
++	struct uts_native_view *native;
++	struct file *pidfile = NULL, *timefile = NULL, *netfile = NULL;
++	struct pid_namespace *pid;
++	struct time_namespace *time;
++	struct net *net;
++	struct ns_common *ns;
++	const struct uts_resource_info *binding = uts_resources_binding(view);
++	int ret = -EINVAL;
++
++	native = kzalloc(sizeof(*native), GFP_KERNEL);
++	if (!native)
++		return -ENOMEM;
++	if (copy_from_user(&native->config, argp, sizeof(native->config))) {
++		ret = -EFAULT;
++		goto out;
++	}
++	if (native->config.abi != 1 || native->config.flags ||
++	    native->config.reserved0 ||
++	    memchr_inv(native->config.reserved1, 0,
++		       sizeof(native->config.reserved1)) ||
++	    memcmp(native->config.generation, binding->generation,
++		   sizeof(binding->generation)) ||
++	    !view_string(native->config.cpu_vendor,
++			 sizeof(native->config.cpu_vendor), false) ||
++	    !view_string(native->config.cpu_model,
++			 sizeof(native->config.cpu_model), false) ||
++	    !view_string(native->config.cmdline, sizeof(native->config.cmdline),
++			 true))
++		goto out;
++
++	ns = view_namespace(native->config.pidns_fd, CLONE_NEWPID, &pidfile);
++	if (IS_ERR(ns)) {
++		ret = PTR_ERR(ns);
++		goto out;
++	}
++	pid = to_pid_ns(ns);
++	ns = view_namespace(native->config.timens_fd, CLONE_NEWTIME, &timefile);
++	if (IS_ERR(ns)) {
++		ret = PTR_ERR(ns);
++		goto out;
++	}
++	time = to_time_ns(ns);
++	ns = view_namespace(native->config.netns_fd, CLONE_NEWNET, &netfile);
++	if (IS_ERR(ns)) {
++		ret = PTR_ERR(ns);
++		goto out;
++	}
++	net = to_net_ns(ns);
++	if (pid == &init_pid_ns || time == &init_time_ns || net == &init_net) {
++		ret = -EPERM;
++		goto out;
++	}
++	if (!uts_resources_events(view) || !uts_uevent_matches(view, net))
++		goto out;
++
++	mutex_lock(&uts_view_lock);
++	mutex_lock(&timens_offset_lock);
++	if (uts_resources_native(view) || pid->uts_view || time->uts_view) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	if (!uts_resources_live(view) || pid->uts_view_dead ||
++	    !READ_ONCE(pid->child_reaper)) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (binding->start_boottime_ns > S64_MAX ||
++	    timespec64_to_ns(&time->offsets.boottime) !=
++		    -(s64)binding->start_boottime_ns ||
++	    timespec64_to_ns(&time->offsets.monotonic) > 0 ||
++	    timespec64_to_ns(&time->offsets.monotonic) <
++		    -(s64)binding->start_boottime_ns) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	if (!cgroup_psi(uts_resources_cgroup(view)) ||
++	    !cgroup_psi(uts_resources_cgroup(view))->enabled) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	native->suspend_origin_ns = binding->start_boottime_ns +
++				    timespec64_to_ns(&time->offsets.monotonic);
++	/* The offset is kernel-managed once associated with a Run. */
++	if (native->suspend_origin_ns >
++	    ktime_to_ns(ktime_mono_to_any(0, TK_OFFS_BOOT))) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	native->resources = view;
++	native->info.abi = 1;
++	native->info.flags = UTS_VIEW_BOUND;
++	native->info.cgroup_id = binding->cgroup_id;
++	memcpy(native->info.generation, binding->generation,
++	       sizeof(binding->generation));
++	native->info.start_boottime_ns = binding->start_boottime_ns;
++	native->info.pidns_id = pid->ns.ns_id;
++	native->info.netns_id = net->ns.ns_id;
++	native->info.timens_id = time->ns.ns_id;
++	generate_random_uuid(native->info.boot_id);
++	memcpy(native->info.profile_sha256, native->config.profile_sha256,
++	       sizeof(native->info.profile_sha256));
++	native->info.capabilities = UTS_VIEW_SYSINFO | UTS_VIEW_EVENTS |
++				    UTS_VIEW_PROC | UTS_VIEW_PROC_FILTER |
++				    UTS_VIEW_PSI | UTS_VIEW_CPU_STAT;
++	if (IS_ENABLED(CONFIG_ANDROID_UID_CPUTIME))
++		native->info.capabilities |= UTS_VIEW_UID_CPU;
++	rtnl_lock();
++	ret = uts_sysfs_create(native, net);
++	if (ret) {
++		rtnl_unlock();
++		goto unlock;
++	}
++	native->info.capabilities |= UTS_VIEW_SYSFS;
++	cgroup_instance_enable();
++	pid->uts_view = uts_resources_get(view);
++	time->uts_view = uts_resources_get(view);
++	uts_resources_publish_native(view, native);
++	rtnl_unlock();
++	native = NULL;
++	ret = 0;
++unlock:
++	mutex_unlock(&timens_offset_lock);
++	mutex_unlock(&uts_view_lock);
++out:
++	if (pidfile)
++		fput(pidfile);
++	if (timefile)
++		fput(timefile);
++	if (netfile)
++		fput(netfile);
++	uts_views_destroy(native);
++	return ret;
++}
++
++long uts_views_ioctl(struct uts_namespace *ns, unsigned int cmd,
++		     unsigned long arg)
++{
++	struct uts_resource_view *view = uts_resources_acquire(ns);
++	struct uts_resource_view *caller;
++	struct uts_native_view *native;
++	struct uts_view_info info = { .abi = 1 };
++	void __user *argp = (void __user *)arg;
++	long ret;
++
++	if (cmd == NS_UTS_CONFIG_VIEW) {
++		if (!uts_resources_admin() || ns == &init_uts_ns)
++			ret = -EPERM;
++		else if (!view)
++			ret = -ENODATA;
++		else
++			ret = configure_view(view, argp);
++	} else {
++		caller = uts_resources_acquire(current->nsproxy->uts_ns);
++		ret = !uts_resources_admin() && caller != view ? -EPERM : 0;
++		uts_resources_release(caller);
++		if (!ret) {
++			native = uts_resources_native(view);
++			if (native) {
++				info = native->info;
++				if (uts_resources_live(view))
++					info.flags |= UTS_VIEW_LIVE;
++			}
++			ret = copy_to_user(argp, &info, sizeof(info)) ?
++					    -EFAULT :
++					    0;
++		}
++	}
++	uts_resources_release(view);
++	return ret;
++}

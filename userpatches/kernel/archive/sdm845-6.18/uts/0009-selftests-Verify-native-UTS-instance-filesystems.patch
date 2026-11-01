@@ -1,0 +1,773 @@
+From 82846ef28489cdab5a55ec2adc35bf3bff18f0bb Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Sun, 1 Nov 2026 23:34:24 +0800
+Subject: [PATCH] selftests: Verify native UTS instance filesystems
+
+---
+ .../admin-guide/namespaces/index.rst          |   1 +
+ .../admin-guide/namespaces/uts-views.rst      | 117 ++++
+ tools/testing/selftests/Makefile              |   1 +
+ tools/testing/selftests/uts_views/Makefile    |   4 +
+ tools/testing/selftests/uts_views/config      |   6 +
+ tools/testing/selftests/uts_views/uts_views.c | 583 ++++++++++++++++++
+ 6 files changed, 712 insertions(+)
+ create mode 100644 Documentation/admin-guide/namespaces/uts-views.rst
+ create mode 100644 tools/testing/selftests/uts_views/Makefile
+ create mode 100644 tools/testing/selftests/uts_views/config
+ create mode 100644 tools/testing/selftests/uts_views/uts_views.c
+
+diff --git a/Documentation/admin-guide/namespaces/index.rst b/Documentation/admin-guide/namespaces/index.rst
+index 384f2e0f3..eb19001ea 100644
+--- a/Documentation/admin-guide/namespaces/index.rst
++++ b/Documentation/admin-guide/namespaces/index.rst
+@@ -9,3 +9,4 @@ Namespaces
+ 
+    compatibility-list
+    resource-control
++   uts-views
+diff --git a/Documentation/admin-guide/namespaces/uts-views.rst b/Documentation/admin-guide/namespaces/uts-views.rst
+new file mode 100644
+index 000000000..be34ceca6
+--- /dev/null
++++ b/Documentation/admin-guide/namespaces/uts-views.rst
+@@ -0,0 +1,117 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++Native UTS instance views
++=========================
++
++CONFIG_UTS_NS_VIEWS adds an optional host-managed resource domain to native
++procfs and sysfs. It requires UTS resources, PID/net/time namespaces, cgroup
++v2, PSI, and an ARM64 or x86 host. SELinux is independent of this facility.
++Unconfigured UTS namespaces retain ordinary kernel behavior.
++
++Configuration and lifetime
++--------------------------
++
++Only CAP_SYS_ADMIN in the initial user and PID namespaces may configure a
++noninitial UTS namespace. First bind its cgroup with NS_UTS_BIND_RESOURCES,
++then bind its device projection and netns with NS_UTS_BIND_EVENTS, and set
++the time namespace offsets. NS_UTS_CONFIG_VIEW accepts ABI 1, zero flags
++and reserved bytes, the same generation, and PID/net/time namespace FDs.
++The layout is 4304 bytes on native and compat tasks. String fields have
++zero padding and no control characters; cmdline must be nonempty.
++
++The boottime offset must be the negative Run origin. The monotonic offset
++must represent an origin in the same Run, with an elapsed suspend offset
++between zero and the kernel's current suspend offset. These offsets are
++immutable after association, including in descendant time namespaces.
++
++A successful configuration is published once. Reconfiguration returns
++EBUSY; GET_VIEW reports the existing state for recovery. Its 128-byte
++response carries immutable namespace IDs, generation, cgroup, profile
++SHA-256 and an instance boot UUID. BOUND and LIVE are separate bits.
++Capabilities report the implemented interfaces. Initial namespaces may
++not be supplied as instance PID/net/time namespaces. Malformed parameters
++return EINVAL and namespace permission failures return EPERM.
++
++UTS descendants share the resource domain. PID/time descendants inherit
++ownership; guest setns cannot cross resource domains. Namespace objects,
++proc mounts and sysfs superblocks hold references. The domain does not
++hold references to those namespaces, avoiding a netns/event socket cycle.
++The instance init exit, cgroup root removal or disappearance of a pinned
++device revokes LIVE. Subsequent resource access returns ENODEV. Ordinary
++thread and descendant cgroup exit do not revoke the domain.
++
++Mounts and filesystem behavior
++-----------------------------
++
++Mount proc/sysfs only after CONFIG_VIEW. A bootstrap mount created before
++configuration still denotes its original filesystem. The host launcher
++must remove it, and any raw host mount/directory/namespace FDs, before
++running Android. This is a launcher's responsibility; UTS does not revoke
++privileges the host explicitly hands to a guest.
++
++Each proc superblock pins its resource domain and UTS identity; its PID
++namespace must belong to that domain. New and traditional mount APIs
++perform the same check. A retained FD keeps its original source even if
++the reading task enters another namespace. Dynamic seq files retain
++normal read/seek semantics without a userspace cache.
++
++Resource files and raw sysinfo use the same root cgroup accounting.
++Per-CPU user/nice/system counters come from rstat subtree data, including
++removed descendants. Context-switch and fork counters use the same rstat
++propagation. Their scheduler accounting remains disabled until the first
++native view is configured. No physical interrupt is assigned, so IRQ
++counters are zero and IRQ names are absent. Swap, disk and buddy device
++lists are empty rather than exposing host devices. Slab totals remain
++available in meminfo but physical slab object lists are empty.
++
++VM refault/reclaim counters and a virtual Node 0/Normal zone are supplied
++for LMKD. MemAvailable is the resource ABI's bounded reclaim estimate.
++The VM zone is an instance model, not physical NUMA/DRAM topology. PSI
++read, trigger writes, poll and release share the instance PSI group.
++
++Global proc entries are explicitly classified in fs/proc/native.c.
++Unclassified driver or firmware entries are absent from both lookup and
++readdir. PID/net interfaces retain their ordinary permissions. Generic
++proc chmod/chown changes stay in this superblock rather than rewriting
++global proc_dir_entry metadata. Sysctl permits ordinary network/UTS
++semantics and selected compatible reads. Global writes with no instance
++implementation fail explicitly; they are not accepted as no-ops.
++
++Sysfs uses a private kernfs root with standard sysfs magic, attributes,
++links, ownership, xattrs and SELinux genfs labeling. CPU IDs follow the
++instance cpuset intersected with online CPUs. Network objects are tagged
++with their actual netns and updated by netdevice notifications. Device
++class/dev-char links remain inside the private root. Only explicitly
++bound DRM/V4L2 devices are created; their device objects are pinned.
++GPU bus selection and PCI IDs needed by drivers are retained, while host
++platform addresses and DT ancestors are not exported.
++
++Device uevent action writes emit normal NETLINK_KOBJECT_UEVENT messages
++only to the instance netns, using the same mapping as runtime events.
++They do not call the physical device's uevent store. Ordinary socket,
++socketcall and io_uring APIs are unchanged. No private AOSP view protocol
++or filesystem-label exception is required.
++
++A device FD still exposes its real driver's ioctl capabilities. Native
++file views do not promise to virtualize DRM/V4L2 hardware ioctl identity,
++CPU ISA/HWCAP, or privileged raw CPU instructions. Android SELinux remains
++responsible for app mount permissions. Enforcing, permissive and disabled
++modes require separate integration tests, as do Mesa and codec backends.
++
++Validation
++----------
++
++Build tools/testing/selftests/uts_views, then run uts_views as host root
++on a disposable test system with a writable unified cgroup hierarchy and
++cpu, memory, cpuset, pids and io delegated into it. The test uses separate
++PID/mount/UTS/net/time namespaces, two memory limits, fixed FDs, remounts,
++PSI triggers, descendant netns and init-exit invalidation. If card0 exists,
++it also validates an authorized DRM projection and standard coldboot.
++An optional first argument names an ARM32 helper inherited with UTS FD 9;
++this permits native/compat ioctl validation on an ARM64 kernel. Tests need
++CAP_SYS_ADMIN and CAP_SYS_TIME in the host and deliberately create load in
++their temporary cgroups. A missing kernel extension returns kselftest SKIP.
++
++These checks do not certify complete Android boot, SELinux policy labels,
++LMKD pressure handling, GPU/codec compatibility or isolation performance.
++Those require the target board and the final launcher/image integration.
+diff --git a/tools/testing/selftests/Makefile b/tools/testing/selftests/Makefile
+index b3b978d7f..e0d696347 100644
+--- a/tools/testing/selftests/Makefile
++++ b/tools/testing/selftests/Makefile
+@@ -123,6 +123,7 @@ TARGETS += tty
+ TARGETS += ublk
+ TARGETS += uevent
+ TARGETS += uts_resources
++TARGETS += uts_views
+ TARGETS += user_events
+ TARGETS += vDSO
+ TARGETS += mm
+diff --git a/tools/testing/selftests/uts_views/Makefile b/tools/testing/selftests/uts_views/Makefile
+new file mode 100644
+index 000000000..6fb4dc4aa
+--- /dev/null
++++ b/tools/testing/selftests/uts_views/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++CFLAGS += -O2 -Wall -Wextra
++TEST_GEN_PROGS := uts_views
++include ../lib.mk
+diff --git a/tools/testing/selftests/uts_views/config b/tools/testing/selftests/uts_views/config
+new file mode 100644
+index 000000000..2003511c3
+--- /dev/null
++++ b/tools/testing/selftests/uts_views/config
+@@ -0,0 +1,6 @@
++CONFIG_UTS_NS_IDENTITY=y
++CONFIG_UTS_NS_RESOURCES=y
++CONFIG_UTS_NS_VIEWS=y
++CONFIG_ANDROID_UID_CPUTIME=y
++CONFIG_PSI=y
++CONFIG_PSI_DEFAULT_DISABLED=n
+diff --git a/tools/testing/selftests/uts_views/uts_views.c b/tools/testing/selftests/uts_views/uts_views.c
+new file mode 100644
+index 000000000..db58afff1
+--- /dev/null
++++ b/tools/testing/selftests/uts_views/uts_views.c
+@@ -0,0 +1,583 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#define _GNU_SOURCE
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/magic.h>
++#include <linux/mount.h>
++#include <linux/netlink.h>
++#include <linux/nsfs.h>
++#include <poll.h>
++#include <sched.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mount.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/statfs.h>
++#include <sys/syscall.h>
++#include <sys/sysinfo.h>
++#include <sys/wait.h>
++#include <time.h>
++#include <unistd.h>
++
++#define CHECK(x)                                                             \
++	do {                                                                 \
++		if (!(x)) {                                                  \
++			fprintf(stderr, "FAIL line %d: %s (%s)\n", __LINE__, \
++				#x, strerror(errno));                        \
++			exit(1);                                             \
++		}                                                            \
++	} while (0)
++#define NS_COUNT 4
++
++_Static_assert(sizeof(struct uts_view_config) == 4304, "native/compat config");
++_Static_assert(sizeof(struct uts_view_info) == 128, "native/compat info");
++_Static_assert(__builtin_offsetof(struct uts_view_config, cmdline) == 208,
++	       "config offset");
++
++static const char *const nsnames[NS_COUNT] = { "uts", "pid", "net", "time" };
++static uint64_t origin;
++static int64_t mono_offset;
++static char fixture[256];
++static char host_boot[128];
++static int host_net, host_pid;
++static const char *compat_helper;
++
++struct instance {
++	pid_t shim, init;
++	int channel[2];
++	int ns[NS_COUNT];
++	int cgroup;
++	char path[320];
++};
++
++static void put(const char *path, const char *text)
++{
++	int fd = open(path, O_WRONLY | O_CLOEXEC);
++	size_t length = strlen(text);
++
++	CHECK(fd >= 0);
++	CHECK(write(fd, text, length) == (ssize_t)length);
++	CHECK(!close(fd));
++}
++
++static void get(const char *path, char *data, size_t capacity)
++{
++	int fd = open(path, O_RDONLY | O_CLOEXEC);
++	ssize_t n;
++
++	CHECK(fd >= 0);
++	n = read(fd, data, capacity - 1);
++	CHECK(n >= 0);
++	data[n] = 0;
++	CHECK(!close(fd));
++}
++
++static uint64_t clockns(clockid_t id)
++{
++	struct timespec time;
++
++	CHECK(!clock_gettime(id, &time));
++	return (uint64_t)time.tv_sec * 1000000000 + time.tv_nsec;
++}
++
++static void send_byte(int fd, char value)
++{
++	CHECK(write(fd, &value, 1) == 1);
++}
++
++static void expect_byte(int fd, char expected)
++{
++	char value;
++
++	CHECK(read(fd, &value, 1) == 1 && value == expected);
++}
++
++static void burn(void)
++{
++	uint64_t end = clockns(CLOCK_PROCESS_CPUTIME_ID) + 100000000;
++	volatile unsigned long value = 1;
++
++	while (clockns(CLOCK_PROCESS_CPUTIME_ID) < end)
++		for (int i = 0; i < 1000; i++)
++			value = value * 1664525 + 1013904223;
++}
++
++static int listener(void)
++{
++	int fd = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC,
++			NETLINK_KOBJECT_UEVENT);
++	struct sockaddr_nl address = { .nl_family = AF_NETLINK,
++				       .nl_groups = 1 };
++
++	CHECK(fd >= 0);
++	CHECK(!bind(fd, (void *)&address, sizeof(address)));
++	return fd;
++}
++
++static void send_fd(int socket, int fd)
++{
++	char byte = 'f', control[CMSG_SPACE(sizeof(fd))] = {};
++	struct iovec iov = { &byte, 1 };
++	struct msghdr message = { .msg_iov = &iov,
++				  .msg_iovlen = 1,
++				  .msg_control = control,
++				  .msg_controllen = sizeof(control) };
++	struct cmsghdr *header = CMSG_FIRSTHDR(&message);
++
++	header->cmsg_level = SOL_SOCKET;
++	header->cmsg_type = SCM_RIGHTS;
++	header->cmsg_len = CMSG_LEN(sizeof(fd));
++	memcpy(CMSG_DATA(header), &fd, sizeof(fd));
++	CHECK(sendmsg(socket, &message, 0) == 1);
++}
++
++static int receive_fd(int socket)
++{
++	char byte, control[CMSG_SPACE(sizeof(int))];
++	struct iovec iov = { &byte, 1 };
++	struct msghdr message = { .msg_iov = &iov,
++				  .msg_iovlen = 1,
++				  .msg_control = control,
++				  .msg_controllen = sizeof(control) };
++	struct cmsghdr *header;
++	int fd;
++
++	CHECK(recvmsg(socket, &message, 0) == 1 && byte == 'f');
++	header = CMSG_FIRSTHDR(&message);
++	CHECK(header && header->cmsg_type == SCM_RIGHTS &&
++	      header->cmsg_len == CMSG_LEN(sizeof(fd)));
++	memcpy(&fd, CMSG_DATA(header), sizeof(fd));
++	return fd;
++}
++
++static void check_files(unsigned int index)
++{
++	char data[16384], name[64];
++	struct statfs fs;
++	struct sysinfo info;
++	unsigned long long memory;
++	int fd;
++
++	CHECK(!statfs("/proc", &fs) && fs.f_type == PROC_SUPER_MAGIC);
++	CHECK(!statfs("/sys", &fs) && fs.f_type == SYSFS_MAGIC);
++	get("/proc/version", data, sizeof(data));
++	snprintf(name, sizeof(name), "6.18-instance-%u", index);
++	CHECK(strstr(data, name) && !strstr(data, "build@"));
++	get("/proc/sys/kernel/osrelease", data, sizeof(data));
++	CHECK(strstr(data, name));
++	get("/proc/sys/kernel/random/boot_id", data, sizeof(data));
++	CHECK(strlen(data) == 37 && strcmp(data, host_boot));
++	get("/proc/cmdline", data, sizeof(data));
++	CHECK(!strcmp(data, "androidboot.serialno=uts-test\n"));
++	get("/proc/cpuinfo", data, sizeof(data));
++	snprintf(name, sizeof(name), "Instance CPU %u", index);
++	CHECK(strstr(data, name) && strstr(data, "InstanceVendor"));
++	CHECK(!strstr(data, "CPU implementer") && !strstr(data, "BogoMIPS"));
++	get("/proc/meminfo", data, sizeof(data));
++	CHECK(sscanf(data, "MemTotal: %llu kB", &memory) == 1);
++	CHECK(memory == (index ? 98304 : 65536));
++	CHECK(!syscall(SYS_sysinfo, &info));
++	CHECK((uint64_t)info.totalram * info.mem_unit == memory * 1024);
++	CHECK(llabs((int64_t)info.uptime -
++		    (int64_t)(clockns(CLOCK_BOOTTIME) / 1000000000)) <= 1);
++	get("/proc/uptime", data, sizeof(data));
++	{
++		double uptime;
++
++		CHECK(sscanf(data, "%lf", &uptime) == 1);
++		CHECK(llabs((int64_t)(uptime * 1000000000) -
++			    (int64_t)clockns(CLOCK_BOOTTIME)) < 100000000);
++	}
++	for (size_t i = 0; i < 7; i++) {
++		const char *const paths[] = {
++			"/proc/kallsyms",    "/proc/driver",
++			"/proc/device-tree", "/proc/bootconfig",
++			"/proc/modules",     "/sys/firmware/devicetree",
++			"/sys/bus/i2c"
++		};
++
++		errno = 0;
++		CHECK(access(paths[i], F_OK) == -1 && errno == ENOENT);
++	}
++	CHECK(!chmod("/proc/meminfo", index ? 0444 : 0400));
++	fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
++	CHECK(fd >= 0);
++	burn();
++	CHECK(read(fd, data, 9) == 9);
++	CHECK(lseek(fd, 0, SEEK_SET) == 0);
++	CHECK(read(fd, data, sizeof(data)) > 0);
++	close(fd);
++	errno = 0;
++	CHECK(setns(host_net, CLONE_NEWNET) == -1 && errno == EPERM);
++	CHECK(setns(host_pid, CLONE_NEWPID) == -1);
++	CHECK(!mkdir("/proc-again", 0700));
++	CHECK(!mount("proc", "/proc-again", "proc", 0, NULL));
++	get("/proc-again/meminfo", data, sizeof(data));
++	CHECK(sscanf(data, "MemTotal: %llu kB", &memory) == 1 &&
++	      memory == (index ? 98304 : 65536));
++	CHECK(!umount("/proc-again") && !rmdir("/proc-again"));
++	fd = syscall(SYS_fsopen, "proc", 0);
++	CHECK(fd >= 0);
++	CHECK(!syscall(SYS_fsconfig, fd, FSCONFIG_CMD_CREATE, NULL, NULL, 0));
++	{
++		int mountfd = syscall(SYS_fsmount, fd, 0, 0);
++
++		CHECK(mountfd >= 0);
++		close(mountfd);
++	}
++	close(fd);
++}
++
++static void check_network(void)
++{
++	char event[4096];
++	struct pollfd wait;
++	int fd = listener();
++
++	if (!access("/sys/class/drm/card0/uevent", W_OK)) {
++		put("/sys/class/drm/card0/uevent", "add");
++		wait = (struct pollfd){ .fd = fd, .events = POLLIN };
++		CHECK(poll(&wait, 1, 1000) == 1);
++		CHECK(recv(fd, event, sizeof(event), 0) > 0);
++		CHECK(!access("/sys/class/drm/card0/device/subsystem", F_OK));
++	}
++	put("/sys/class/net/lo/uevent", "change");
++	wait = (struct pollfd){ .fd = fd, .events = POLLIN };
++	CHECK(poll(&wait, 1, 1000) == 1);
++	{
++		struct sockaddr_nl source;
++		socklen_t length = sizeof(source);
++		ssize_t n = recvfrom(fd, event, sizeof(event) - 1, 0,
++				     (void *)&source, &length);
++
++		CHECK(n > 0 && source.nl_pid == 0);
++		for (ssize_t i = 0; i < n - 1; i++)
++			if (!event[i])
++				event[i] = '\n';
++		event[n] = 0;
++		CHECK(strstr(event, "DEVPATH=/devices/virtual/net/lo") &&
++		      !strstr(event, "OF_"));
++	}
++	close(fd);
++	CHECK(!unshare(CLONE_NEWNET));
++	CHECK(!mkdir("/sys-again", 0700));
++	CHECK(!mount("sysfs", "/sys-again", "sysfs", 0, NULL));
++	CHECK(!access("/sys-again/class/net/lo/ifindex", R_OK));
++	CHECK(!umount("/sys-again") && !rmdir("/sys-again"));
++}
++
++static void guest(unsigned int index, int channel)
++{
++	char buffer[4096];
++	struct pollfd pressure;
++	int fd;
++
++	expect_byte(channel, 'g');
++	CHECK(!umount2("/proc", MNT_DETACH));
++	CHECK(!mount("proc", "/proc", "proc", 0, NULL));
++	CHECK(!umount2("/sys", MNT_DETACH));
++	CHECK(!mount("sysfs", "/sys", "sysfs", 0, NULL));
++	check_files(index);
++	if (compat_helper) {
++		pid_t helper = fork();
++		int status;
++
++		CHECK(helper >= 0);
++		if (!helper) {
++			int ns = open("/proc/self/ns/uts", O_RDONLY);
++
++			CHECK(ns >= 0 && dup2(ns, 9) == 9);
++			CHECK(!fcntl(9, F_SETFD, 0));
++			execl(compat_helper, compat_helper, NULL);
++			_exit(127);
++		}
++		CHECK(waitpid(helper, &status, 0) == helper &&
++		      WIFEXITED(status) && !WEXITSTATUS(status));
++	}
++	fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
++	CHECK(fd >= 0);
++	send_fd(channel, fd);
++	close(fd);
++	fd = open("/proc/pressure/memory", O_RDWR | O_CLOEXEC);
++	CHECK(fd >= 0);
++	CHECK(write(fd, "some 1000 1000000\n", 18) == 18);
++	send_byte(channel, 'p');
++	expect_byte(channel, 'p');
++	if (!index) {
++		volatile char *memory = malloc(32 * 1024 * 1024);
++
++		CHECK(memory);
++		for (size_t i = 0; i < 32 * 1024 * 1024; i += 4096)
++			memory[i] = 1;
++		pressure = (struct pollfd){ .fd = fd, .events = POLLPRI };
++		CHECK(poll(&pressure, 1, 2000) == 1 &&
++		      (pressure.revents & POLLPRI));
++		free((void *)memory);
++	} else {
++		pressure = (struct pollfd){ .fd = fd, .events = POLLPRI };
++		CHECK(poll(&pressure, 1, 2000) == 0);
++	}
++	close(fd);
++	get("/proc/stat", buffer, sizeof(buffer));
++	CHECK(strstr(buffer, "ctxt ") && strstr(buffer, "processes "));
++	check_network();
++	send_byte(channel, 'd');
++	expect_byte(channel, 'x');
++	_exit(0);
++}
++
++static void launch(struct instance *instance, unsigned int index)
++{
++	char path[512], text[256];
++	int status;
++
++	CHECK(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
++			  instance->channel));
++	instance->shim = fork();
++	CHECK(instance->shim >= 0);
++	if (!instance->shim) {
++		int64_t boot = -(int64_t)origin;
++		int64_t mono = mono_offset;
++		pid_t init;
++
++		close(instance->channel[0]);
++		CHECK(!unshare(CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID |
++			       CLONE_NEWTIME | CLONE_NEWNS));
++		CHECK(!mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL));
++		snprintf(text, sizeof(text),
++			 "boottime %lld %lld\nmonotonic %lld %lld\n",
++			 (long long)(boot / 1000000000 -
++				     (boot % 1000000000 != 0)),
++			 (long long)((boot % 1000000000 + 1000000000) %
++				     1000000000),
++			 (long long)(mono / 1000000000 -
++				     (mono % 1000000000 != 0)),
++			 (long long)((mono % 1000000000 + 1000000000) %
++				     1000000000));
++		put("/proc/self/timens_offsets", text);
++		init = fork();
++		CHECK(init >= 0);
++		if (!init)
++			guest(index, instance->channel[1]);
++		CHECK(write(instance->channel[1], &init, sizeof(init)) ==
++		      sizeof(init));
++		CHECK(waitpid(init, &status, 0) == init && WIFEXITED(status));
++		_exit(WEXITSTATUS(status));
++	}
++	close(instance->channel[1]);
++	CHECK(read(instance->channel[0], &instance->init,
++		   sizeof(instance->init)) == sizeof(instance->init));
++	snprintf(instance->path, sizeof(instance->path), "%s/instance%u",
++		 fixture, index);
++	CHECK(!mkdir(instance->path, 0700));
++	snprintf(path, sizeof(path), "%s/memory.max", instance->path);
++	put(path, index ? "100663296" : "67108864");
++	if (!index) {
++		snprintf(path, sizeof(path), "%.319s/memory.high",
++			 instance->path);
++		put(path, "16777216");
++	}
++	snprintf(path, sizeof(path), "%s/cgroup.procs", instance->path);
++	snprintf(text, sizeof(text), "%d", instance->init);
++	put(path, text);
++	instance->cgroup =
++		open(instance->path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++	CHECK(instance->cgroup >= 0);
++	for (int i = 0; i < NS_COUNT; i++) {
++		snprintf(path, sizeof(path), "/proc/%d/ns/%s", instance->init,
++			 nsnames[i]);
++		instance->ns[i] = open(path, O_RDONLY | O_CLOEXEC);
++		CHECK(instance->ns[i] >= 0);
++	}
++}
++
++static unsigned long long cpu_total(const char *path)
++{
++	char data[16384];
++	unsigned long long user, nice, system;
++
++	get(path, data, sizeof(data));
++	CHECK(sscanf(data, "cpu %llu %llu %llu", &user, &nice, &system) == 3);
++	return user + nice + system;
++}
++
++static void check_deleted_cgroup(struct instance *instance)
++{
++	char subgroup[512], path[512], stat[128], text[32];
++	unsigned long long before, active, removed;
++	int start[2], status;
++	pid_t worker;
++
++	snprintf(stat, sizeof(stat), "/proc/%d/root/proc/stat", instance->init);
++	snprintf(subgroup, sizeof(subgroup), "%.319s/short-lived",
++		 instance->path);
++	before = cpu_total(stat);
++	CHECK(!mkdir(subgroup, 0700) && !pipe(start));
++	worker = fork();
++	CHECK(worker >= 0);
++	if (!worker) {
++		close(start[1]);
++		expect_byte(start[0], 'g');
++		burn();
++		_exit(0);
++	}
++	close(start[0]);
++	snprintf(path, sizeof(path), "%.480s/cgroup.procs", subgroup);
++	snprintf(text, sizeof(text), "%d", worker);
++	put(path, text);
++	send_byte(start[1], 'g');
++	close(start[1]);
++	CHECK(waitpid(worker, &status, 0) == worker && WIFEXITED(status) &&
++	      !WEXITSTATUS(status));
++	active = cpu_total(stat);
++	CHECK(active > before);
++	CHECK(!rmdir(subgroup));
++	removed = cpu_total(stat);
++	CHECK(removed >= active);
++}
++
++static void configure(struct instance *instance, unsigned int index)
++{
++	struct uts_ns_identity identity = { .abi_version = 1 };
++	struct uts_resource_binding resources = { .abi = 1,
++						  .cgroup_fd = instance->cgroup,
++						  .generation = { index + 1,
++								  42 },
++						  .start_boottime_ns = origin };
++	struct uts_event_binding events = { .abi = 1,
++					    .netns_fd = instance->ns[2],
++					    .generation = { index + 1, 42 } };
++	struct uts_view_config config = { .abi = 1,
++					  .pidns_fd = instance->ns[1],
++					  .netns_fd = instance->ns[2],
++					  .timens_fd = instance->ns[3],
++					  .generation = { index + 1, 42 } };
++	struct uts_view_info info;
++
++	snprintf(identity.release, sizeof(identity.release), "6.18-instance-%u",
++		 index);
++	snprintf(identity.version, sizeof(identity.version),
++		 "#1 instance kernel");
++	CHECK(!ioctl(instance->ns[0], NS_UTS_SET_IDENTITY, &identity));
++	CHECK(!ioctl(instance->ns[0], NS_UTS_BIND_RESOURCES, &resources));
++	if (!access("/sys/class/drm/card0/dev", R_OK)) {
++		char dev[64];
++
++		get("/sys/class/drm/card0/dev", dev, sizeof(dev));
++		CHECK(sscanf(dev, "%u:%u", &events.devices[0].major,
++			     &events.devices[0].minor) == 2);
++		events.devices[0].class = UTS_EVENT_DRM;
++		strcpy(events.devices[0].name, "card0");
++		events.count = 1;
++	}
++	CHECK(!ioctl(instance->ns[0], NS_UTS_BIND_EVENTS, &events));
++	strcpy(config.cpu_vendor, "InstanceVendor");
++	snprintf(config.cpu_model, sizeof(config.cpu_model), "Instance CPU %u",
++		 index);
++	strcpy(config.cmdline, "androidboot.serialno=uts-test");
++	config.profile_sha256[0] = index + 1;
++	config.flags = 1;
++	CHECK(ioctl(instance->ns[0], NS_UTS_CONFIG_VIEW, &config) == -1 &&
++	      errno == EINVAL);
++	CHECK(!ioctl(instance->ns[0], NS_UTS_GET_VIEW, &info) &&
++	      info.flags == 0);
++	config.flags = 0;
++	CHECK(!ioctl(instance->ns[0], NS_UTS_CONFIG_VIEW, &config));
++	CHECK(ioctl(instance->ns[0], NS_UTS_CONFIG_VIEW, &config) == -1 &&
++	      errno == EBUSY);
++	CHECK(!ioctl(instance->ns[0], NS_UTS_GET_VIEW, &info));
++	CHECK(info.abi == 1 && info.flags == (UTS_VIEW_BOUND | UTS_VIEW_LIVE) &&
++	      info.capabilities == 255);
++	for (int i = 1; i < NS_COUNT; i++) {
++		uint64_t id;
++
++		CHECK(!ioctl(instance->ns[i], NS_GET_ID, &id));
++		CHECK(id == (i == 1 ? info.pidns_id :
++			     i == 2 ? info.netns_id :
++					    info.timens_id));
++	}
++}
++
++int main(int argc, char **argv)
++{
++	struct instance instances[2];
++	struct uts_view_info info;
++	char path[512], buffer[4096];
++	struct stat before, after;
++	int files[2], fd, status;
++
++	setbuf(stdout, NULL);
++	compat_helper = argc > 1 ? argv[1] : NULL;
++	fd = open("/proc/self/ns/uts", O_RDONLY | O_CLOEXEC);
++	CHECK(fd >= 0);
++	if (ioctl(fd, NS_UTS_GET_VIEW, &info) && errno == ENOTTY) {
++		puts("SKIP: CONFIG_UTS_NS_VIEWS is unavailable");
++		return 4;
++	}
++	CHECK(info.abi == 1 && info.flags == 0);
++	close(fd);
++	host_net = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
++	host_pid = open("/proc/self/ns/pid", O_RDONLY | O_CLOEXEC);
++	CHECK(host_net >= 0 && host_pid >= 0);
++	get("/proc/sys/kernel/random/boot_id", host_boot, sizeof(host_boot));
++	CHECK(!stat("/proc/meminfo", &before));
++	origin = clockns(CLOCK_BOOTTIME);
++	mono_offset = (int64_t)clockns(CLOCK_BOOTTIME) -
++		      (int64_t)clockns(CLOCK_MONOTONIC);
++	if (mono_offset < 0)
++		mono_offset = 0;
++	mono_offset -= origin;
++	snprintf(fixture, sizeof(fixture), "/sys/fs/cgroup/uts-views-%d",
++		 getpid());
++	CHECK(!mkdir(fixture, 0700));
++	snprintf(path, sizeof(path), "%s/cgroup.subtree_control", fixture);
++	put(path, "+cpu +memory +cpuset +pids +io");
++	for (unsigned int i = 0; i < 2; i++) {
++		launch(&instances[i], i);
++		configure(&instances[i], i);
++		send_byte(instances[i].channel[0], 'g');
++	}
++	for (unsigned int i = 0; i < 2; i++) {
++		files[i] = receive_fd(instances[i].channel[0]);
++		expect_byte(instances[i].channel[0], 'p');
++		CHECK(read(files[i], buffer, sizeof(buffer)) > 0);
++		CHECK(lseek(files[i], 0, SEEK_SET) == 0);
++	}
++	check_deleted_cgroup(&instances[0]);
++	puts("PASS: two native proc/sysfs mounts, fixed FDs, syscall/time/identity views and remounts");
++	for (unsigned int i = 0; i < 2; i++)
++		send_byte(instances[i].channel[0], 'p');
++	for (unsigned int i = 0; i < 2; i++)
++		expect_byte(instances[i].channel[0], 'd');
++	puts("PASS: instance PSI triggers/poll, standard Netlink coldboot and descendant netns");
++	for (unsigned int i = 0; i < 2; i++) {
++		send_byte(instances[i].channel[0], 'x');
++		CHECK(waitpid(instances[i].shim, &status, 0) ==
++			      instances[i].shim &&
++		      WIFEXITED(status) && !WEXITSTATUS(status));
++		CHECK(!ioctl(instances[i].ns[0], NS_UTS_GET_VIEW, &info) &&
++		      info.flags == UTS_VIEW_BOUND);
++		CHECK(lseek(files[i], 0, SEEK_SET) == 0);
++		CHECK(read(files[i], buffer, sizeof(buffer)) == -1 &&
++		      errno == ENODEV);
++		close(files[i]);
++		for (int j = 0; j < NS_COUNT; j++)
++			close(instances[i].ns[j]);
++		close(instances[i].cgroup);
++		close(instances[i].channel[0]);
++		CHECK(!rmdir(instances[i].path));
++	}
++	CHECK(!rmdir(fixture));
++	CHECK(!stat("/proc/meminfo", &after) &&
++	      (before.st_mode & 0777) == (after.st_mode & 0777));
++	get("/proc/sys/kernel/random/boot_id", buffer, sizeof(buffer));
++	CHECK(!strcmp(buffer, host_boot));
++	puts("PASS: init exit revokes LIVE and stale file reads; host identity and permissions unchanged");
++	return 0;
++}

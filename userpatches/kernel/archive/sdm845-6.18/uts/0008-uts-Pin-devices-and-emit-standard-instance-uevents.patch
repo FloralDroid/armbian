@@ -1,0 +1,167 @@
+From 163e674f55dea2dec3809e63ee93be48f10b33df Mon Sep 17 00:00:00 2001
+From: 5656565566 <contact@home56.top>
+Date: Sun, 1 Nov 2026 23:34:22 +0800
+Subject: [PATCH] uts: Pin devices and emit standard instance uevents
+
+---
+ drivers/base/core.c  | 23 +++++++++++++++
+ init/Kconfig         | 10 +++++++
+ lib/kobject_uevent.c | 69 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 102 insertions(+)
+
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 5ba783e50..950a25f36 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -13,6 +13,7 @@
+ #include <linux/cleanup.h>
+ #include <linux/cpufreq.h>
+ #include <linux/device.h>
++#include <linux/uts_views.h>
+ #include <linux/dma-map-ops.h> /* for dma_default_coherent */
+ #include <linux/err.h>
+ #include <linux/fwnode.h>
+@@ -3056,6 +3057,28 @@ static DEVICE_ATTR_RO(dev);
+ /* /sys/devices/ */
+ struct kset *devices_kset;
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++/* Pin a registered device, rather than trusting a reusable major/minor pair. */
++struct device *uts_device_get_by_devt(dev_t devt)
++{
++	struct kobject *kobj;
++	struct device *dev, *found = NULL;
++
++	spin_lock(&devices_kset->list_lock);
++	list_for_each_entry(kobj, &devices_kset->list, entry) {
++		if (kobj->ktype != &device_ktype)
++			continue;
++		dev = kobj_to_dev(kobj);
++		if (dev->devt == devt && device_is_registered(dev) && kobject_get_unless_zero(kobj)) {
++			found = dev;
++			break;
++		}
++	}
++	spin_unlock(&devices_kset->list_lock);
++	return found;
++}
++#endif
++
+ /**
+  * devices_kset_move_before - Move device in the devices_kset's list.
+  * @deva: Device to move.
+diff --git a/init/Kconfig b/init/Kconfig
+index bff9b9fb3..9beaca243 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1384,6 +1384,16 @@ config UTS_NS_RESOURCES
+ 	  Unbound namespaces retain the original kernel behavior.
+ 
+ 
++config UTS_NS_VIEWS
++	bool "Host-managed native instance procfs and sysfs"
++	depends on ARM64 || X86
++	depends on UTS_NS_RESOURCES && PROC_FS && SYSFS
++	depends on PID_NS && NET_NS && TIME_NS && PSI
++	help
++	  Bind native proc and sysfs mounts to the host-configured UTS instance
++	  domain. Keep Android's standard filesystem and syscall interfaces.
++	  A namespace without a native configuration retains normal behavior.
++
+ config ANDROID_UID_CPUTIME
+ 	bool "Android per-UID CPU time accounting"
+ 	depends on PROC_FS && PID_NS
+diff --git a/lib/kobject_uevent.c b/lib/kobject_uevent.c
+index 0cc358061..2a0b170b9 100644
+--- a/lib/kobject_uevent.c
++++ b/lib/kobject_uevent.c
+@@ -30,6 +30,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/uts_namespace.h>
+ #include <linux/uts_resources.h>
++#include <linux/uts_views.h>
+ #include <net/sock.h>
+ #include <net/netlink.h>
+ #include <net/net_namespace.h>
+@@ -320,6 +321,33 @@ struct uts_event_projection {
+ 	atomic64_t sequence;
+ };
+ 
++struct uts_resource_view *uts_uevent_resources(struct net *net)
++{
++	struct uts_resource_view *view;
++
++	mutex_lock(&uevent_sock_mutex);
++	view = net->uevent_sock ? uts_resources_get(net->uevent_sock->view) : NULL;
++	mutex_unlock(&uevent_sock_mutex);
++	return view;
++}
++
++bool uts_uevent_matches(struct uts_resource_view *view, struct net *net)
++{
++	bool match;
++
++	mutex_lock(&uevent_sock_mutex);
++	match = net->uevent_sock && net->uevent_sock->view == view;
++	mutex_unlock(&uevent_sock_mutex);
++	return match;
++}
++
++const struct uts_event_info *uts_resources_event_info(struct uts_resource_view *view)
++{
++	struct uts_event_projection *projection = uts_resources_events(view);
++
++	return projection ? &projection->info : NULL;
++}
++
+ static const char *uevent_value(const struct kobj_uevent_env *env, const char *key)
+ {
+ 	size_t length = strlen(key);
+@@ -568,6 +596,47 @@ static int uevent_project(struct uevent_sock *socket, struct kobj_uevent_env *so
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++int uts_views_emit_event(struct uts_resource_view *view, struct net *net,
++		const struct uts_event_device *device, struct net_device *netdev,
++		const char *action, size_t count)
++{
++	struct kobj_uevent_env *env;
++	enum kobject_action type;
++	int ret;
++
++	ret = kobject_action_type(action, count, &type, NULL);
++	if (ret)
++		return ret;
++	if (!uts_resources_live(view))
++		return -ENODEV;
++	env = kzalloc(sizeof(*env), GFP_KERNEL);
++	if (!env)
++		return -ENOMEM;
++	ret = add_uevent_var(env, "ACTION=%s", kobject_actions[type]);
++	if (device) {
++		ret = ret ?: add_uevent_var(env, "SUBSYSTEM=%s", device->class == UTS_EVENT_DRM ? "drm" : "video4linux");
++		ret = ret ?: add_uevent_var(env, "MAJOR=%u", device->major);
++		ret = ret ?: add_uevent_var(env, "MINOR=%u", device->minor);
++	} else if (netdev && dev_net(netdev) == net) {
++		ret = ret ?: add_uevent_var(env, "SUBSYSTEM=net");
++		ret = ret ?: add_uevent_var(env, "INTERFACE=%s", netdev->name);
++		ret = ret ?: add_uevent_var(env, "IFINDEX=%u", netdev->ifindex);
++	} else {
++		ret = -EPERM;
++	}
++	mutex_lock(&uevent_sock_mutex);
++	if (!ret && (!net->uevent_sock || net->uevent_sock->view != view))
++		ret = -EPERM;
++	if (!ret)
++		ret = uevent_project(net->uevent_sock, env, !device);
++	mutex_unlock(&uevent_sock_mutex);
++	kfree(env);
++	return ret;
++}
++
++#endif
++
+ static int uevent_project_user(struct uevent_sock *socket, struct sk_buff *skb)
+ {
+ 	struct nlmsghdr *nlh = nlmsg_hdr(skb);
