@@ -1,4 +1,4 @@
-From a7907a25ae1f1ca181d068ecdc80ee72be94315a Mon Sep 17 00:00:00 2001
+From 5f44c98e664e5be4a3fee6229de931f9d1eb2bd5 Mon Sep 17 00:00:00 2001
 From: Stephen Smalley <stephen.smalley.work@gmail.com>
 Date: Mon, 30 Sep 2024 12:54:37 -0400
 Subject: [PATCH 65/90] selinux: convert selinux_file_send_sigiotask() to
@@ -20,10 +20,10 @@ Upstream-commit: 8497b26eb49f8609e8dc39752abbf8004cd156b9
  2 files changed, 7 insertions(+), 11 deletions(-)
 
 diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
-index c52844323045629b1041f6545a8bd8b0c79916af..f90546690f8b972d6d61f841f6876b6626fab349 100644
+index d789b1dcdad34f189a1294e60d497d68d7cd3aba..018a02d972bae39d20dea3937f79295d1c253cf6 100644
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -3875,8 +3875,7 @@ static int selinux_file_alloc_security(struct file *file)
+@@ -3898,8 +3898,7 @@ static int selinux_file_alloc_security(struct file *file)
  	u32 sid = current_sid();
  
  	fsec->sid = sid;
@@ -33,7 +33,7 @@ index c52844323045629b1041f6545a8bd8b0c79916af..f90546690f8b972d6d61f841f6876b66
  
  	return 0;
  }
-@@ -3896,8 +3895,7 @@ static void selinux_file_free_security(struct file *file)
+@@ -3976,8 +3975,7 @@ static void selinux_file_free_security(struct file *file)
  {
  	struct file_security_struct *fsec = selinux_file(file);
  
@@ -43,7 +43,7 @@ index c52844323045629b1041f6545a8bd8b0c79916af..f90546690f8b972d6d61f841f6876b66
  }
  
  /*
-@@ -4265,14 +4263,14 @@ static void selinux_file_set_fowner(struct file *file)
+@@ -4398,14 +4396,14 @@ static void selinux_file_set_fowner(struct file *file)
  	struct file_security_struct *fsec;
  
  	fsec = selinux_file(file);
@@ -60,7 +60,7 @@ index c52844323045629b1041f6545a8bd8b0c79916af..f90546690f8b972d6d61f841f6876b66
  	u32 perm;
  	struct file_security_struct *fsec;
  
-@@ -4286,9 +4284,8 @@ static int selinux_file_send_sigiotask(struct task_struct *tsk,
+@@ -4419,9 +4417,8 @@ static int selinux_file_send_sigiotask(struct task_struct *tsk,
  	else
  		perm = signal_to_av(signum);
  
@@ -73,7 +73,7 @@ index c52844323045629b1041f6545a8bd8b0c79916af..f90546690f8b972d6d61f841f6876b66
  
  static int selinux_file_receive(struct file *file)
 diff --git a/security/selinux/include/objsec.h b/security/selinux/include/objsec.h
-index a1ebfe74a46c227bdc04d0e0fabab97a4a74930d..e739ba62e6b58bdf019841960a022e8cf866fb16 100644
+index 5594c8378f2c87851bcb237701368faa74cca920..37a3c2ea1db7ea181d87ecaf8a139e53a7259dcb 100644
 --- a/security/selinux/include/objsec.h
 +++ b/security/selinux/include/objsec.h
 @@ -74,10 +74,9 @@ struct inode_security_struct {
@@ -87,4 +87,4 @@ index a1ebfe74a46c227bdc04d0e0fabab97a4a74930d..e739ba62e6b58bdf019841960a022e8c
 +	const struct cred *cred; /* cred for file owner (for SIGIO) */
  };
  
- struct backing_file_security_struct {
+ struct backing_file_security_layer {

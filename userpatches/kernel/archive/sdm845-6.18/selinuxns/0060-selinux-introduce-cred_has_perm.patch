@@ -1,4 +1,4 @@
-From e55670bc0c7505635d05fafe6c80e50505998a12 Mon Sep 17 00:00:00 2001
+From abbaa2fd1dc1b7b418a7c85f62d341364945c908 Mon Sep 17 00:00:00 2001
 From: Stephen Smalley <stephen.smalley.work@gmail.com>
 Date: Wed, 25 Sep 2024 11:12:38 -0400
 Subject: [PATCH 60/90] selinux: introduce cred_has_perm()
@@ -31,10 +31,10 @@ Backport: route directory cache misses through cred_has_perm_noaudit while retai
  3 files changed, 206 insertions(+), 227 deletions(-)
 
 diff --git a/security/selinux/avc.c b/security/selinux/avc.c
-index 51d63670c2af82e8101402bc02810455feb9d408..a0f72635191c4a5948a5d7540482bce764e9db3e 100644
+index 2b864a70675513332485faa7e61a49dfad87fe5b..b4b66de31e48c695ef77d18c9b6e4f33c49da757 100644
 --- a/security/selinux/avc.c
 +++ b/security/selinux/avc.c
-@@ -1363,6 +1363,59 @@ int cred_self_has_perm_noaudit(const struct cred *cred, u16 tclass,
+@@ -1366,6 +1366,59 @@ int cred_self_has_perm_noaudit(const struct cred *cred, u16 tclass,
  	return 0;
  }
  
@@ -93,9 +93,9 @@ index 51d63670c2af82e8101402bc02810455feb9d408..a0f72635191c4a5948a5d7540482bce7
 +
  u32 avc_policy_seqno(struct selinux_state *state)
  {
- 	return state->avc->avc_cache.latest_notif;
+ 	/* Writers hold notif_lock; readers only sample the sequence number. */
 diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
-index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4df7906c5 100644
+index 6836251ac2b1b691d58141f17185346957be25f3..fff09622890f6dc3d1e5388fbc676729cec69824 100644
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
 @@ -446,17 +446,14 @@ static int may_context_mount_sb_relabel(u32 sid,
@@ -143,7 +143,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_is_genfs_special_handling(struct super_block *sb)
-@@ -1700,16 +1694,13 @@ static int inode_has_perm(const struct cred *cred,
+@@ -1723,16 +1717,13 @@ static int inode_has_perm(const struct cred *cred,
  			  struct common_audit_data *adp)
  {
  	struct inode_security_struct *isec;
@@ -161,7 +161,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  /* Same as inode_has_perm, but pass explicit audit data containing
-@@ -1763,7 +1754,7 @@ static inline int file_path_has_perm(const struct cred *cred,
+@@ -1786,7 +1777,7 @@ static inline int file_path_has_perm(const struct cred *cred,
  }
  
  #ifdef CONFIG_BPF_SYSCALL
@@ -170,7 +170,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  #endif
  
  static int __file_has_perm(const struct cred *cred, const struct file *file,
-@@ -1801,15 +1792,14 @@ static int __file_has_perm(const struct cred *cred, const struct file *file,
+@@ -1824,15 +1815,14 @@ static int __file_has_perm(const struct cred *cred, const struct file *file,
  	}
  
  	if (ssid != tsid_fd) {
@@ -188,7 +188,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	if (rc)
  		return rc;
  #endif
-@@ -1868,23 +1858,21 @@ static int may_create(struct inode *dir,
+@@ -1891,23 +1881,21 @@ static int may_create(struct inode *dir,
  		      struct dentry *dentry,
  		      u16 tclass)
  {
@@ -216,7 +216,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  			  DIR__ADD_NAME | DIR__SEARCH,
  			  &ad);
  	if (rc)
-@@ -1895,8 +1883,7 @@ static int may_create(struct inode *dir,
+@@ -1918,8 +1906,7 @@ static int may_create(struct inode *dir,
  	if (rc)
  		return rc;
  
@@ -226,7 +226,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	if (rc)
  		return rc;
  
-@@ -1916,9 +1903,9 @@ static int may_link(struct inode *dir,
+@@ -1939,9 +1926,9 @@ static int may_link(struct inode *dir,
  		    int kind)
  
  {
@@ -237,7 +237,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	u32 av;
  	int rc;
  
-@@ -1930,8 +1917,7 @@ static int may_link(struct inode *dir,
+@@ -1953,8 +1940,7 @@ static int may_link(struct inode *dir,
  
  	av = DIR__SEARCH;
  	av |= (kind ? DIR__REMOVE_NAME : DIR__ADD_NAME);
@@ -247,7 +247,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	if (rc)
  		return rc;
  
-@@ -1951,9 +1937,7 @@ static int may_link(struct inode *dir,
+@@ -1974,9 +1960,7 @@ static int may_link(struct inode *dir,
  		return 0;
  	}
  
@@ -258,7 +258,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static inline int may_rename(struct inode *old_dir,
-@@ -1961,9 +1945,9 @@ static inline int may_rename(struct inode *old_dir,
+@@ -1984,9 +1968,9 @@ static inline int may_rename(struct inode *old_dir,
  			     struct inode *new_dir,
  			     struct dentry *new_dentry)
  {
@@ -269,7 +269,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	u32 av;
  	int old_is_dir, new_is_dir;
  	int rc;
-@@ -1976,20 +1960,17 @@ static inline int may_rename(struct inode *old_dir,
+@@ -1999,20 +1983,17 @@ static inline int may_rename(struct inode *old_dir,
  	ad.type = LSM_AUDIT_DATA_DENTRY;
  
  	ad.u.dentry = old_dentry;
@@ -295,7 +295,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  		if (rc)
  			return rc;
  	}
-@@ -1998,17 +1979,15 @@ static inline int may_rename(struct inode *old_dir,
+@@ -2021,17 +2002,15 @@ static inline int may_rename(struct inode *old_dir,
  	av = DIR__ADD_NAME | DIR__SEARCH;
  	if (d_is_positive(new_dentry))
  		av |= DIR__REMOVE_NAME;
@@ -317,7 +317,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  		if (rc)
  			return rc;
  	}
-@@ -2023,11 +2002,10 @@ static int superblock_has_perm(const struct cred *cred,
+@@ -2046,11 +2025,10 @@ static int superblock_has_perm(const struct cred *cred,
  			       struct common_audit_data *ad)
  {
  	struct superblock_security_struct *sbsec;
@@ -331,7 +331,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  /* Convert a Linux mode and permission mask to an access vector. */
-@@ -2150,17 +2128,14 @@ static int selinux_binder_transfer_file(const struct cred *from,
+@@ -2173,17 +2151,14 @@ static int selinux_binder_transfer_file(const struct cred *from,
  	ad.u.path = file->f_path;
  
  	if (sid != fsec->sid) {
@@ -352,7 +352,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	if (rc)
  		return rc;
  #endif
-@@ -2169,9 +2144,8 @@ static int selinux_binder_transfer_file(const struct cred *from,
+@@ -2192,9 +2167,8 @@ static int selinux_binder_transfer_file(const struct cred *from,
  		return 0;
  
  	isec = backing_inode_security(dentry);
@@ -364,7 +364,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_ptrace_access_check(struct task_struct *child,
-@@ -2269,25 +2243,25 @@ static int selinux_quota_on(struct dentry *dentry)
+@@ -2292,25 +2266,25 @@ static int selinux_quota_on(struct dentry *dentry)
  
  static int selinux_syslog(int type)
  {
@@ -400,7 +400,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  /*
-@@ -3097,12 +3071,8 @@ static int selinux_inode_init_security_anon(struct inode *inode,
+@@ -3120,12 +3094,8 @@ static int selinux_inode_init_security_anon(struct inode *inode,
  	ad.type = LSM_AUDIT_DATA_ANONINODE;
  	ad.u.anonclass = name ? (const char *)name->name : "?";
  
@@ -415,7 +415,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_inode_create(struct inode *dir, struct dentry *dentry, umode_t mode)
-@@ -3158,7 +3128,6 @@ static int selinux_inode_follow_link(struct dentry *dentry, struct inode *inode,
+@@ -3181,7 +3151,6 @@ static int selinux_inode_follow_link(struct dentry *dentry, struct inode *inode,
  {
  	struct common_audit_data ad;
  	struct inode_security_struct *isec;
@@ -423,7 +423,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  
  	ad.type = LSM_AUDIT_DATA_DENTRY;
  	ad.u.dentry = dentry;
-@@ -3166,8 +3135,8 @@ static int selinux_inode_follow_link(struct dentry *dentry, struct inode *inode,
+@@ -3189,8 +3158,8 @@ static int selinux_inode_follow_link(struct dentry *dentry, struct inode *inode,
  	if (IS_ERR(isec))
  		return PTR_ERR(isec);
  
@@ -434,7 +434,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static noinline int audit_inode_permission(struct inode *inode,
-@@ -3313,8 +3282,8 @@ static int selinux_inode_permission(struct inode *inode, int requested)
+@@ -3336,8 +3305,8 @@ static int selinux_inode_permission(struct inode *inode, int requested)
  			rc = -EACCES;
  	} else {
  		/* Cache miss. */
@@ -445,7 +445,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  		task_avdcache_update(tsec, isec, avdp);
  	}
  
-@@ -3405,11 +3374,12 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
+@@ -3428,11 +3397,12 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
  				  struct dentry *dentry, const char *name,
  				  const void *value, size_t size, int flags)
  {
@@ -459,7 +459,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	int rc = 0;
  
  	/* if not a selinux xattr, only check the ordinary setattr perm */
-@@ -3430,9 +3400,8 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
+@@ -3453,9 +3423,8 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
  	ad.u.dentry = dentry;
  
  	isec = backing_inode_security(dentry);
@@ -471,7 +471,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	if (rc)
  		return rc;
  
-@@ -3471,14 +3440,13 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
+@@ -3494,14 +3463,13 @@ static int selinux_inode_setxattr(struct mnt_idmap *idmap,
  	if (rc)
  		return rc;
  
@@ -489,7 +489,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	if (rc)
  		return rc;
  
-@@ -3929,11 +3897,8 @@ static int ioctl_has_perm(const struct cred *cred, struct file *file,
+@@ -4009,11 +3977,8 @@ static int ioctl_has_perm(const struct cred *cred, struct file *file,
  	ad.u.op->path = file->f_path;
  
  	if (ssid != fsec->sid) {
@@ -503,15 +503,15 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  		if (rc)
  			goto out;
  	}
-@@ -4158,7 +4123,6 @@ static int selinux_file_mprotect(struct vm_area_struct *vma,
+@@ -4282,7 +4247,6 @@ static int selinux_file_mprotect(struct vm_area_struct *vma,
  {
  	int rc;
  	const struct cred *cred = current_cred();
 -	u32 sid = cred_sid(cred);
+ 	u32 av;
  	const struct file *file = vma->vm_file;
  	bool backing_file;
- 	bool shared = vma->vm_flags & VM_SHARED;
-@@ -4408,14 +4372,10 @@ static void selinux_cred_getlsmprop(const struct cred *c, struct lsm_prop *prop)
+@@ -4541,14 +4505,10 @@ static void selinux_cred_getlsmprop(const struct cred *c, struct lsm_prop *prop)
  static int selinux_kernel_act_as(struct cred *new, u32 secid)
  {
  	struct cred_security_struct *crsec = selinux_cred(new);
@@ -528,7 +528,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	if (ret == 0) {
  		crsec->sid = secid;
  		crsec->create_sid = 0;
-@@ -4433,15 +4393,12 @@ static int selinux_kernel_create_files_as(struct cred *new, struct inode *inode)
+@@ -4566,15 +4526,12 @@ static int selinux_kernel_create_files_as(struct cred *new, struct inode *inode)
  {
  	struct inode_security_struct *isec = inode_security(inode);
  	struct cred_security_struct *crsec = selinux_cred(new);
@@ -548,7 +548,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	if (ret == 0)
  		crsec->create_sid = isec->sid;
  	return ret;
-@@ -4454,9 +4411,8 @@ static int selinux_kernel_module_request(char *kmod_name)
+@@ -4587,9 +4544,8 @@ static int selinux_kernel_module_request(char *kmod_name)
  	ad.type = LSM_AUDIT_DATA_KMOD;
  	ad.u.kmod_name = kmod_name;
  
@@ -560,7 +560,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_kernel_load_from_file(struct file *file, u32 requested)
-@@ -4464,27 +4420,27 @@ static int selinux_kernel_load_from_file(struct file *file, u32 requested)
+@@ -4597,27 +4553,27 @@ static int selinux_kernel_load_from_file(struct file *file, u32 requested)
  	struct common_audit_data ad;
  	struct inode_security_struct *isec;
  	struct file_security_struct *fsec;
@@ -594,7 +594,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_kernel_read_file(struct file *file,
-@@ -5009,9 +4965,8 @@ static int sock_has_perm(struct sock *sk, u32 perms)
+@@ -5143,9 +5099,8 @@ static int sock_has_perm(struct sock *sk, u32 perms)
  
  	ad_net_init_from_sk(&ad, &net, sk);
  
@@ -606,7 +606,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_socket_create(int family, int type,
-@@ -5030,9 +4985,8 @@ static int selinux_socket_create(int family, int type,
+@@ -5164,9 +5119,8 @@ static int selinux_socket_create(int family, int type,
  	if (rc)
  		return rc;
  
@@ -618,7 +618,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_socket_post_create(struct socket *sock, int family,
-@@ -6000,8 +5954,7 @@ static void selinux_inet_conn_established(struct sock *sk, struct sk_buff *skb)
+@@ -6134,8 +6088,7 @@ static void selinux_inet_conn_established(struct sock *sk, struct sk_buff *skb)
  
  static int selinux_secmark_relabel_packet(u32 sid)
  {
@@ -628,7 +628,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  			    PACKET__RELABELTO, NULL);
  }
  
-@@ -6031,8 +5984,6 @@ static int selinux_tun_dev_alloc_security(void *security)
+@@ -6165,8 +6118,6 @@ static int selinux_tun_dev_alloc_security(void *security)
  
  static int selinux_tun_dev_create(void)
  {
@@ -637,7 +637,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	/* we aren't taking into account the "sockcreate" SID since the socket
  	 * that is being created here is not a socket in the traditional sense,
  	 * instead it is a private sock, accessible only to the kernel, and
-@@ -6040,18 +5991,17 @@ static int selinux_tun_dev_create(void)
+@@ -6174,18 +6125,17 @@ static int selinux_tun_dev_create(void)
  	 * connections unlike traditional sockets - check the TUN driver to
  	 * get a better understanding of why this socket is special */
  
@@ -661,7 +661,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_tun_dev_attach(struct sock *sk, void *security)
-@@ -6074,21 +6024,19 @@ static int selinux_tun_dev_attach(struct sock *sk, void *security)
+@@ -6208,21 +6158,19 @@ static int selinux_tun_dev_attach(struct sock *sk, void *security)
  
  static int selinux_tun_dev_open(void *security)
  {
@@ -689,7 +689,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  
  	return 0;
  }
-@@ -6465,15 +6413,14 @@ static int ipc_has_perm(struct kern_ipc_perm *ipc_perms,
+@@ -6599,15 +6547,14 @@ static int ipc_has_perm(struct kern_ipc_perm *ipc_perms,
  {
  	struct ipc_security_struct *isec;
  	struct common_audit_data ad;
@@ -707,7 +707,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_msg_msg_alloc_security(struct msg_msg *msg)
-@@ -6491,7 +6438,6 @@ static int selinux_msg_queue_alloc_security(struct kern_ipc_perm *msq)
+@@ -6625,7 +6572,6 @@ static int selinux_msg_queue_alloc_security(struct kern_ipc_perm *msq)
  {
  	struct ipc_security_struct *isec;
  	struct common_audit_data ad;
@@ -715,7 +715,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  
  	isec = selinux_ipc(msq);
  	ipc_init_security(isec, SECCLASS_MSGQ);
-@@ -6499,24 +6445,21 @@ static int selinux_msg_queue_alloc_security(struct kern_ipc_perm *msq)
+@@ -6633,24 +6579,21 @@ static int selinux_msg_queue_alloc_security(struct kern_ipc_perm *msq)
  	ad.type = LSM_AUDIT_DATA_IPC;
  	ad.u.ipc_id = msq->key;
  
@@ -743,7 +743,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  			    MSGQ__ASSOCIATE, &ad);
  }
  
-@@ -6528,8 +6471,7 @@ static int selinux_msg_queue_msgctl(struct kern_ipc_perm *msq, int cmd)
+@@ -6662,8 +6605,7 @@ static int selinux_msg_queue_msgctl(struct kern_ipc_perm *msq, int cmd)
  	case IPC_INFO:
  	case MSG_INFO:
  		/* No specific object, just general system-wide information. */
@@ -753,7 +753,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  				    SECCLASS_SYSTEM, SYSTEM__IPC_INFO, NULL);
  	case IPC_STAT:
  	case MSG_STAT:
-@@ -6551,6 +6493,7 @@ static int selinux_msg_queue_msgctl(struct kern_ipc_perm *msq, int cmd)
+@@ -6685,6 +6627,7 @@ static int selinux_msg_queue_msgctl(struct kern_ipc_perm *msq, int cmd)
  
  static int selinux_msg_queue_msgsnd(struct kern_ipc_perm *msq, struct msg_msg *msg, int msqflg)
  {
@@ -761,7 +761,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	struct ipc_security_struct *isec;
  	struct msg_security_struct *msec;
  	struct common_audit_data ad;
-@@ -6578,14 +6521,11 @@ static int selinux_msg_queue_msgsnd(struct kern_ipc_perm *msq, struct msg_msg *m
+@@ -6712,14 +6655,11 @@ static int selinux_msg_queue_msgsnd(struct kern_ipc_perm *msq, struct msg_msg *m
  	ad.u.ipc_id = msq->key;
  
  	/* Can this process write to the queue? */
@@ -779,7 +779,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	if (!rc)
  		/* Can the message be put in the queue? */
  		rc = avc_has_perm(current_selinux_state,
-@@ -6626,7 +6566,6 @@ static int selinux_shm_alloc_security(struct kern_ipc_perm *shp)
+@@ -6760,7 +6700,6 @@ static int selinux_shm_alloc_security(struct kern_ipc_perm *shp)
  {
  	struct ipc_security_struct *isec;
  	struct common_audit_data ad;
@@ -787,7 +787,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  
  	isec = selinux_ipc(shp);
  	ipc_init_security(isec, SECCLASS_SHM);
-@@ -6634,25 +6573,22 @@ static int selinux_shm_alloc_security(struct kern_ipc_perm *shp)
+@@ -6768,25 +6707,22 @@ static int selinux_shm_alloc_security(struct kern_ipc_perm *shp)
  	ad.type = LSM_AUDIT_DATA_IPC;
  	ad.u.ipc_id = shp->key;
  
@@ -817,7 +817,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  /* Note, at this point, shp is locked down */
-@@ -6664,9 +6600,9 @@ static int selinux_shm_shmctl(struct kern_ipc_perm *shp, int cmd)
+@@ -6798,9 +6734,9 @@ static int selinux_shm_shmctl(struct kern_ipc_perm *shp, int cmd)
  	case IPC_INFO:
  	case SHM_INFO:
  		/* No specific object, just general system-wide information. */
@@ -830,7 +830,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	case IPC_STAT:
  	case SHM_STAT:
  	case SHM_STAT_ANY:
-@@ -6707,7 +6643,6 @@ static int selinux_sem_alloc_security(struct kern_ipc_perm *sma)
+@@ -6841,7 +6777,6 @@ static int selinux_sem_alloc_security(struct kern_ipc_perm *sma)
  {
  	struct ipc_security_struct *isec;
  	struct common_audit_data ad;
@@ -838,7 +838,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  
  	isec = selinux_ipc(sma);
  	ipc_init_security(isec, SECCLASS_SEM);
-@@ -6715,25 +6650,22 @@ static int selinux_sem_alloc_security(struct kern_ipc_perm *sma)
+@@ -6849,25 +6784,22 @@ static int selinux_sem_alloc_security(struct kern_ipc_perm *sma)
  	ad.type = LSM_AUDIT_DATA_IPC;
  	ad.u.ipc_id = sma->key;
  
@@ -868,7 +868,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  /* Note, at this point, sma is locked down */
-@@ -6746,9 +6678,9 @@ static int selinux_sem_semctl(struct kern_ipc_perm *sma, int cmd)
+@@ -6880,9 +6812,9 @@ static int selinux_sem_semctl(struct kern_ipc_perm *sma, int cmd)
  	case IPC_INFO:
  	case SEM_INFO:
  		/* No specific object, just general system-wide information. */
@@ -881,7 +881,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	case GETPID:
  	case GETNCNT:
  	case GETZCNT:
-@@ -6882,9 +6814,10 @@ static int selinux_lsm_getattr(unsigned int attr, struct task_struct *p,
+@@ -7016,9 +6948,10 @@ static int selinux_lsm_getattr(unsigned int attr, struct task_struct *p,
  
  static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
  {
@@ -893,7 +893,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  	int error;
  	char *str = value;
  
-@@ -6893,23 +6826,23 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
+@@ -7027,23 +6960,23 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
  	 */
  	switch (attr) {
  	case LSM_ATTR_EXEC:
@@ -922,7 +922,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  					   PROCESS__SETCURRENT, NULL);
  		break;
  	default:
-@@ -6976,8 +6909,8 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
+@@ -7110,8 +7043,8 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
  		crsec->create_sid = sid;
  	} else if (attr == LSM_ATTR_KEYCREATE) {
  		if (sid) {
@@ -933,7 +933,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  			if (error)
  				goto abort_change;
  		}
-@@ -7202,7 +7135,7 @@ static int selinux_key_permission(key_ref_t key_ref,
+@@ -7336,7 +7269,7 @@ static int selinux_key_permission(key_ref_t key_ref,
  {
  	struct key *key;
  	struct key_security_struct *ksec;
@@ -942,7 +942,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  
  	switch (need_perm) {
  	case KEY_NEED_VIEW:
-@@ -7234,12 +7167,10 @@ static int selinux_key_permission(key_ref_t key_ref,
+@@ -7368,12 +7301,10 @@ static int selinux_key_permission(key_ref_t key_ref,
  
  	}
  
@@ -956,7 +956,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_key_getsecurity(struct key *key, char **_buffer)
-@@ -7261,10 +7192,9 @@ static int selinux_key_getsecurity(struct key *key, char **_buffer)
+@@ -7395,10 +7326,9 @@ static int selinux_key_getsecurity(struct key *key, char **_buffer)
  static int selinux_watch_key(struct key *key)
  {
  	struct key_security_struct *ksec = selinux_key(key);
@@ -969,7 +969,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  #endif
  #endif
-@@ -7330,19 +7260,17 @@ static int selinux_ib_alloc_security(void *ib_sec)
+@@ -7464,19 +7394,17 @@ static int selinux_ib_alloc_security(void *ib_sec)
  static int selinux_bpf(int cmd, union bpf_attr *attr,
  		       unsigned int size, bool kernel)
  {
@@ -994,7 +994,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  		break;
  	default:
  		ret = 0;
-@@ -7371,7 +7299,7 @@ static u32 bpf_map_fmode_to_av(fmode_t fmode)
+@@ -7505,7 +7433,7 @@ static u32 bpf_map_fmode_to_av(fmode_t fmode)
   * access the bpf object and that's why we have to add this additional check in
   * selinux_file_receive and selinux_binder_transfer_files.
   */
@@ -1003,7 +1003,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  {
  	struct bpf_security_struct *bpfsec;
  	struct bpf_prog *prog;
-@@ -7381,16 +7309,14 @@ static int bpf_fd_pass(const struct file *file, u32 sid)
+@@ -7515,16 +7443,14 @@ static int bpf_fd_pass(const struct file *file, u32 sid)
  	if (file->f_op == &bpf_map_fops) {
  		map = file->private_data;
  		bpfsec = selinux_bpf_map_security(map);
@@ -1022,7 +1022,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  				   BPF__PROG_RUN, NULL);
  		if (ret)
  			return ret;
-@@ -7400,23 +7326,19 @@ static int bpf_fd_pass(const struct file *file, u32 sid)
+@@ -7534,23 +7460,19 @@ static int bpf_fd_pass(const struct file *file, u32 sid)
  
  static int selinux_bpf_map(struct bpf_map *map, fmode_t fmode)
  {
@@ -1049,7 +1049,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  			    BPF__PROG_RUN, NULL);
  }
  
-@@ -7479,7 +7401,7 @@ struct lsm_blob_sizes selinux_blob_sizes __ro_after_init = {
+@@ -7613,7 +7535,7 @@ struct lsm_blob_sizes selinux_blob_sizes __ro_after_init = {
  #ifdef CONFIG_PERF_EVENTS
  static int selinux_perf_event_open(int type)
  {
@@ -1058,7 +1058,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  
  	if (type == PERF_SECURITY_OPEN)
  		requested = PERF_EVENT__OPEN;
-@@ -7492,8 +7414,8 @@ static int selinux_perf_event_open(int type)
+@@ -7626,8 +7548,8 @@ static int selinux_perf_event_open(int type)
  	else
  		return -EINVAL;
  
@@ -1069,7 +1069,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  
  static int selinux_perf_event_alloc(struct perf_event *event)
-@@ -7509,19 +7431,17 @@ static int selinux_perf_event_alloc(struct perf_event *event)
+@@ -7643,19 +7565,17 @@ static int selinux_perf_event_alloc(struct perf_event *event)
  static int selinux_perf_event_read(struct perf_event *event)
  {
  	struct perf_event_security_struct *perfsec = event->security;
@@ -1093,7 +1093,7 @@ index 270905fc5764b79c3d616aa80c149cee14157f8a..c6406a1ee42edb35170ded4d771428e4
  }
  #endif
  
-@@ -7569,7 +7489,7 @@ static int selinux_uring_cmd(struct io_uring_cmd *ioucmd)
+@@ -7703,7 +7623,7 @@ static int selinux_uring_cmd(struct io_uring_cmd *ioucmd)
  	ad.type = LSM_AUDIT_DATA_FILE;
  	ad.u.file = file;
  

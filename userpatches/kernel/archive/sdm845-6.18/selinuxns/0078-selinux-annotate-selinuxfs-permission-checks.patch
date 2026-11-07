@@ -1,4 +1,4 @@
-From c94177b8b12f597abaffa46a12d742eb1947f17b Mon Sep 17 00:00:00 2001
+From d451e3a25d09b2c6837f2793c5e1bac32b83d528 Mon Sep 17 00:00:00 2001
 From: Stephen Smalley <stephen.smalley.work@gmail.com>
 Date: Tue, 1 Oct 2024 10:17:11 -0400
 Subject: [PATCH 78/90] selinux: annotate selinuxfs permission checks
@@ -20,10 +20,10 @@ Upstream-commit: 056773a5e1db0daa19bd9c148fe72965161bb597
  1 file changed, 55 insertions(+), 1 deletion(-)
 
 diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
-index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e66143a51b25b 100644
+index be4a8ab401cefdb42a8ddacc26107548ca9af299..da65532e02218ae93f3c460c7febbcb0adf8d88a 100644
 --- a/security/selinux/selinuxfs.c
 +++ b/security/selinux/selinuxfs.c
-@@ -168,6 +168,10 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
+@@ -167,6 +167,10 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
  
  	old_value = enforcing_enabled(state);
  	if (new_value != old_value) {
@@ -34,9 +34,9 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  		length = avc_has_perm(current_selinux_state,
  				      current_sid(), SECINITSID_SECURITY,
  				      SECCLASS_SECURITY, SECURITY__SETENFORCE,
-@@ -493,6 +497,10 @@ static int sel_open_policy(struct inode *inode, struct file *filp)
- 
- 	mutex_lock(&fsi->state->policy_mutex);
+@@ -488,6 +492,10 @@ static int sel_open_policy(struct inode *inode, struct file *filp)
+ 	struct policy_load_memory *plm = NULL;
+ 	int rc;
  
 +	/*
 +	 * Only check against the current namespace because
@@ -45,7 +45,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	rc = avc_has_perm(current_selinux_state,
  			  current_sid(), SECINITSID_SECURITY,
  			  SECCLASS_SECURITY, SECURITY__READ_POLICY, NULL);
-@@ -555,6 +563,10 @@ static ssize_t sel_read_policy(struct file *filp, char __user *buf,
+@@ -537,6 +545,10 @@ static ssize_t sel_read_policy(struct file *filp, char __user *buf,
  	struct policy_load_memory *plm = filp->private_data;
  	int ret;
  
@@ -56,7 +56,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	ret = avc_has_perm(current_selinux_state,
  			   current_sid(), SECINITSID_SECURITY,
  			   SECCLASS_SECURITY, SECURITY__READ_POLICY, NULL);
-@@ -711,7 +723,13 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
+@@ -693,7 +705,13 @@ static ssize_t sel_write_load(struct file *file, const char __user *buf,
  	if (fsi->state != current_selinux_state)
  		return -EPERM;
  
@@ -71,7 +71,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  			      SECCLASS_SECURITY, SECURITY__LOAD_POLICY, NULL);
  	if (length)
  		return length;
-@@ -765,6 +783,10 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
+@@ -747,6 +765,10 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
  	u32 sid, len;
  	ssize_t length;
  
@@ -82,7 +82,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	length = avc_has_perm(current_selinux_state,
  			      current_sid(), SECINITSID_SECURITY,
  			      SECCLASS_SECURITY, SECURITY__CHECK_CONTEXT, NULL);
-@@ -842,6 +864,10 @@ static ssize_t sel_write_validatetrans(struct file *file,
+@@ -824,6 +846,10 @@ static ssize_t sel_write_validatetrans(struct file *file,
  	if (state != current_selinux_state)
  		return -EPERM;
  
@@ -93,7 +93,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	rc = avc_has_perm(current_selinux_state,
  			  current_sid(), SECINITSID_SECURITY,
  			  SECCLASS_SECURITY, SECURITY__VALIDATE_TRANS, NULL);
-@@ -975,6 +1001,10 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
+@@ -957,6 +983,10 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
  	struct av_decision avd;
  	ssize_t length;
  
@@ -104,7 +104,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	length = avc_has_perm(current_selinux_state,
  			      current_sid(), SECINITSID_SECURITY,
  			      SECCLASS_SECURITY, SECURITY__COMPUTE_AV, NULL);
-@@ -1029,6 +1059,10 @@ static ssize_t sel_write_create(struct file *file, char *buf, size_t size)
+@@ -1011,6 +1041,10 @@ static ssize_t sel_write_create(struct file *file, char *buf, size_t size)
  	u32 len;
  	int nargs;
  
@@ -115,7 +115,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	length = avc_has_perm(current_selinux_state,
  			      current_sid(), SECINITSID_SECURITY,
  			      SECCLASS_SECURITY, SECURITY__COMPUTE_CREATE,
-@@ -1131,6 +1165,10 @@ static ssize_t sel_write_relabel(struct file *file, char *buf, size_t size)
+@@ -1113,6 +1147,10 @@ static ssize_t sel_write_relabel(struct file *file, char *buf, size_t size)
  	char *newcon = NULL;
  	u32 len;
  
@@ -126,7 +126,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	length = avc_has_perm(current_selinux_state,
  			      current_sid(), SECINITSID_SECURITY,
  			      SECCLASS_SECURITY, SECURITY__COMPUTE_RELABEL,
-@@ -1201,6 +1239,10 @@ static ssize_t sel_write_member(struct file *file, char *buf, size_t size)
+@@ -1183,6 +1221,10 @@ static ssize_t sel_write_member(struct file *file, char *buf, size_t size)
  	char *newcon = NULL;
  	u32 len;
  
@@ -137,7 +137,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	length = avc_has_perm(current_selinux_state,
  			      current_sid(), SECINITSID_SECURITY,
  			      SECCLASS_SECURITY, SECURITY__COMPUTE_MEMBER,
-@@ -1324,6 +1366,10 @@ static ssize_t sel_write_bool(struct file *filep, const char __user *buf,
+@@ -1306,6 +1348,10 @@ static ssize_t sel_write_bool(struct file *filep, const char __user *buf,
  
  	mutex_lock(&fsi->state->policy_mutex);
  
@@ -148,7 +148,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	length = avc_has_perm(current_selinux_state,
  			      current_sid(), SECINITSID_SECURITY,
  			      SECCLASS_SECURITY, SECURITY__SETBOOL,
-@@ -1383,6 +1429,10 @@ static ssize_t sel_commit_bools_write(struct file *filep,
+@@ -1365,6 +1411,10 @@ static ssize_t sel_commit_bools_write(struct file *filep,
  
  	mutex_lock(&fsi->state->policy_mutex);
  
@@ -159,7 +159,7 @@ index 16dfa86f689b0404c4f4938cdbbe0c31c5950a52..e5ae1d124f6ef1c9e4f38f870b5e6614
  	length = avc_has_perm(current_selinux_state,
  			      current_sid(), SECINITSID_SECURITY,
  			      SECCLASS_SECURITY, SECURITY__SETBOOL,
-@@ -1504,6 +1554,10 @@ static ssize_t sel_write_avc_cache_threshold(struct file *file,
+@@ -1486,6 +1536,10 @@ static ssize_t sel_write_avc_cache_threshold(struct file *file,
  	if (state != current_selinux_state)
  		return -EPERM;
  

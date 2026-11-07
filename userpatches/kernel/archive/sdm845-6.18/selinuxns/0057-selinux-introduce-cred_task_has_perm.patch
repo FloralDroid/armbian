@@ -1,4 +1,4 @@
-From 57f849e5ec0d32e12ba7e82283a80a999a2c4283 Mon Sep 17 00:00:00 2001
+From a4543c5b98e86d1ff15810d1df77e8892f4430e3 Mon Sep 17 00:00:00 2001
 From: Stephen Smalley <stephen.smalley.work@gmail.com>
 Date: Thu, 12 Sep 2024 09:08:36 -0400
 Subject: [PATCH 57/90] selinux: introduce cred_task_has_perm()
@@ -20,10 +20,10 @@ Upstream-commit: c7cdca955810dafd83fd2c20ecc3724cc52b27a6
  3 files changed, 81 insertions(+), 56 deletions(-)
 
 diff --git a/security/selinux/avc.c b/security/selinux/avc.c
-index 056e597912ec8efedcbe3a8875c259a1c95e26e0..466d6f5a7fd9b87f4df23d17da54bbf892cfe223 100644
+index a58196e346eee1fddfe39206bb91435167011306..f3ec4d029852a6affae6708626ce6f114441a972 100644
 --- a/security/selinux/avc.c
 +++ b/security/selinux/avc.c
-@@ -1246,6 +1246,50 @@ int avc_has_perm(struct selinux_state *state, u32 ssid, u32 tsid, u16 tclass,
+@@ -1249,6 +1249,50 @@ int avc_has_perm(struct selinux_state *state, u32 ssid, u32 tsid, u16 tclass,
  	return rc;
  }
  
@@ -73,12 +73,12 @@ index 056e597912ec8efedcbe3a8875c259a1c95e26e0..466d6f5a7fd9b87f4df23d17da54bbf8
 +
  u32 avc_policy_seqno(struct selinux_state *state)
  {
- 	return state->avc->avc_cache.latest_notif;
+ 	/* Writers hold notif_lock; readers only sample the sequence number. */
 diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
-index 2cbfc573fd06e818efc588a211447942d8193d26..3606f24a2d49d17090a5875ef78dacbf888fe7ba 100644
+index 1cb07cfe608fdce3e412cac10dee00327e9cb392..1d4fad3bf9e5140c7c396fc1483abcc0e389d72b 100644
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -2182,15 +2182,12 @@ static int selinux_binder_transfer_file(const struct cred *from,
+@@ -2205,15 +2205,12 @@ static int selinux_binder_transfer_file(const struct cred *from,
  static int selinux_ptrace_access_check(struct task_struct *child,
  				       unsigned int mode)
  {
@@ -98,7 +98,7 @@ index 2cbfc573fd06e818efc588a211447942d8193d26..3606f24a2d49d17090a5875ef78dacbf
  }
  
  static int selinux_ptrace_traceme(struct task_struct *parent)
-@@ -2203,9 +2200,8 @@ static int selinux_ptrace_traceme(struct task_struct *parent)
+@@ -2226,9 +2223,8 @@ static int selinux_ptrace_traceme(struct task_struct *parent)
  static int selinux_capget(const struct task_struct *target, kernel_cap_t *effective,
  			  kernel_cap_t *inheritable, kernel_cap_t *permitted)
  {
@@ -110,7 +110,7 @@ index 2cbfc573fd06e818efc588a211447942d8193d26..3606f24a2d49d17090a5875ef78dacbf
  }
  
  static int selinux_capset(struct cred *new, const struct cred *old,
-@@ -4580,23 +4576,20 @@ static int selinux_kernel_load_data(enum kernel_load_data_id id, bool contents)
+@@ -4714,23 +4710,20 @@ static int selinux_kernel_load_data(enum kernel_load_data_id id, bool contents)
  
  static int selinux_task_setpgid(struct task_struct *p, pid_t pgid)
  {
@@ -140,7 +140,7 @@ index 2cbfc573fd06e818efc588a211447942d8193d26..3606f24a2d49d17090a5875ef78dacbf
  }
  
  static void selinux_current_getlsmprop_subj(struct lsm_prop *prop)
-@@ -4612,23 +4605,20 @@ static void selinux_task_getlsmprop_obj(struct task_struct *p,
+@@ -4746,23 +4739,20 @@ static void selinux_task_getlsmprop_obj(struct task_struct *p,
  
  static int selinux_task_setnice(struct task_struct *p, int nice)
  {
@@ -170,7 +170,7 @@ index 2cbfc573fd06e818efc588a211447942d8193d26..3606f24a2d49d17090a5875ef78dacbf
  }
  
  static int selinux_task_prlimit(const struct cred *cred, const struct cred *tcred,
-@@ -4657,56 +4647,43 @@ static int selinux_task_setrlimit(struct task_struct *p, unsigned int resource,
+@@ -4791,56 +4781,43 @@ static int selinux_task_setrlimit(struct task_struct *p, unsigned int resource,
  	   later be used as a safe reset point for the soft limit
  	   upon context transitions.  See selinux_bprm_committing_creds. */
  	if (old_rlim->rlim_max != new_rlim->rlim_max)
@@ -238,7 +238,7 @@ index 2cbfc573fd06e818efc588a211447942d8193d26..3606f24a2d49d17090a5875ef78dacbf
  }
  
  static void selinux_task_to_inode(struct task_struct *p,
-@@ -6870,14 +6847,14 @@ static int selinux_lsm_getattr(unsigned int attr, struct task_struct *p,
+@@ -7004,14 +6981,14 @@ static int selinux_lsm_getattr(unsigned int attr, struct task_struct *p,
  	u32 len;
  
  	rcu_read_lock();

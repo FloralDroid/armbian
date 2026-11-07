@@ -1,4 +1,4 @@
-From 36cff8edc40cb31b429c00f48530b789903b02be Mon Sep 17 00:00:00 2001
+From 1d4fb831e42d5ec63dede4dfd879e629d1587ac7 Mon Sep 17 00:00:00 2001
 From: Stephen Smalley <stephen.smalley.work@gmail.com>
 Date: Mon, 23 Sep 2024 10:40:21 -0400
 Subject: [PATCH 58/90] selinux: introduce cred_has_extended_perms()
@@ -18,10 +18,10 @@ Upstream-commit: a67c30eab6156667a3a2476095d88c50dd54207f
  3 files changed, 33 insertions(+), 4 deletions(-)
 
 diff --git a/security/selinux/avc.c b/security/selinux/avc.c
-index 466d6f5a7fd9b87f4df23d17da54bbf892cfe223..d9640679ee477081dfc0de57909882ed555bb55f 100644
+index f3ec4d029852a6affae6708626ce6f114441a972..2065fc60ecf9fd18a905698eaf8e3a38feee1f8e 100644
 --- a/security/selinux/avc.c
 +++ b/security/selinux/avc.c
-@@ -1290,6 +1290,32 @@ int cred_task_has_perm(const struct cred *cred, const struct task_struct *p,
+@@ -1293,6 +1293,32 @@ int cred_task_has_perm(const struct cred *cred, const struct task_struct *p,
  	return 0;
  }
  
@@ -53,12 +53,12 @@ index 466d6f5a7fd9b87f4df23d17da54bbf892cfe223..d9640679ee477081dfc0de57909882ed
 +
  u32 avc_policy_seqno(struct selinux_state *state)
  {
- 	return state->avc->avc_cache.latest_notif;
+ 	/* Writers hold notif_lock; readers only sample the sequence number. */
 diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
-index 3606f24a2d49d17090a5875ef78dacbf888fe7ba..27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2 100644
+index 1d4fad3bf9e5140c7c396fc1483abcc0e389d72b..62d362586bfc9f7f62f8f36806a83aeafbaab2e3 100644
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -3947,10 +3947,9 @@ static int ioctl_has_perm(const struct cred *cred, struct file *file,
+@@ -4027,10 +4027,9 @@ static int ioctl_has_perm(const struct cred *cred, struct file *file,
  		return 0;
  
  	isec = inode_security(inode);

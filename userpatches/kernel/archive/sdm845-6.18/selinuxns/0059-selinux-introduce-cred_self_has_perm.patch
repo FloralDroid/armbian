@@ -1,4 +1,4 @@
-From 8e758c859a166ee164b41745167b11e48c54282d Mon Sep 17 00:00:00 2001
+From b807d043b000f71914541fae0c880dd635cdd134 Mon Sep 17 00:00:00 2001
 From: Stephen Smalley <stephen.smalley.work@gmail.com>
 Date: Tue, 24 Sep 2024 14:15:41 -0400
 Subject: [PATCH 59/90] selinux: introduce cred_self_has_perm()
@@ -21,10 +21,10 @@ Upstream-commit: bc390ce978d17c1839a0e0a6abc725769b00463a
  3 files changed, 88 insertions(+), 58 deletions(-)
 
 diff --git a/security/selinux/avc.c b/security/selinux/avc.c
-index d9640679ee477081dfc0de57909882ed555bb55f..51d63670c2af82e8101402bc02810455feb9d408 100644
+index 2065fc60ecf9fd18a905698eaf8e3a38feee1f8e..2b864a70675513332485faa7e61a49dfad87fe5b 100644
 --- a/security/selinux/avc.c
 +++ b/security/selinux/avc.c
-@@ -1316,6 +1316,53 @@ int cred_has_extended_perms(const struct cred *cred, u32 tsid, u16 tclass,
+@@ -1319,6 +1319,53 @@ int cred_has_extended_perms(const struct cred *cred, u32 tsid, u16 tclass,
  	return 0;
  }
  
@@ -77,12 +77,12 @@ index d9640679ee477081dfc0de57909882ed555bb55f..51d63670c2af82e8101402bc02810455
 +
  u32 avc_policy_seqno(struct selinux_state *state)
  {
- 	return state->avc->avc_cache.latest_notif;
+ 	/* Writers hold notif_lock; readers only sample the sequence number. */
 diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
-index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee14157f8a 100644
+index 62d362586bfc9f7f62f8f36806a83aeafbaab2e3..6836251ac2b1b691d58141f17185346957be25f3 100644
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -1663,9 +1663,7 @@ static int cred_has_capability(const struct cred *cred,
+@@ -1670,9 +1670,7 @@ static int cred_has_capability(const struct cred *cred,
  			       int cap, unsigned int opts, bool initns)
  {
  	struct common_audit_data ad;
@@ -92,7 +92,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  	u32 av = CAP_TO_MASK(cap);
  	int rc;
  
-@@ -1685,14 +1683,11 @@ static int cred_has_capability(const struct cred *cred,
+@@ -1692,14 +1690,11 @@ static int cred_has_capability(const struct cred *cred,
  		return -EINVAL;
  	}
  
@@ -112,7 +112,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  	return rc;
  }
  
-@@ -4048,15 +4043,14 @@ static int __file_map_prot_check(const struct file *file, unsigned long prot,
+@@ -4176,15 +4171,14 @@ static int __file_map_prot_check(const struct file *file, unsigned long prot,
  	if (!mounter_check && default_noexec && prot_exec &&
  	    (!file || IS_PRIVATE(inode) || (!shared && prot_write))) {
  		int rc;
@@ -131,7 +131,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  		if (rc)
  			return rc;
  	}
-@@ -4089,10 +4083,8 @@ static int selinux_mmap_addr(unsigned long addr)
+@@ -4213,10 +4207,8 @@ static int selinux_mmap_addr(unsigned long addr)
  	int rc = 0;
  
  	if (addr < CONFIG_LSM_MMAP_MIN_ADDR) {
@@ -144,7 +144,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  	}
  
  	return rc;
-@@ -4187,16 +4179,15 @@ static int selinux_file_mprotect(struct vm_area_struct *vma,
+@@ -4312,16 +4304,15 @@ static int selinux_file_mprotect(struct vm_area_struct *vma,
  		 */
  		if (vma->vm_start >= vma->vm_mm->start_brk &&
  		    vma->vm_end <= vma->vm_mm->brk) {
@@ -166,7 +166,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  			if (rc)
  				return rc;
  		} else if (file && vma->anon_vma) {
-@@ -4349,13 +4340,12 @@ static int selinux_file_open(struct file *file)
+@@ -4482,13 +4473,12 @@ static int selinux_file_open(struct file *file)
  static int selinux_task_alloc(struct task_struct *task,
  			      u64 clone_flags)
  {
@@ -182,7 +182,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  }
  
  /*
-@@ -4478,9 +4468,8 @@ static int selinux_kernel_load_from_file(struct file *file, u32 requested)
+@@ -4611,9 +4601,8 @@ static int selinux_kernel_load_from_file(struct file *file, u32 requested)
  	int rc;
  
  	if (file == NULL)
@@ -194,7 +194,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  
  	ad.type = LSM_AUDIT_DATA_FILE;
  	ad.u.file = file;
-@@ -4700,11 +4689,8 @@ static void selinux_task_to_inode(struct task_struct *p,
+@@ -4834,11 +4823,8 @@ static void selinux_task_to_inode(struct task_struct *p,
  
  static int selinux_userns_create(const struct cred *cred)
  {
@@ -208,7 +208,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  }
  
  /* Returns error only if unable to parse addresses */
-@@ -6907,29 +6893,24 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
+@@ -7041,29 +7027,24 @@ static int selinux_lsm_setattr(u64 attr, void *value, size_t size)
  	 */
  	switch (attr) {
  	case LSM_ATTR_EXEC:
@@ -248,7 +248,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  		break;
  	default:
  		error = -EOPNOTSUPP;
-@@ -7566,10 +7547,8 @@ static int selinux_uring_override_creds(const struct cred *new)
+@@ -7700,10 +7681,8 @@ static int selinux_uring_override_creds(const struct cred *new)
   */
  static int selinux_uring_sqpoll(void)
  {
@@ -261,7 +261,7 @@ index 27fa6e52bc4ccfadb5f6fca6e215f1b6876392f2..270905fc5764b79c3d616aa80c149cee
  }
  
  /**
-@@ -7601,10 +7580,8 @@ static int selinux_uring_cmd(struct io_uring_cmd *ioucmd)
+@@ -7735,10 +7714,8 @@ static int selinux_uring_cmd(struct io_uring_cmd *ioucmd)
   */
  static int selinux_uring_allowed(void)
  {

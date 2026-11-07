@@ -1,4 +1,4 @@
-From f7836d282233b1d58c27a22b9408e8bc162ae333 Mon Sep 17 00:00:00 2001
+From e5e5a7bc9a14631a8d9d32163763b9eb05ed693f Mon Sep 17 00:00:00 2001
 From: Stephen Smalley <stephen.smalley.work@gmail.com>
 Date: Tue, 1 Oct 2024 08:13:17 -0400
 Subject: [PATCH 69/90] selinux: introduce selinux_state_has_perm()
@@ -28,10 +28,10 @@ Upstream-commit: e0e69573f70075abd8df2d07f8b9074b61dd43fe
  4 files changed, 81 insertions(+), 31 deletions(-)
 
 diff --git a/security/selinux/avc.c b/security/selinux/avc.c
-index 0d650efe16ac0a13c8ad703882dd0307b49afb1e..c6bc1f0a745d1826cb7915530d6d0c7a05e5f9ef 100644
+index 11edd223a7f4e77bf2603245f9ab69c08b448695..e8576f1abbb25ce51e94366edf829aab324bddf2 100644
 --- a/security/selinux/avc.c
 +++ b/security/selinux/avc.c
-@@ -1688,6 +1688,43 @@ int cred_other_has_perm(const struct cred *cred, const struct cred *other,
+@@ -1691,6 +1691,43 @@ int cred_other_has_perm(const struct cred *cred, const struct cred *other,
  	return 0;
  }
  
@@ -74,12 +74,12 @@ index 0d650efe16ac0a13c8ad703882dd0307b49afb1e..c6bc1f0a745d1826cb7915530d6d0c7a
 +
  u32 avc_policy_seqno(struct selinux_state *state)
  {
- 	return state->avc->avc_cache.latest_notif;
+ 	/* Writers hold notif_lock; readers only sample the sequence number. */
 diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
-index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495a6e51a52 100644
+index be61788f3090e5582a1cc38e5f5ce2dbb8085216..8984b2ed93471821c17534406f2df9b1603966ad 100644
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -5456,16 +5456,16 @@ static int selinux_inet_sys_rcv_skb(struct selinux_state *state,
+@@ -5590,16 +5590,16 @@ static int selinux_inet_sys_rcv_skb(struct selinux_state *state,
  	err = sel_netif_sid(state, ns, ifindex, &if_sid);
  	if (err)
  		return err;
@@ -100,7 +100,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  }
  
  static int selinux_sock_rcv_skb_compat(struct sock *sk, struct sk_buff *skb,
-@@ -5485,8 +5485,9 @@ static int selinux_sock_rcv_skb_compat(struct sock *sk, struct sk_buff *skb,
+@@ -5619,8 +5619,9 @@ static int selinux_sock_rcv_skb_compat(struct sock *sk, struct sk_buff *skb,
  		return err;
  
  	if (selinux_secmark_enabled()) {
@@ -112,7 +112,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  		if (err)
  			return err;
  	}
-@@ -5546,8 +5547,8 @@ static int selinux_socket_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
+@@ -5680,8 +5681,8 @@ static int selinux_socket_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
  			selinux_netlbl_err(skb, family, err, 0);
  			return err;
  		}
@@ -123,7 +123,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  		if (err) {
  			selinux_netlbl_err(skb, family, err, 0);
  			return err;
-@@ -5555,8 +5556,9 @@ static int selinux_socket_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
+@@ -5689,8 +5690,9 @@ static int selinux_socket_sock_rcv_skb(struct sock *sk, struct sk_buff *skb)
  	}
  
  	if (secmark_active) {
@@ -135,7 +135,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  		if (err)
  			return err;
  	}
-@@ -5740,9 +5742,9 @@ static int selinux_sctp_process_new_assoc(struct sctp_association *asoc,
+@@ -5874,9 +5876,9 @@ static int selinux_sctp_process_new_assoc(struct sctp_association *asoc,
  		 * consistency among the peer SIDs.
  		 */
  		ad_net_init_from_sk(&ad, &net, asoc->base.sk);
@@ -148,7 +148,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  		if (err)
  			return err;
  	}
-@@ -6108,8 +6110,9 @@ static unsigned int selinux_ip_forward(void *priv, struct sk_buff *skb,
+@@ -6242,8 +6244,9 @@ static unsigned int selinux_ip_forward(void *priv, struct sk_buff *skb,
  	}
  
  	if (secmark_active)
@@ -160,7 +160,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  			return NF_DROP;
  
  	if (netlbl_enabled())
-@@ -6190,8 +6193,9 @@ static unsigned int selinux_ip_postroute_compat(struct sk_buff *skb,
+@@ -6324,8 +6327,9 @@ static unsigned int selinux_ip_postroute_compat(struct sk_buff *skb,
  		return NF_DROP;
  
  	if (selinux_secmark_enabled())
@@ -172,7 +172,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  			return NF_DROP_ERR(-ECONNREFUSED);
  
  	if (selinux_xfrm_postroute_last(sksec->sid, skb, sksec->state, &ad,
-@@ -6317,8 +6321,8 @@ static unsigned int selinux_ip_postroute(void *priv,
+@@ -6451,8 +6455,8 @@ static unsigned int selinux_ip_postroute(void *priv,
  		return NF_DROP;
  
  	if (secmark_active)
@@ -183,7 +183,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  			return NF_DROP_ERR(-ECONNREFUSED);
  
  	if (peerlbl_active) {
-@@ -6327,14 +6331,14 @@ static unsigned int selinux_ip_postroute(void *priv,
+@@ -6461,14 +6465,14 @@ static unsigned int selinux_ip_postroute(void *priv,
  
  		if (sel_netif_sid(se_state, state->net, ifindex, &if_sid))
  			return NF_DROP;
@@ -202,7 +202,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  			return NF_DROP_ERR(-ECONNREFUSED);
  	}
  
-@@ -7238,10 +7242,10 @@ static int selinux_ib_pkey_access(void *ib_sec, u64 subnet_prefix, u16 pkey_val)
+@@ -7372,10 +7376,10 @@ static int selinux_ib_pkey_access(void *ib_sec, u64 subnet_prefix, u16 pkey_val)
  	ibpkey.subnet_prefix = subnet_prefix;
  	ibpkey.pkey = pkey_val;
  	ad.u.ibpkey = &ibpkey;
@@ -217,7 +217,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  }
  
  static int selinux_ib_endport_manage_subnet(void *ib_sec, const char *dev_name,
-@@ -7263,10 +7267,10 @@ static int selinux_ib_endport_manage_subnet(void *ib_sec, const char *dev_name,
+@@ -7397,10 +7401,10 @@ static int selinux_ib_endport_manage_subnet(void *ib_sec, const char *dev_name,
  	ibendport.dev_name = dev_name;
  	ibendport.port = port_num;
  	ad.u.ibendport = &ibendport;
@@ -232,7 +232,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  }
  
  static int selinux_ib_alloc_security(void *ib_sec)
-@@ -7841,6 +7845,7 @@ int selinux_state_create(const struct cred *cred)
+@@ -7976,6 +7980,7 @@ int selinux_state_create(const struct cred *cred)
  {
  	struct cred_security_struct *crsec = selinux_cred(cred);
  	struct selinux_state *parent = crsec->state;
@@ -240,7 +240,7 @@ index 6a6b4c9ce6e36e84f92ab1f47b873d1a9e888d07..2c66e4bae21733f6b7642eac30c20495
  	struct selinux_state *newstate;
  	int rc;
  
-@@ -7848,6 +7853,8 @@ int selinux_state_create(const struct cred *cred)
+@@ -7983,6 +7988,8 @@ int selinux_state_create(const struct cred *cred)
  	if (!newstate)
  		return -ENOMEM;
  
