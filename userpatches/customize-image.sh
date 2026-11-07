@@ -18,6 +18,18 @@ BOARD=$3
 BUILD_DESKTOP=$4
 
 Main() {
+	local deb
+	local -a debs=()
+	for deb in /tmp/overlay/debs/*.deb; do
+		[[ -f $deb ]] && debs+=("$deb")
+	done
+
+	if ((${#debs[@]})); then
+		export DEBIAN_FRONTEND=noninteractive
+		apt-get update || return $?
+		apt-get install -y --no-install-recommends "${debs[@]}" || return $?
+	fi
+
 	case $RELEASE in
 		stretch)
 			# your code here
