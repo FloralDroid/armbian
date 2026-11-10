@@ -1,0 +1,66 @@
+From: 5656565566 <contact@home56.top>
+Subject: [PATCH] SELinux: clear every cached mapping for an invalidated namespace
+
+Scan all fixed cache slots, clear duplicate mappings and recompute the
+valid range. A removed first slot must not hide subsequent live slots
+from teardown.
+
+Plain Git-generated diff against the complete Linux 6.18.62 SDM845
+series. No source commit ID is manufactured.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+
+diff --git a/security/selinux/ss/sidtab.c b/security/selinux/ss/sidtab.c
+index 198bcf67483b726f147d517acd084b0a2f131658..708a7ff7cc153b68641b3200b99e15974d56bf20 100644
+--- a/security/selinux/ss/sidtab.c
++++ b/security/selinux/ss/sidtab.c
+@@ -556,7 +556,7 @@ static void sidtab_invalidate_state_entry(struct sidtab_entry *entry,
+ {
+ #if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
+ 	struct sidtab_ss_sid_cache *cache;
+-	int i, first, last;
++	int i, first = -1, last = -1;
+ #endif
+ 
+ 	if (entry->state == state) {
+@@ -566,32 +566,19 @@ static void sidtab_invalidate_state_entry(struct sidtab_entry *entry,
+ 
+ #if CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE > 0
+ 	cache = &entry->ss_sid_cache;
+-	first = cache->first;
+-	last = cache->last;
+-	for (i = first; i >= 0 && i <= last; i++) {
++	for (i = 0; i < CONFIG_SECURITY_SELINUX_SS_SID_CACHE_SIZE; i++) {
+ 		if (cache->state[i] == state) {
+ 			WRITE_ONCE(cache->ss_sid[i], 0);
+ 			WRITE_ONCE(cache->state[i], NULL);
+-			if (first == i) {
+-				for (first = i + 1; first <= last &&
+-					     !cache->ss_sid[first]; first++)
+-					;
+-				if (first == (i+1))
+-					first = -1;
+-				WRITE_ONCE(cache->first, first);
+-			}
+-			if (last == i) {
+-				for (last = i - 1; last >= first &&
+-					     last >= 0 &&
+-					     !cache->ss_sid[last]; last--)
+-					;
+-				if (last == (i-1))
+-					last = -1;
+-				WRITE_ONCE(cache->last, last);
+-			}
+-			return;
++		}
++		if (cache->ss_sid[i]) {
++			if (first < 0)
++				first = i;
++			last = i;
+ 		}
+ 	}
++	WRITE_ONCE(cache->first, first);
++	WRITE_ONCE(cache->last, last);
+ #endif
+ }
+ 

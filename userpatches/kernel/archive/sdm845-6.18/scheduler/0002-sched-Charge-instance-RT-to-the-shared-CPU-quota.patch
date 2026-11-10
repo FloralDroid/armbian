@@ -1,0 +1,807 @@
+From: 5656565566 <contact@home56.top>
+Date: Tue, 10 Nov 2026 18:44:00 +0800
+Subject: [PATCH] sched: Charge instance RT to the shared CPU quota
+
+Keep native FIFO/RR priority, runqueue selection and SMP balancing. Charge
+managed RT and priority inheritance to the instance's existing CFS CPU
+bandwidth hierarchy, shared with ordinary tasks, without fair group
+weighting or a second RT runtime pool. Reuse the throttle return-to-user
+work and limbo lists; retain the native host RT bandwidth safeguards.
+
+Only the initial user namespace may enable quota mode on an empty finite
+unpublished boundary. Descendants inherit that owner and cannot escape it
+or remove its finite quota. Instance RT admission uses the sealed owner;
+SCHED_DEADLINE admission is not delegated.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+
+diff --git a/include/linux/uts_resources.h b/include/linux/uts_resources.h
+index cf17c435e7630190cbd16e8310dbb340db4cc396..add6d7ebd627d08528f5a3d8ea9526255e0e4d72 100644
+--- a/include/linux/uts_resources.h
++++ b/include/linux/uts_resources.h
+@@ -131,9 +131,11 @@ void uts_resources_publish_events(struct uts_resource_view *view, struct uts_eve
+ void memory_resource_watermarks(u64 managed, u64 watermarks[3]);
+ unsigned long uts_resources_task_limit(struct task_struct *task);
+ bool uts_resources_self_rtprio(void);
++bool uts_resources_rt_capable(struct task_struct *p);
+ #else
+ static inline unsigned long uts_resources_task_limit(struct task_struct *task) { return ~0UL; }
+ static inline bool uts_resources_self_rtprio(void) { return false; }
++static inline bool uts_resources_rt_capable(struct task_struct *p) { return false; }
+ static inline struct uts_resource_view *uts_resources_acquire(struct uts_namespace *ns) { return NULL; }
+ static inline void uts_resources_release(struct uts_resource_view *view) {}
+ static inline struct uts_resource_view *uts_resources_get(struct uts_resource_view *view) { return NULL; }
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index e6a3e46b86309f242447b58af81c97ff9fd83a51..f17af56b75092172483c4c2ab3d9291a93fb4d8b 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -9114,6 +9114,9 @@ struct task_group *sched_create_group(struct task_group *parent)
+ 	if (!alloc_rt_sched_group(tg, parent))
+ 		goto err;
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	tg->rt_owner = READ_ONCE(parent->rt_owner);
++#endif
+ 	scx_tg_init(tg);
+ 	alloc_uclamp_sched_group(tg, parent);
+ 
+@@ -9284,6 +9287,11 @@ static void cpu_cgroup_css_released(struct cgroup_subsys_state *css)
+ {
+ 	struct task_group *tg = css_tg(css);
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	/* css release runs in process context, after all task/child references. */
++	if (tg->rt_owner == tg)
++		static_branch_dec(&sched_rt_group_quota);
++#endif
+ 	sched_release_group(tg);
+ }
+ 
+@@ -9307,8 +9315,13 @@ static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
+ 		goto scx_check;
+ 
+ 	cgroup_taskset_for_each(task, css, tset) {
++		if (rt_group_task(task) &&
++		    rt_group_owner(task_group(task)) != rt_group_owner(css_tg(css)))
++			return -EPERM;
+ 		if (!sched_rt_can_attach(css_tg(css), task))
+ 			return -EINVAL;
++		if (rt_group_owner(css_tg(css)) && dl_policy(task->policy))
++			return -EINVAL;
+ 	}
+ scx_check:
+ #endif /* CONFIG_RT_GROUP_SCHED */
+@@ -9320,8 +9333,14 @@ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
+ 	struct task_struct *task;
+ 	struct cgroup_subsys_state *css;
+ 
+-	cgroup_taskset_for_each(task, css, tset)
++	cgroup_taskset_for_each(task, css, tset) {
++#ifdef SCHED_RT_GROUP_QUOTA
++		WRITE_ONCE(css_tg(css)->rt_published, true);
++		if (css_tg(css)->rt_owner)
++			WRITE_ONCE(css_tg(css)->rt_owner->rt_published, true);
++#endif
+ 		sched_move_task(task, false);
++	}
+ }
+ 
+ static void cpu_cgroup_cancel_attach(struct cgroup_taskset *tset)
+@@ -9539,12 +9558,28 @@ static DEFINE_MUTEX(cfs_constraints_mutex);
+ 
+ static int __cfs_schedulable(struct task_group *tg, u64 period, u64 runtime);
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++static int tg_rt_quota_active(struct task_group *tg, void *data)
++{
++	return rt_group_owner(tg) != NULL;
++}
++
++static bool tg_has_rt_quota(struct task_group *tg)
++{
++	guard(rcu)();
++	return walk_tg_tree_from(tg, tg_rt_quota_active, tg_nop, NULL) != 0;
++}
++#else
++static bool tg_has_rt_quota(struct task_group *tg) { return false; }
++#endif
++
+ static int tg_set_cfs_bandwidth(struct task_group *tg,
+ 				u64 period_us, u64 quota_us, u64 burst_us)
+ {
+ 	int i, ret = 0, runtime_enabled, runtime_was_enabled;
+ 	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+ 	u64 period, quota, burst;
++	bool preserve_runtime;
+ 
+ 	period = (u64)period_us * NSEC_PER_USEC;
+ 
+@@ -9562,6 +9597,10 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
+ 	guard(cpus_read_lock)();
+ 	guard(mutex)(&cfs_constraints_mutex);
+ 
++	if (rt_group_owner(tg) == tg && quota == RUNTIME_INF)
++		return -EBUSY;
++	preserve_runtime = tg_has_rt_quota(tg) && cfs_b->quota != RUNTIME_INF;
++
+ 	ret = __cfs_schedulable(tg, period, quota);
+ 	if (ret)
+ 		return ret;
+@@ -9580,7 +9619,10 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
+ 		cfs_b->quota = quota;
+ 		cfs_b->burst = burst;
+ 
+-		__refill_cfs_bandwidth_runtime(cfs_b);
++		if (preserve_runtime)
++			cfs_b->runtime = min(cfs_b->runtime, quota + burst);
++		else
++			__refill_cfs_bandwidth_runtime(cfs_b);
+ 
+ 		/*
+ 		 * Restart the period timer (if active) to handle new
+@@ -9596,7 +9638,10 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
+ 
+ 		guard(rq_lock_irq)(rq);
+ 		cfs_rq->runtime_enabled = runtime_enabled;
+-		cfs_rq->runtime_remaining = 1;
++		if (preserve_runtime)
++			cfs_rq->runtime_remaining = min_t(s64, cfs_rq->runtime_remaining, 1);
++		else
++			cfs_rq->runtime_remaining = 1;
+ 
+ 		if (cfs_rq->throttled)
+ 			unthrottle_cfs_rq(cfs_rq);
+@@ -10227,7 +10272,94 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of,
+ }
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++DEFINE_STATIC_KEY_FALSE(sched_rt_group_quota);
++
++static int cpu_rt_mode_show(struct seq_file *sf, void *v)
++{
++	struct task_group *tg = css_tg(seq_css(sf));
++
++	seq_puts(sf, READ_ONCE(tg->rt_owner) ? "quota\n" : "native\n");
++	return 0;
++}
++
++static ssize_t cpu_rt_mode_write(struct kernfs_open_file *of, char *buf,
++				size_t nbytes, loff_t off)
++{
++	struct task_group *tg = css_tg(of_css(of));
++	struct cgroup *cgrp;
++	bool enable;
++	int ret = 0;
++
++	if (!ns_capable(&init_user_ns, CAP_SYS_ADMIN))
++		return -EPERM;
++	buf = strim(buf);
++	if (!strcmp(buf, "quota"))
++		enable = true;
++	else if (!strcmp(buf, "native"))
++		enable = false;
++	else
++		return -EINVAL;
++
++	/* Match kernfs/cgroup lock ordering without retaining active protection. */
++	cgrp = tg->css.cgroup;
++	css_get(&tg->css);
++	cgroup_get(cgrp);
++	kernfs_break_active_protection(of->kn);
++	cgroup_lock();
++	if (!(tg->css.flags & CSS_ONLINE)) {
++		ret = -ENOENT;
++		goto out;
++	}
++	/* Empty is not sufficient: a published boundary must stay immutable. */
++	if (READ_ONCE(tg->rt_published) || cgroup_is_populated(cgrp) ||
++	    css_has_online_children(&cgrp->self)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	if (tg->parent && tg->parent->rt_owner) {
++		ret = -EPERM;
++		goto out;
++	}
++	if (enable == (tg->rt_owner == tg))
++		goto out;
++	if (enable) {
++		guard(cpus_read_lock)();
++		guard(mutex)(&cfs_constraints_mutex);
++
++		if (!rt_group_sched_enabled() || IS_ENABLED(CONFIG_SCHED_CORE) ||
++		    IS_ENABLED(CONFIG_SCHED_PROXY_EXEC) || IS_ENABLED(CONFIG_SCHED_CLASS_EXT)) {
++			ret = -EOPNOTSUPP;
++			goto out;
++		}
++		if (tg->cfs_bandwidth.quota == RUNTIME_INF) {
++			ret = -EINVAL;
++			goto out;
++		}
++		static_branch_inc_cpuslocked(&sched_rt_group_quota);
++		WRITE_ONCE(tg->rt_owner, tg);
++	} else {
++		WRITE_ONCE(tg->rt_owner, NULL);
++		static_branch_dec(&sched_rt_group_quota);
++	}
++out:
++	cgroup_unlock();
++	kernfs_unbreak_active_protection(of->kn);
++	cgroup_put(cgrp);
++	css_put(&tg->css);
++	return ret ?: nbytes;
++}
++#endif
++
+ static struct cftype cpu_files[] = {
++#ifdef SCHED_RT_GROUP_QUOTA
++	{
++		.name = "rt.mode",
++		.flags = CFTYPE_NOT_ON_ROOT,
++		.seq_show = cpu_rt_mode_show,
++		.write = cpu_rt_mode_write,
++	},
++#endif
+ #ifdef CONFIG_GROUP_SCHED_WEIGHT
+ 	{
+ 		.name = "weight",
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 0180758d90af8ab7b2e566930527c4ee3f9109b7..339ce04256091b3913636e165f0a58ee1c659701 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1910,6 +1910,12 @@ static void update_curr_dl(struct rq *rq)
+ 	struct sched_dl_entity *dl_se = &donor->dl;
+ 	s64 delta_exec;
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (dl_task(donor) && rt_group_task(donor)) {
++		update_curr_rt(rq);
++		return;
++	}
++#endif
+ 	if (!dl_task(donor) || !on_dl_rq(dl_se))
+ 		return;
+ 
+@@ -2259,6 +2265,12 @@ static void dequeue_dl_entity(struct sched_dl_entity *dl_se, int flags)
+ 
+ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+ {
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p)) {
++		enqueue_task_rt(rq, p, flags);
++		return;
++	}
++#endif
+ 	if (is_dl_boosted(&p->dl)) {
+ 		/*
+ 		 * Because of delays in the detection of the overrun of a
+@@ -2319,6 +2331,10 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+ 
+ static bool dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+ {
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p))
++		return dequeue_task_rt(rq, p, flags);
++#endif
+ 	update_curr_dl(rq);
+ 
+ 	if (p->on_rq == TASK_ON_RQ_MIGRATING)
+@@ -2343,6 +2359,13 @@ static bool dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+  */
+ static void yield_task_dl(struct rq *rq)
+ {
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(rq->donor)) {
++		requeue_task_rt(rq, rq->donor, 0);
++		resched_curr(rq);
++		return;
++	}
++#endif
+ 	/*
+ 	 * We make the task go to sleep until its current deadline by
+ 	 * forcing its runtime to zero. This way, update_curr_dl() stops
+@@ -2378,6 +2401,11 @@ select_task_rq_dl(struct task_struct *p, int cpu, int flags)
+ 	bool select_rq;
+ 	struct rq *rq;
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p))
++		return select_task_rq_rt(p, cpu, flags);
++#endif
++
+ 	if (!(flags & WF_TTWU))
+ 		goto out;
+ 
+@@ -2423,6 +2451,12 @@ select_task_rq_dl(struct task_struct *p, int cpu, int flags)
+ 
+ static void migrate_task_rq_dl(struct task_struct *p, int new_cpu __maybe_unused)
+ {
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p)) {
++		/* Native RT has no fair PELT entity to migrate. */
++		return;
++	}
++#endif
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 
+@@ -2504,6 +2538,18 @@ static int balance_dl(struct rq *rq, struct rq_flags *rf)
+ static void wakeup_preempt_dl(struct rq *rq, struct task_struct *p,
+ 				  int flags)
+ {
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p)) {
++		if (rt_group_task(rq->donor) &&
++		    dl_time_before(p->dl.pi_se->deadline, rq->donor->dl.pi_se->deadline))
++			resched_curr(rq);
++		return;
++	}
++	if (rt_group_task(rq->donor)) {
++		resched_curr(rq);
++		return;
++	}
++#endif
+ 	if (dl_entity_preempt(&p->dl, &rq->donor->dl)) {
+ 		resched_curr(rq);
+ 		return;
+@@ -2534,6 +2580,12 @@ static void set_next_task_dl(struct rq *rq, struct task_struct *p, bool first)
+ 	struct sched_dl_entity *dl_se = &p->dl;
+ 	struct dl_rq *dl_rq = &rq->dl;
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p)) {
++		set_next_task_rt(rq, p, first);
++		return;
++	}
++#endif
+ 	p->se.exec_start = rq_clock_task(rq);
+ 	if (on_dl_rq(&p->dl))
+ 		update_stats_wait_end_dl(dl_rq, dl_se);
+@@ -2604,6 +2656,12 @@ static void put_prev_task_dl(struct rq *rq, struct task_struct *p, struct task_s
+ 	struct sched_dl_entity *dl_se = &p->dl;
+ 	struct dl_rq *dl_rq = &rq->dl;
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p)) {
++		put_prev_task_rt(rq, p, next);
++		return;
++	}
++#endif
+ 	if (on_dl_rq(&p->dl))
+ 		update_stats_wait_start_dl(dl_rq, dl_se);
+ 
+@@ -2628,6 +2686,12 @@ static void put_prev_task_dl(struct rq *rq, struct task_struct *p, struct task_s
+  */
+ static void task_tick_dl(struct rq *rq, struct task_struct *p, int queued)
+ {
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p)) {
++		task_tick_rt(rq, p, queued);
++		return;
++	}
++#endif
+ 	update_curr_dl(rq);
+ 
+ 	update_dl_rq_load_avg(rq_clock_pelt(rq), rq, 1);
+@@ -2802,6 +2866,8 @@ static struct task_struct *pick_next_pushable_dl_task(struct rq *rq)
+ /* Locks the rq it finds */
+ static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq)
+ {
++	if (rt_group_task(task))
++		return find_lock_lowest_rq(task, rq);
+ 	struct rq *later_rq = NULL;
+ 	int tries;
+ 	int cpu;
+@@ -3060,6 +3126,10 @@ static void pull_dl_task(struct rq *this_rq)
+  */
+ static void task_woken_dl(struct rq *rq, struct task_struct *p)
+ {
++	if (rt_group_task(p)) {
++		task_woken_rt(rq, p);
++		return;
++	}
+ 	if (!task_on_cpu(rq, p) &&
+ 	    !test_tsk_need_resched(rq->curr) &&
+ 	    p->nr_cpus_allowed > 1 &&
+@@ -3076,6 +3146,10 @@ static void set_cpus_allowed_dl(struct task_struct *p,
+ 	struct root_domain *src_rd;
+ 	struct rq *rq;
+ 
++	if (rt_group_task(p)) {
++		set_cpus_allowed_common(p, ctx);
++		return;
++	}
+ 	WARN_ON_ONCE(!dl_task(p));
+ 
+ 	rq = task_rq(p);
+@@ -3190,6 +3264,12 @@ void dl_clear_root_domain_cpu(int cpu)
+ 
+ static void switched_from_dl(struct rq *rq, struct task_struct *p)
+ {
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p)) {
++		switched_from_rt(rq, p);
++		return;
++	}
++#endif
+ 	/*
+ 	 * task_non_contending() can start the "inactive timer" (if the 0-lag
+ 	 * time is in the future). If the task switches back to dl before
+@@ -3244,6 +3324,12 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
+  */
+ static void switched_to_dl(struct rq *rq, struct task_struct *p)
+ {
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p)) {
++		switched_to_rt(rq, p);
++		return;
++	}
++#endif
+ 	cancel_inactive_timer(&p->dl);
+ 
+ 	/*
+@@ -3278,6 +3364,12 @@ static void switched_to_dl(struct rq *rq, struct task_struct *p)
+ static void prio_changed_dl(struct rq *rq, struct task_struct *p,
+ 			    int oldprio)
+ {
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p)) {
++		prio_changed_rt(rq, p, oldprio);
++		return;
++	}
++#endif
+ 	if (!task_on_rq_queued(p))
+ 		return;
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 97fe3988905cf2baff694885f23bbc1a6f96aa2c..e824141e54c899ea732bae66dd15ccc49be6e734 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5963,7 +5963,7 @@ static void throttle_cfs_rq_work(struct callback_head *work)
+ 		cfs_rq = cfs_rq_of(se);
+ 
+ 		/* Raced, forget */
+-		if (p->sched_class != &fair_sched_class)
++		if (p->sched_class != &fair_sched_class && !rt_group_task(p))
+ 			return;
+ 
+ 		/*
+@@ -5975,7 +5975,7 @@ static void throttle_cfs_rq_work(struct callback_head *work)
+ 		rq = scope.rq;
+ 		update_rq_clock(rq);
+ 		WARN_ON_ONCE(p->throttled || !list_empty(&p->throttle_node));
+-		dequeue_task_fair(rq, p, DEQUEUE_SLEEP | DEQUEUE_THROTTLE);
++		p->sched_class->dequeue_task(rq, p, DEQUEUE_SLEEP | DEQUEUE_THROTTLE);
+ 		list_add(&p->throttle_node, &cfs_rq->throttled_limbo_list);
+ 		/*
+ 		 * Must not set throttled before dequeue or dequeue will
+@@ -6018,7 +6018,7 @@ static void dequeue_throttled_task(struct task_struct *p, int flags)
+ 	 * task is migrating off its old cfs_rq, detach
+ 	 * the task's load from its old cfs_rq.
+ 	 */
+-	if (task_on_rq_migrating(p))
++	if (task_on_rq_migrating(p) && p->sched_class == &fair_sched_class)
+ 		detach_task_cfs_rq(p);
+ }
+ 
+@@ -6105,7 +6105,9 @@ static int tg_unthrottle_up(struct task_group *tg, void *data)
+ 	list_for_each_entry_safe(p, tmp, &cfs_rq->throttled_limbo_list, throttle_node) {
+ 		list_del_init(&p->throttle_node);
+ 		p->throttled = false;
+-		enqueue_task_fair(rq_of(cfs_rq), p, ENQUEUE_WAKEUP);
++		p->sched_class->enqueue_task(rq, p, ENQUEUE_WAKEUP);
++		if (rt_or_dl_prio(p->prio))
++			wakeup_preempt(rq, p, 0);
+ 	}
+ 
+ 	/* Add cfs_rq with load or one or more already running entities to the list */
+@@ -6658,6 +6660,52 @@ static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ 	return throttle_cfs_rq(cfs_rq);
+ }
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++/* RT uses the existing quota caches, without entering the fair runqueues. */
++void account_rt_cfs_runtime(struct rq *rq, struct task_struct *p, u64 delta)
++{
++	struct sched_entity *se;
++
++	for (se = &p->se; se; se = parent_entity(se)) {
++		struct cfs_rq *cfs_rq = cfs_rq_of(se);
++
++		account_cfs_rq_runtime(cfs_rq, delta);
++		if (cfs_rq->runtime_enabled && cfs_rq->runtime_remaining <= 0)
++			resched_curr(rq);
++	}
++}
++
++void check_rt_cfs_runtime(struct task_struct *p)
++{
++	struct sched_entity *se;
++	bool throttled = false;
++
++	for (se = &p->se; se; se = parent_entity(se)) {
++		struct cfs_rq *cfs_rq = cfs_rq_of(se);
++
++		account_cfs_rq_runtime(cfs_rq, 0);
++		throttled |= check_cfs_rq_runtime(cfs_rq);
++		if (cfs_rq->throttle_count)
++			record_throttle_clock(cfs_rq);
++	}
++	if (throttled || throttled_hierarchy(cfs_rq_of(&p->se)))
++		task_throttle_setup_work(p);
++}
++
++bool enqueue_rt_throttled(struct task_struct *p)
++{
++	return p->throttled && enqueue_throttled_task(p);
++}
++
++bool dequeue_rt_throttled(struct task_struct *p, int flags)
++{
++	if (!p->throttled)
++		return false;
++	dequeue_throttled_task(p, flags);
++	return true;
++}
++#endif
++
+ static enum hrtimer_restart sched_cfs_slack_timer(struct hrtimer *timer)
+ {
+ 	struct cfs_bandwidth *cfs_b =
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index fc9737decfb73adedbb5fbaacab267ca4ae68aa2..6491f0255fe441c29bec3f376e0b12a74a840e1c 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -964,6 +964,9 @@ static inline int rt_se_prio(struct sched_rt_entity *rt_se)
+ 		return rt_rq->highest_prio.curr;
+ #endif
+ 
++	/* Deadline PI remains charged to the instance's finite CPU quota. */
++	if (rt_group_task(rt_task_of(rt_se)) && dl_prio(rt_task_of(rt_se)->prio))
++		return 0;
+ 	return rt_task_of(rt_se)->prio;
+ }
+ 
+@@ -976,13 +979,18 @@ static void update_curr_rt(struct rq *rq)
+ 	struct task_struct *donor = rq->donor;
+ 	s64 delta_exec;
+ 
+-	if (donor->sched_class != &rt_sched_class)
++	if (donor->sched_class != &rt_sched_class &&
++	    !(rt_group_task(donor) && donor->sched_class == &dl_sched_class))
+ 		return;
+ 
+ 	delta_exec = update_curr_common(rq);
+ 	if (unlikely(delta_exec <= 0))
+ 		return;
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(donor))
++		account_rt_cfs_runtime(rq, donor, delta_exec);
++#endif
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 	struct sched_rt_entity *rt_se = &donor->rt;
+ 
+@@ -1344,7 +1352,27 @@ static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flag
+ 
+ 	if (move_entity(flags)) {
+ 		WARN_ON_ONCE(rt_se->on_list);
+-		if (flags & ENQUEUE_HEAD)
++		if (rt_entity_is_task(rt_se) &&
++		    rt_group_task(rt_task_of(rt_se)) && dl_prio(rt_task_of(rt_se)->prio)) {
++#ifdef CONFIG_RT_MUTEXES
++			struct task_struct *p = rt_task_of(rt_se);
++			struct sched_rt_entity *entry;
++			struct list_head *before = queue;
++
++			/* Deadline PI precedes FIFO/RR, but does not enter host DL. */
++			list_for_each_entry(entry, queue, run_list) {
++				struct task_struct *next = rt_task_of(entry);
++
++				if (!dl_prio(next->prio) ||
++				    dl_time_before(p->dl.pi_se->deadline,
++						   next->dl.pi_se->deadline)) {
++					before = &entry->run_list;
++					break;
++				}
++			}
++			list_add_tail(&rt_se->run_list, before);
++#endif
++		} else if (flags & ENQUEUE_HEAD)
+ 			list_add(&rt_se->run_list, queue);
+ 		else
+ 			list_add_tail(&rt_se->run_list, queue);
+@@ -1432,6 +1460,10 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	struct sched_rt_entity *rt_se = &p->rt;
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p) && enqueue_rt_throttled(p))
++		return;
++#endif
+ 	if (flags & ENQUEUE_WAKEUP)
+ 		rt_se->timeout = 0;
+ 
+@@ -1451,6 +1483,10 @@ static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	struct sched_rt_entity *rt_se = &p->rt;
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (rt_group_task(p) && dequeue_rt_throttled(p, flags))
++		return true;
++#endif
+ 	update_curr_rt(rq);
+ 	dequeue_rt_entity(rt_se, flags);
+ 
+@@ -1710,6 +1746,10 @@ static struct task_struct *pick_task_rt(struct rq *rq)
+ 
+ 	p = _pick_next_task_rt(rq);
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	if (p && rt_group_task(p))
++		check_rt_cfs_runtime(p);
++#endif
+ 	return p;
+ }
+ 
+@@ -2840,7 +2880,7 @@ static int sched_rt_global_constraints(void)
+ int sched_rt_can_attach(struct task_group *tg, struct task_struct *tsk)
+ {
+ 	/* Don't accept real-time tasks when there is no way for them to run */
+-	if (rt_group_sched_enabled() && rt_task(tsk) && tg->rt_bandwidth.rt_runtime == 0)
++	if (rt_group_sched_enabled() && rt_task(tsk) && tg->rt_bandwidth.rt_runtime == 0 && !rt_group_owner(tg))
+ 		return 0;
+ 
+ 	return 1;
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 0f29def72877b85b6fdf5c08b09e8c0cc13b7a80..8b12816d76071a053cc2c7799be791d7dcf2e5cb 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -469,6 +469,11 @@ struct cfs_bandwidth {
+ };
+ 
+ /* Task group related information */
++#if defined(CONFIG_FAIR_GROUP_SCHED) && defined(CONFIG_RT_GROUP_SCHED) && \
++	defined(CONFIG_CFS_BANDWIDTH)
++#define SCHED_RT_GROUP_QUOTA
++#endif
++
+ struct task_group {
+ 	struct cgroup_subsys_state css;
+ 
+@@ -498,6 +503,12 @@ struct task_group {
+ 	struct rt_bandwidth	rt_bandwidth;
+ #endif
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++	/* Immutable after the first task is attached; descendants share it. */
++	struct task_group	*rt_owner;
++	bool			rt_published;
++#endif
++
+ 	struct scx_task_group	scx;
+ 
+ 	struct rcu_head		rcu;
+@@ -524,6 +535,30 @@ struct task_group {
+ 
+ };
+ 
++#ifdef SCHED_RT_GROUP_QUOTA
++DECLARE_STATIC_KEY_FALSE(sched_rt_group_quota);
++
++static inline struct task_group *rt_group_owner(struct task_group *tg)
++{
++	if (!static_branch_unlikely(&sched_rt_group_quota))
++		return NULL;
++	return READ_ONCE(tg->rt_owner);
++}
++
++static inline bool rt_group_task(struct task_struct *p)
++{
++	return rt_group_owner(p->sched_task_group) != NULL;
++}
++
++extern void account_rt_cfs_runtime(struct rq *rq, struct task_struct *p, u64 delta);
++extern void check_rt_cfs_runtime(struct task_struct *p);
++extern bool enqueue_rt_throttled(struct task_struct *p);
++extern bool dequeue_rt_throttled(struct task_struct *p, int flags);
++#else
++static inline struct task_group *rt_group_owner(struct task_group *tg) { return NULL; }
++static inline bool rt_group_task(struct task_struct *p) { return false; }
++#endif
++
+ #ifdef CONFIG_GROUP_SCHED_WEIGHT
+ #define ROOT_TASK_GROUP_LOAD	NICE_0_LOAD
+ 
+@@ -2193,7 +2228,7 @@ static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
+ 	 * root_task_group's rt_rq than switching in rt_rq_of_se()
+ 	 * Clobbers tg(!)
+ 	 */
+-	if (!rt_group_sched_enabled())
++	if (!rt_group_sched_enabled() || rt_group_owner(tg))
+ 		tg = &root_task_group;
+ 	p->rt.rt_rq  = tg->rt_rq[cpu];
+ 	p->rt.parent = tg->rt_se[cpu];
+diff --git a/kernel/sched/syscalls.c b/kernel/sched/syscalls.c
+index 77b663a5dfb2b57b5c98b694330e924571fab298..80112c3f9c009a75415f0c428dc7feaa3b9fc779 100644
+--- a/kernel/sched/syscalls.c
++++ b/kernel/sched/syscalls.c
+@@ -10,6 +10,7 @@
+ #include <linux/sched.h>
+ #include <linux/cpuset.h>
+ #include <linux/sched/debug.h>
++#include <linux/uts_resources.h>
+ 
+ #include <uapi/linux/sched/types.h>
+ 
+@@ -522,6 +523,10 @@ static int user_check_sched_setscheduler(struct task_struct *p,
+ 	return 0;
+ 
+ req_priv:
++	if (rt_policy(policy) && rt_group_task(p) &&
++	    rt_group_owner(task_group(p)) == rt_group_owner(task_group(current)) &&
++	    uts_resources_rt_capable(p))
++		return 0;
+ 	if (!capable(CAP_SYS_NICE))
+ 		return -EPERM;
+ 
+@@ -642,6 +647,11 @@ int __sched_setscheduler(struct task_struct *p,
+ 		goto unlock;
+ 	}
+ change:
++	/* No instance SCHED_DEADLINE queue is delegated by cpu.rt.mode. */
++	if (dl_policy(policy) && rt_group_task(p)) {
++		retval = -EPERM;
++		goto unlock;
++	}
+ 
+ 	if (user) {
+ #ifdef CONFIG_RT_GROUP_SCHED
+@@ -652,6 +662,7 @@ int __sched_setscheduler(struct task_struct *p,
+ 		if (rt_group_sched_enabled() &&
+ 				rt_bandwidth_enabled() && rt_policy(policy) &&
+ 				task_group(p)->rt_bandwidth.rt_runtime == 0 &&
++				!rt_group_task(p) &&
+ 				!task_group_is_autogroup(task_group(p))) {
+ 			retval = -EPERM;
+ 			goto unlock;
+diff --git a/kernel/uts_resources.c b/kernel/uts_resources.c
+index 5fd7b87c55a22e4fba9b0463240adf67713fe6ab..02ed75d627bce76253345342836f79e511b15d9a 100644
+--- a/kernel/uts_resources.c
++++ b/kernel/uts_resources.c
+@@ -72,7 +72,7 @@ static struct uts_resource_view *current_resource_view(void)
+ 	return smp_load_acquire(&current->nsproxy->uts_ns->resources);
+ }
+ 
+-bool uts_resources_self_rtprio(void)
++static bool uts_resources_self_capable(int cap)
+ {
+ #ifdef CONFIG_UTS_NS_VIEWS
+ 	struct uts_resource_view *view = task_resource_view(current);
+@@ -97,12 +97,24 @@ bool uts_resources_self_rtprio(void)
+ 		if (pid->ns.ns_id != native->info.pidns_id)
+ 			continue;
+ 		return pid->user_ns != &init_user_ns &&
+-			ns_capable(pid->user_ns, CAP_SYS_RESOURCE);
++			ns_capable(pid->user_ns, cap);
+ 	}
+ #endif
+ 	return false;
+ }
+ 
++bool uts_resources_self_rtprio(void)
++{
++	return uts_resources_self_capable(CAP_SYS_RESOURCE);
++}
++
++bool uts_resources_rt_capable(struct task_struct *p)
++{
++	/* A child user namespace must not manufacture instance SYS_NICE. */
++	return task_resource_view(p) == current_resource_view() &&
++		uts_resources_self_capable(CAP_SYS_NICE);
++}
++
+ struct cgroup *uts_resources_ucounts_scope(void)
+ {
+ 	struct uts_resource_view *view;

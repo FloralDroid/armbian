@@ -1,0 +1,354 @@
+From: 5656565566 <contact@home56.top>
+Subject: [PATCH] uts: Charge projected uevent queues before namespace buffer grants
+
+Charge projected event data and multicast clone heads to the sealed instance
+budget using existing slab accounting. Cover protocol-local user broadcasts
+and unicast replies, with an accounted copy before userspace unicast delivery.
+Allow namespaced receive-buffer force only for matching, accounted uevent
+sockets. Keep all other socket protocols and host behavior unchanged.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+
+diff --git a/include/linux/uts_resources.h b/include/linux/uts_resources.h
+index 5a950b635f4b1411a6b6be88fe211d7e70fc9208..09021d4ce415717986acb059bf4e475d83a1bbc3 100644
+--- a/include/linux/uts_resources.h
++++ b/include/linux/uts_resources.h
+@@ -6,6 +6,9 @@
+ #include <linux/string.h>
+ #include <uapi/linux/nsfs.h>
+ 
++struct sock;
++struct mem_cgroup;
++struct cgroup_subsys_state;
+ struct uts_namespace;
+ struct seq_file;
+ struct sysinfo;
+@@ -155,7 +158,16 @@ bool uts_uevent_matches(struct uts_resource_view *view, struct net *net);
+ const struct uts_event_info *uts_resources_event_info(struct uts_resource_view *view);
+ long uts_uevent_ioctl(struct uts_namespace *ns, unsigned int cmd, unsigned long arg);
+ bool uts_uevent_may_enter(struct uts_namespace *uts, struct net *net);
++bool uts_uevent_buffer_allowed(struct sock *sk);
++struct cgroup_subsys_state *uts_uevent_memory_begin(struct net *net,
++						 struct mem_cgroup **previous);
++void uts_uevent_memory_end(struct cgroup_subsys_state *css, struct mem_cgroup *previous);
+ #else
++static inline bool uts_uevent_buffer_allowed(struct sock *sk) { return false; }
++static inline struct cgroup_subsys_state *uts_uevent_memory_begin(struct net *net,
++		struct mem_cgroup **previous) { return NULL; }
++static inline void uts_uevent_memory_end(struct cgroup_subsys_state *css,
++		struct mem_cgroup *previous) {}
+ static inline bool uts_uevent_may_enter(struct uts_namespace *uts, struct net *net)
+ {
+ 	return true;
+diff --git a/lib/kobject_uevent.c b/lib/kobject_uevent.c
+index 608d2c4853a829401b96c86e442696baa48c7e27..303eff450bcf3280b0419d3112d33b735bca91c4 100644
+--- a/lib/kobject_uevent.c
++++ b/lib/kobject_uevent.c
+@@ -33,6 +33,9 @@
+ #include <linux/uts_views.h>
+ #include <linux/device.h>
+ #include <linux/blkdev.h>
++#include <linux/cgroup.h>
++#include <linux/memcontrol.h>
++#include <linux/sched/mm.h>
+ #include <net/sock.h>
+ #include <net/netlink.h>
+ #include <net/net_namespace.h>
+@@ -286,7 +289,7 @@ static void cleanup_uevent_env(struct subprocess_info *info)
+ #ifdef CONFIG_NET
+ static struct sk_buff *alloc_uevent_skb(struct kobj_uevent_env *env,
+ 					const char *action_string,
+-					const char *devpath)
++					const char *devpath, gfp_t allocation)
+ {
+ 	struct netlink_skb_parms *parms;
+ 	struct sk_buff *skb = NULL;
+@@ -295,7 +298,7 @@ static struct sk_buff *alloc_uevent_skb(struct kobj_uevent_env *env,
+ 
+ 	/* allocate message with maximum possible size */
+ 	len = strlen(action_string) + strlen(devpath) + 2;
+-	skb = alloc_skb(len + env->buflen, GFP_KERNEL);
++	skb = alloc_skb(len + env->buflen, allocation);
+ 	if (!skb)
+ 		return NULL;
+ 
+@@ -343,6 +346,79 @@ bool uts_uevent_matches(struct uts_resource_view *view, struct net *net)
+ 	return match;
+ }
+ 
++#ifdef CONFIG_MEMCG
++static struct cgroup_subsys_state *uevent_memcg_css(struct uts_resource_view *view)
++{
++	struct cgroup_subsys_state *css;
++	struct cgroup *root;
++
++	if (!view || !uts_resources_live(view) || mem_cgroup_kmem_disabled())
++		return NULL;
++	root = uts_resources_cgroup(view);
++	css = cgroup_get_e_css(root, &memory_cgrp_subsys);
++	if (css && css->cgroup != root) {
++		css_put(css);
++		css = NULL;
++	}
++	return css;
++}
++#endif
++
++bool uts_uevent_buffer_allowed(struct sock *sk)
++{
++#ifdef CONFIG_MEMCG
++	struct uts_resource_view *view;
++	struct cgroup_subsys_state *css = NULL;
++	struct net *net = sock_net(sk);
++	bool allowed = false;
++
++	if (sk->sk_family != AF_NETLINK || sk->sk_protocol != NETLINK_KOBJECT_UEVENT ||
++	    !ns_capable(net->user_ns, CAP_NET_ADMIN))
++		return false;
++	view = uts_resources_acquire(current->nsproxy->uts_ns);
++	if (view && uts_uevent_matches(view, net))
++		css = uevent_memcg_css(view);
++	if (css) {
++		allowed = true;
++		css_put(css);
++	}
++	uts_resources_release(view);
++	return allowed;
++#else
++	return false;
++#endif
++}
++
++struct cgroup_subsys_state *uts_uevent_memory_begin(struct net *net,
++						 struct mem_cgroup **previous)
++{
++#ifdef CONFIG_MEMCG
++	struct uts_resource_view *view = uts_uevent_resources(net);
++	struct cgroup_subsys_state *css;
++
++	if (!view)
++		return NULL;
++	css = uevent_memcg_css(view);
++	uts_resources_release(view);
++	if (!css)
++		return ERR_PTR(-ENODEV);
++	*previous = set_active_memcg(mem_cgroup_from_css(css));
++	return css;
++#else
++	return NULL;
++#endif
++}
++
++void uts_uevent_memory_end(struct cgroup_subsys_state *css, struct mem_cgroup *previous)
++{
++#ifdef CONFIG_MEMCG
++	if (css) {
++		set_active_memcg(previous);
++		css_put(css);
++	}
++#endif
++}
++
+ const struct uts_event_info *uts_resources_event_info(struct uts_resource_view *view)
+ {
+ 	struct uts_event_projection *projection = uts_resources_events(view);
+@@ -817,7 +893,7 @@ static int uevent_net_broadcast_untagged(struct kobject *kobj, struct kobj_ueven
+ 		}
+ 		if (!skb) {
+ 			retval = -ENOMEM;
+-			skb = alloc_uevent_skb(env, action_string, devpath);
++			skb = alloc_uevent_skb(env, action_string, devpath, GFP_KERNEL);
+ 			if (!skb)
+ 				continue;
+ 		}
+@@ -841,11 +917,28 @@ static int uevent_net_deliver(struct sock *usk,
+ {
+ 	struct user_namespace *owning_user_ns = sock_net(usk)->user_ns;
+ 	struct sk_buff *skb = NULL;
++	gfp_t allocation = GFP_KERNEL;
+ 	int ret = 0;
++#if defined(CONFIG_UTS_NS_RESOURCES) && defined(CONFIG_MEMCG)
++	struct uts_resource_view *view = smp_load_acquire(&sock_net(usk)->uevent_sock->view);
++	struct cgroup_subsys_state *css = NULL;
++	struct mem_cgroup *previous = NULL;
++
++	if (view) {
++		css = uevent_memcg_css(view);
++		if (!css)
++			return -ENODEV;
++		/* Include multicast clone headers and trim copies in the same budget. */
++		previous = set_active_memcg(mem_cgroup_from_css(css));
++		allocation = GFP_NOWAIT | __GFP_ACCOUNT | __GFP_NOWARN;
++	}
++#endif
+ 
+-	skb = alloc_uevent_skb(env, action_string, devpath);
+-	if (!skb)
+-		return -ENOMEM;
++	skb = alloc_uevent_skb(env, action_string, devpath, allocation);
++	if (!skb) {
++		ret = -ENOMEM;
++		goto out;
++	}
+ 
+ 	/* fix credentials */
+ 	if (owning_user_ns != &init_user_ns) {
+@@ -864,11 +957,18 @@ static int uevent_net_deliver(struct sock *usk,
+ 			parms->creds.gid = root_gid;
+ 	}
+ 
+-	ret = netlink_broadcast(usk, skb, 0, 1, GFP_KERNEL);
++	ret = netlink_broadcast(usk, skb, 0, 1, allocation);
+ 	/* ENOBUFS should be handled in userspace */
+ 	if (ret == -ENOBUFS || ret == -ESRCH)
+ 		ret = 0;
+ 
++out:
++#if defined(CONFIG_UTS_NS_RESOURCES) && defined(CONFIG_MEMCG)
++	if (css) {
++		set_active_memcg(previous);
++		css_put(css);
++	}
++#endif
+ 	return ret;
+ }
+ #endif
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 03136176c7d0f91e69a19fd284e7e11a01a7b8db..4b2ab6bc9ef7e2953d4889b040d45064a391bb94 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -111,6 +111,7 @@
+ #include <linux/init.h>
+ #include <linux/highmem.h>
+ #include <linux/user_namespace.h>
++#include <linux/uts_resources.h>
+ #include <linux/static_key.h>
+ #include <linux/memcontrol.h>
+ #include <linux/prefetch.h>
+@@ -1360,7 +1361,7 @@ int sk_setsockopt(struct sock *sk, int level, int optname,
+ 		break;
+ 
+ 	case SO_RCVBUFFORCE:
+-		if (!sockopt_capable(CAP_NET_ADMIN)) {
++		if (!sockopt_capable(CAP_NET_ADMIN) && !uts_uevent_buffer_allowed(sk)) {
+ 			ret = -EPERM;
+ 			break;
+ 		}
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index fec8b52ed05e7696e15d8686a29ed0a5205f6c36..2809471ac96e58d14f7f924d61196a7aa26f13b0 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -62,6 +62,7 @@
+ #include <linux/net_namespace.h>
+ #include <linux/nospec.h>
+ #include <linux/btf_ids.h>
++#include <linux/uts_resources.h>
+ 
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+@@ -1326,14 +1327,15 @@ static int netlink_unicast_kernel(struct sock *sk, struct sk_buff *skb,
+ 	return ret;
+ }
+ 
+-int netlink_unicast(struct sock *ssk, struct sk_buff *skb,
+-		    u32 portid, int nonblock)
++static int __netlink_unicast(struct sock *ssk, struct sk_buff *skb,
++			     u32 portid, int nonblock, bool accounted)
+ {
+ 	struct sock *sk;
+ 	int err;
+ 	long timeo;
++	bool copied = false;
+ 
+-	skb = netlink_trim(skb, gfp_any());
++	skb = netlink_trim(skb, accounted ? GFP_NOWAIT | __GFP_ACCOUNT | __GFP_NOWARN : gfp_any());
+ 
+ 	timeo = sock_sndtimeo(ssk, nonblock);
+ retry:
+@@ -1344,6 +1346,17 @@ int netlink_unicast(struct sock *ssk, struct sk_buff *skb,
+ 	}
+ 	if (netlink_is_kernel(sk))
+ 		return netlink_unicast_kernel(sk, skb, ssk);
++	if (accounted && !copied) {
++		struct sk_buff *copy = skb_copy(skb, GFP_NOWAIT | __GFP_ACCOUNT | __GFP_NOWARN);
++
++		kfree_skb(skb);
++		if (!copy) {
++			sock_put(sk);
++			return -ENOBUFS;
++		}
++		skb = copy;
++		copied = true;
++	}
+ 
+ 	skb_reset_network_header(skb);
+ 	skb_reset_mac_header(skb);
+@@ -1362,6 +1375,24 @@ int netlink_unicast(struct sock *ssk, struct sk_buff *skb,
+ 
+ 	return netlink_sendskb(sk, skb);
+ }
++
++int netlink_unicast(struct sock *ssk, struct sk_buff *skb, u32 portid, int nonblock)
++{
++	struct cgroup_subsys_state *css;
++	struct mem_cgroup *previous = NULL;
++	int ret;
++
++	if (ssk->sk_protocol != NETLINK_KOBJECT_UEVENT)
++		return __netlink_unicast(ssk, skb, portid, nonblock, false);
++	css = uts_uevent_memory_begin(sock_net(ssk), &previous);
++	if (IS_ERR(css)) {
++		kfree_skb(skb);
++		return PTR_ERR(css);
++	}
++	ret = __netlink_unicast(ssk, skb, portid, nonblock, css != NULL);
++	uts_uevent_memory_end(css, previous);
++	return ret;
++}
+ EXPORT_SYMBOL(netlink_unicast);
+ 
+ int netlink_has_listeners(struct sock *sk, unsigned int group)
+@@ -1831,6 +1862,9 @@ static int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ 	int err;
+ 	struct scm_cookie scm;
+ 	u32 netlink_skb_flags = 0;
++	struct cgroup_subsys_state *css = NULL;
++	struct mem_cgroup *previous = NULL;
++	gfp_t allocation = GFP_KERNEL;
+ 
+ 	if (msg->msg_flags & MSG_OOB)
+ 		return -EOPNOTSUPP;
+@@ -1876,8 +1910,18 @@ static int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ 	err = -EMSGSIZE;
+ 	if (len > sk->sk_sndbuf - 32)
+ 		goto out;
++	if (sk->sk_protocol == NETLINK_KOBJECT_UEVENT) {
++		css = uts_uevent_memory_begin(sock_net(sk), &previous);
++		if (IS_ERR(css)) {
++			err = PTR_ERR(css);
++			css = NULL;
++			goto out;
++		}
++		if (css)
++			allocation = GFP_NOWAIT | __GFP_ACCOUNT | __GFP_NOWARN;
++	}
+ 	err = -ENOBUFS;
+-	skb = netlink_alloc_large_skb(len, dst_group);
++	skb = css ? alloc_skb(len, allocation) : netlink_alloc_large_skb(len, dst_group);
+ 	if (skb == NULL)
+ 		goto out;
+ 
+@@ -1900,11 +1944,12 @@ static int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ 
+ 	if (dst_group) {
+ 		refcount_inc(&skb->users);
+-		netlink_broadcast(sk, skb, dst_portid, dst_group, GFP_KERNEL);
++		netlink_broadcast(sk, skb, dst_portid, dst_group, allocation);
+ 	}
+ 	err = netlink_unicast(sk, skb, dst_portid, msg->msg_flags & MSG_DONTWAIT);
+ 
+ out:
++	uts_uevent_memory_end(css, previous);
+ 	scm_destroy(&scm);
+ 	return err;
+ }

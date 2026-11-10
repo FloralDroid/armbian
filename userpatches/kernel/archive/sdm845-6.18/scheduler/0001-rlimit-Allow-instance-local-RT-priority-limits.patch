@@ -1,0 +1,104 @@
+From: 5656565566 <contact@home56.top>
+Date: Mon, 09 Nov 2026 15:01:01 +0800
+Subject: [PATCH] rlimit: Allow instance-local RT priority limits
+
+Let an instance administrator set its own RT priority ceiling without
+granting host CAP_SYS_RESOURCE. Keep scheduling admission unchanged and
+resolve authority against the original sealed instance namespace.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+
+diff --git a/include/linux/uts_resources.h b/include/linux/uts_resources.h
+index 09021d4ce415717986acb059bf4e475d83a1bbc3..cf17c435e7630190cbd16e8310dbb340db4cc396 100644
+--- a/include/linux/uts_resources.h
++++ b/include/linux/uts_resources.h
+@@ -130,8 +130,10 @@ struct uts_event_projection *uts_resources_events(struct uts_resource_view *view
+ void uts_resources_publish_events(struct uts_resource_view *view, struct uts_event_projection *events);
+ void memory_resource_watermarks(u64 managed, u64 watermarks[3]);
+ unsigned long uts_resources_task_limit(struct task_struct *task);
++bool uts_resources_self_rtprio(void);
+ #else
+ static inline unsigned long uts_resources_task_limit(struct task_struct *task) { return ~0UL; }
++static inline bool uts_resources_self_rtprio(void) { return false; }
+ static inline struct uts_resource_view *uts_resources_acquire(struct uts_namespace *ns) { return NULL; }
+ static inline void uts_resources_release(struct uts_resource_view *view) {}
+ static inline struct uts_resource_view *uts_resources_get(struct uts_resource_view *view) { return NULL; }
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 79ee774ab5d4221e92311ce3e2ede1c448da8ca8..06d8896f35b24062eb49e2ae16228dfb058efb07 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -1540,6 +1540,7 @@ static int do_prlimit(struct task_struct *tsk, unsigned int resource,
+ 		      struct rlimit *new_rlim, struct rlimit *old_rlim)
+ {
+ 	struct rlimit *rlim;
++	bool instance_rtprio = false;
+ 	int retval = 0;
+ 
+ 	if (resource >= RLIM_NLIMITS)
+@@ -1555,6 +1556,9 @@ static int do_prlimit(struct task_struct *tsk, unsigned int resource,
+ 		if (resource == RLIMIT_NOFILE &&
+ 				new_rlim->rlim_max > sysctl_nr_open)
+ 			return -EPERM;
++		if (resource == RLIMIT_RTPRIO && tsk == current &&
++		    new_rlim->rlim_max <= MAX_RT_PRIO - 1)
++			instance_rtprio = uts_resources_self_rtprio();
+ 	}
+ 
+ 	/* Holding a refcount on tsk protects tsk->signal from disappearing. */
+@@ -1562,11 +1566,11 @@ static int do_prlimit(struct task_struct *tsk, unsigned int resource,
+ 	task_lock(tsk->group_leader);
+ 	if (new_rlim) {
+ 		/*
+-		 * Keep the capable check against init_user_ns until cgroups can
+-		 * contain all limits.
++		 * Keep other limits privileged in init_user_ns. The RTPRIO
++		 * exception only changes the caller's per-process ceiling.
+ 		 */
+ 		if (new_rlim->rlim_max > rlim->rlim_max &&
+-				!capable(CAP_SYS_RESOURCE))
++		    !instance_rtprio && !capable(CAP_SYS_RESOURCE))
+ 			retval = -EPERM;
+ 		if (!retval)
+ 			retval = security_task_setrlimit(tsk, resource, new_rlim);
+diff --git a/kernel/uts_resources.c b/kernel/uts_resources.c
+index b1c7496eaf629e2508f39e56311a7ce4027cde22..5fd7b87c55a22e4fba9b0463240adf67713fe6ab 100644
+--- a/kernel/uts_resources.c
++++ b/kernel/uts_resources.c
+@@ -72,6 +72,37 @@ static struct uts_resource_view *current_resource_view(void)
+ 	return smp_load_acquire(&current->nsproxy->uts_ns->resources);
+ }
+ 
++bool uts_resources_self_rtprio(void)
++{
++#ifdef CONFIG_UTS_NS_VIEWS
++	struct uts_resource_view *view = task_resource_view(current);
++	struct uts_native_view *native;
++	struct pid_namespace *pid;
++	bool inside;
++
++	if (!view || current_resource_view() != view || !uts_resources_live(view))
++		return false;
++	native = uts_resources_native(view);
++	if (!native || !(native->info.flags & UTS_VIEW_BOUND))
++		return false;
++
++	rcu_read_lock();
++	inside = cgroup_is_descendant(task_dfl_cgroup(current), view->root);
++	rcu_read_unlock();
++	if (!inside)
++		return false;
++
++	/* Child namespaces cannot replace the host-bound instance owner. */
++	for (pid = task_active_pid_ns(current); pid; pid = pid->parent) {
++		if (pid->ns.ns_id != native->info.pidns_id)
++			continue;
++		return pid->user_ns != &init_user_ns &&
++			ns_capable(pid->user_ns, CAP_SYS_RESOURCE);
++	}
++#endif
++	return false;
++}
++
+ struct cgroup *uts_resources_ucounts_scope(void)
+ {
+ 	struct uts_resource_view *view;

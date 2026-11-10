@@ -1,0 +1,1585 @@
+From: 5656565566 <contact@home56.top>
+Subject: [PATCH] container-root: isolate task, UID accounting and time views
+
+Label explicit task proc files without growing proc inodes; bind UID
+resource accounting to the sealed resource cgroup; normalize instance
+limits and NUMA identity; publish projected vVAR data while retaining
+the vDSO read path; project sync_file query metadata and reject
+unprivileged sealed DRM primary opens before implicit master
+acquisition. Advertise these prerequisites through the existing native
+capability interface.
+
+This extends the existing configured device/export boundary. It does
+not grant GPU allocation, submission or global management operations.
+
+Plain Git-generated diff against the complete Linux 6.18.62 SDM845
+series. No source commit ID is manufactured.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+
+diff --git a/arch/arm64/kernel/vdso.c b/arch/arm64/kernel/vdso.c
+index 78ddf6bdecad704a5b28a29f3f5ca2d9edcda1b9..32f39261b06647a0bae13c9a9c9621144b53d9b9 100644
+--- a/arch/arm64/kernel/vdso.c
++++ b/arch/arm64/kernel/vdso.c
+@@ -18,6 +18,7 @@
+ #include <linux/sched.h>
+ #include <linux/signal.h>
+ #include <linux/slab.h>
++#include <linux/uts_resources.h>
+ #include <linux/vdso_datastore.h>
+ #include <linux/vmalloc.h>
+ #include <vdso/datapage.h>
+@@ -40,6 +41,9 @@ struct vdso_abi_info {
+ 	unsigned long vdso_pages;
+ 	/* Code Mapping */
+ 	struct vm_special_mapping *cm;
++#ifdef CONFIG_UTS_NS_VIEWS
++	struct vm_special_mapping uts_cm;
++#endif
+ };
+ 
+ static struct vdso_abi_info vdso_info[] __ro_after_init = {
+@@ -65,6 +69,152 @@ static int vdso_mremap(const struct vm_special_mapping *sm,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++static bool __init vdso_range_valid(unsigned long offset, unsigned long length,
++				    unsigned long size)
++{
++	return offset <= size && length <= size - offset;
++}
++
++static int __init uts_vdso_scrub(void *image, unsigned long size)
++{
++	Elf64_Ehdr *eh64 = image;
++	Elf32_Ehdr *eh32 = image;
++	bool compat = eh64->e_ident[EI_CLASS] == ELFCLASS32;
++	unsigned long phoff, shoff, offset, length, flags;
++	unsigned int phnum, shnum, i, type;
++
++	if (compat) {
++		phoff = eh32->e_phoff;
++		phnum = eh32->e_phnum;
++		shoff = eh32->e_shoff;
++		shnum = eh32->e_shnum;
++	} else {
++		phoff = eh64->e_phoff;
++		phnum = eh64->e_phnum;
++		shoff = eh64->e_shoff;
++		shnum = eh64->e_shnum;
++	}
++	if (!vdso_range_valid(phoff, phnum * (compat ? sizeof(Elf32_Phdr) :
++			     sizeof(Elf64_Phdr)), size) ||
++	    !vdso_range_valid(shoff, shnum * (compat ? sizeof(Elf32_Shdr) :
++			     sizeof(Elf64_Shdr)), size))
++		return -EINVAL;
++
++	for (i = 0; i < phnum; i++) {
++		if (compat) {
++			Elf32_Phdr *ph = image + phoff;
++
++			type = ph[i].p_type;
++			offset = ph[i].p_offset;
++			length = ph[i].p_filesz;
++		} else {
++			Elf64_Phdr *ph = image + phoff;
++
++			type = ph[i].p_type;
++			offset = ph[i].p_offset;
++			length = ph[i].p_filesz;
++		}
++		if (type != PT_NOTE)
++			continue;
++		if (!vdso_range_valid(offset, length, size))
++			return -EINVAL;
++		while (length >= sizeof(Elf32_Nhdr)) {
++			Elf32_Nhdr *note = image + offset;
++			u64 namesz = ALIGN((u64)note->n_namesz, 4);
++			u64 descsz = ALIGN((u64)note->n_descsz, 4);
++			u64 span = sizeof(*note) + namesz + descsz;
++
++			if (span > length)
++				return -EINVAL;
++			/* Retain GNU CPU properties, including BTI/PAC. */
++			if (note->n_type != NT_GNU_PROPERTY_TYPE_0 ||
++			    note->n_namesz != 4 || memcmp(note + 1, "GNU", 4)) {
++				note->n_type = 0;
++				memset(note + 1, 0, namesz + descsz);
++			}
++			offset += span;
++			length -= span;
++		}
++	}
++	/* Non-allocated sections can retain compiler and build metadata. */
++	for (i = 0; i < shnum; i++) {
++		if (compat) {
++			Elf32_Shdr *sh = image + shoff;
++
++			type = sh[i].sh_type;
++			flags = sh[i].sh_flags;
++			offset = sh[i].sh_offset;
++			length = sh[i].sh_size;
++		} else {
++			Elf64_Shdr *sh = image + shoff;
++
++			type = sh[i].sh_type;
++			flags = sh[i].sh_flags;
++			offset = sh[i].sh_offset;
++			length = sh[i].sh_size;
++		}
++		if ((flags & SHF_ALLOC) || type == SHT_NOBITS)
++			continue;
++		if (!vdso_range_valid(offset, length, size))
++			return -EINVAL;
++		memset(image + offset, 0, length);
++	}
++	/* Bionic reads SHT_DYNSYM from the section table during libc startup. */
++	return 0;
++}
++
++static int __init uts_vdso_init(enum vdso_abi abi)
++{
++	struct vdso_abi_info *info = &vdso_info[abi];
++	unsigned long size = info->vdso_pages << PAGE_SHIFT;
++	struct page **pages;
++	void *image;
++	unsigned int i;
++	int ret;
++
++	image = alloc_pages_exact(size, GFP_KERNEL);
++	if (!image)
++		return -ENOMEM;
++	pages = kcalloc(info->vdso_pages, sizeof(*pages), GFP_KERNEL);
++	if (!pages) {
++		ret = -ENOMEM;
++		goto free_image;
++	}
++	memcpy(image, info->vdso_code_start, size);
++	ret = uts_vdso_scrub(image, size);
++	if (ret)
++		goto free_pages;
++	flush_icache_range((unsigned long)image, (unsigned long)image + size);
++	for (i = 0; i < info->vdso_pages; i++)
++		pages[i] = virt_to_page(image + i * PAGE_SIZE);
++	info->uts_cm.name = "[vdso]";
++	info->uts_cm.mremap = vdso_mremap;
++	info->uts_cm.pages = pages;
++	return 0;
++free_pages:
++	kfree(pages);
++free_image:
++	free_pages_exact(image, size);
++	return ret;
++}
++#endif
++
++bool arch_uts_vdso_ready(void)
++{
++#ifdef CONFIG_UTS_NS_VIEWS
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(vdso_info); i++) {
++		if (!vdso_info[i].uts_cm.pages)
++			return false;
++	}
++	return !IS_ENABLED(CONFIG_POSIX_AUX_CLOCKS);
++#else
++	return false;
++#endif
++}
++
+ static int __init __vdso_init(enum vdso_abi abi)
+ {
+ 	int i;
+@@ -95,6 +245,10 @@ static int __init __vdso_init(enum vdso_abi abi)
+ 
+ 	vdso_info[abi].cm->pages = vdso_pagelist;
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++	if (uts_vdso_init(abi))
++		pr_err("cannot prepare UTS vDSO for %s\n", vdso_info[abi].name);
++#endif
+ 	return 0;
+ }
+ 
+@@ -105,8 +259,16 @@ static int __setup_additional_pages(enum vdso_abi abi,
+ {
+ 	unsigned long vdso_base, vdso_text_len, vdso_mapping_len;
+ 	unsigned long gp_flags = 0;
++	const struct vm_special_mapping *mapping = vdso_info[abi].cm;
+ 	void *ret;
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++	if (uts_resources_native_active()) {
++		if (!arch_uts_vdso_ready())
++			return -EOPNOTSUPP;
++		mapping = &vdso_info[abi].uts_cm;
++	}
++#endif
+ 	BUILD_BUG_ON(VDSO_NR_PAGES != __VDSO_PAGES);
+ 
+ 	vdso_text_len = vdso_info[abi].vdso_pages << PAGE_SHIFT;
+@@ -132,7 +294,7 @@ static int __setup_additional_pages(enum vdso_abi abi,
+ 				       VM_READ|VM_EXEC|gp_flags|
+ 				       VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC|
+ 				       VM_SEALED_SYSMAP,
+-				       vdso_info[abi].cm);
++				       mapping);
+ 	if (IS_ERR(ret))
+ 		goto up_fail;
+ 
+diff --git a/drivers/char/random.c b/drivers/char/random.c
+index f344f67c83f4e556e193bd29dd3598406d60efe9..24fba759ad75e8f842ab4f665f184403070fd954 100644
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -33,6 +33,7 @@
+ #include <linux/fcntl.h>
+ #include <linux/slab.h>
+ #include <linux/random.h>
++#include <linux/time_namespace.h>
+ #include <linux/poll.h>
+ #include <linux/init.h>
+ #include <linux/fs.h>
+@@ -289,6 +290,7 @@ static void crng_reseed(struct work_struct *work)
+ 		crng_init = CRNG_READY;
+ 	spin_unlock_irqrestore(&base_crng.lock, flags);
+ 	memzero_explicit(key, sizeof(key));
++	timens_vdso_rng_update(true, false);
+ }
+ 
+ /*
+@@ -736,6 +738,7 @@ static void __cold _credit_init_bits(size_t bits)
+ 		atomic_notifier_call_chain(&random_ready_notifier, 0, NULL);
+ #ifdef CONFIG_VDSO_GETRANDOM
+ 		WRITE_ONCE(vdso_k_rng_data->is_ready, true);
++		timens_vdso_rng_update(false, true);
+ #endif
+ 		wake_up_interruptible(&crng_init_wait);
+ 		kill_fasync(&fasync, SIGIO, POLL_IN);
+diff --git a/drivers/dma-buf/sync_file.c b/drivers/dma-buf/sync_file.c
+index 747e377fb95417ddd506b528618a4288bea9d459..02cc995fbe7d22ed3eecaff6d0a53a10b3f7a84d 100644
+--- a/drivers/dma-buf/sync_file.c
++++ b/drivers/dma-buf/sync_file.c
+@@ -16,10 +16,20 @@
+ #include <linux/uaccess.h>
+ #include <linux/anon_inodes.h>
+ #include <linux/sync_file.h>
++#include <linux/time_namespace.h>
+ #include <uapi/linux/sync_file.h>
+ 
+ static const struct file_operations sync_file_fops;
+ 
++static bool sync_file_projected(void)
++{
++#if defined(CONFIG_UTS_NS_VIEWS) && defined(CONFIG_TIME_NS)
++	return current->nsproxy->time_ns->vvar_projected;
++#else
++	return false;
++#endif
++}
++
+ static struct sync_file *sync_file_alloc(void)
+ {
+ 	struct sync_file *sync_file;
+@@ -141,11 +151,14 @@ char *sync_file_get_name(struct sync_file *sync_file, char *buf, int len)
+ 		rcu_read_lock();
+ 		driver = dma_fence_driver_name(fence);
+ 		timeline = dma_fence_timeline_name(fence);
+-		snprintf(buf, len, "%s-%s%llu-%lld",
+-			 rcu_dereference(driver),
+-			 rcu_dereference(timeline),
+-			 fence->context,
+-			 fence->seqno);
++		if (sync_file_projected())
++			snprintf(buf, len, "%s-instance", rcu_dereference(driver));
++		else
++			snprintf(buf, len, "%s-%s%llu-%lld",
++				 rcu_dereference(driver),
++				 rcu_dereference(timeline),
++				 fence->context,
++				 fence->seqno);
+ 		rcu_read_unlock();
+ 	}
+ 
+@@ -270,22 +283,32 @@ static int sync_fill_fence_info(struct dma_fence *fence,
+ {
+ 	const char __rcu *timeline;
+ 	const char __rcu *driver;
++	s64 timestamp = 0;
+ 
+ 	rcu_read_lock();
+ 
+ 	driver = dma_fence_driver_name(fence);
+ 	timeline = dma_fence_timeline_name(fence);
+ 
+-	strscpy(info->obj_name, rcu_dereference(timeline),
++	/* Driver timelines may contain host-wide context IDs or sequence state. */
++	strscpy(info->obj_name, sync_file_projected() ? "instance" : rcu_dereference(timeline),
+ 		sizeof(info->obj_name));
+ 	strscpy(info->driver_name, rcu_dereference(driver),
+ 		sizeof(info->driver_name));
+ 
+ 	info->status = dma_fence_get_status(fence);
+-	info->timestamp_ns =
+-		dma_fence_is_signaled(fence) ?
+-			ktime_to_ns(dma_fence_timestamp(fence)) :
+-			ktime_set(0, 0);
++	if (dma_fence_is_signaled(fence)) {
++		timestamp = ktime_to_ns(dma_fence_timestamp(fence));
++#if defined(CONFIG_UTS_NS_VIEWS) && defined(CONFIG_TIME_NS)
++		if (sync_file_projected()) {
++			/* The sealed offset is nonpositive; old events predate this Run. */
++			timestamp += timespec64_to_ns(
++				&current->nsproxy->time_ns->offsets.monotonic);
++			timestamp = max_t(s64, timestamp, 0);
++		}
++#endif
++	}
++	info->timestamp_ns = timestamp;
+ 
+ 	rcu_read_unlock();
+ 
+@@ -367,6 +390,7 @@ static int sync_file_ioctl_set_deadline(struct sync_file *sync_file,
+ 					unsigned long arg)
+ {
+ 	struct sync_set_deadline ts;
++	ktime_t deadline;
+ 
+ 	if (copy_from_user(&ts, (void __user *)arg, sizeof(ts)))
+ 		return -EFAULT;
+@@ -374,7 +398,12 @@ static int sync_file_ioctl_set_deadline(struct sync_file *sync_file,
+ 	if (ts.pad)
+ 		return -EINVAL;
+ 
+-	dma_fence_set_deadline(sync_file->fence, ns_to_ktime(ts.deadline_ns));
++	deadline = ns_to_ktime(ts.deadline_ns);
++#if defined(CONFIG_UTS_NS_VIEWS) && defined(CONFIG_TIME_NS)
++	if (sync_file_projected())
++		deadline = timens_ktime_to_host(CLOCK_MONOTONIC, deadline);
++#endif
++	dma_fence_set_deadline(sync_file->fence, deadline);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/drm_auth.c b/drivers/gpu/drm/drm_auth.c
+index a2556d16bed6fd63e33bfc52e4ff97aafeef1717..e525f2db800bf92b66d32957cdfdc5c37bfed8e8 100644
+--- a/drivers/gpu/drm/drm_auth.c
++++ b/drivers/gpu/drm/drm_auth.c
+@@ -30,6 +30,7 @@
+ 
+ #include <linux/export.h>
+ #include <linux/slab.h>
++#include <linux/time_namespace.h>
+ 
+ #include <drm/drm_auth.h>
+ #include <drm/drm_drv.h>
+@@ -319,6 +320,12 @@ int drm_master_open(struct drm_file *file_priv)
+ 	struct drm_device *dev = file_priv->minor->dev;
+ 	int ret = 0;
+ 
++#if defined(CONFIG_UTS_NS_VIEWS) && defined(CONFIG_TIME_NS)
++	/* A primary open can acquire global master before any ioctl is checked. */
++	if (current->nsproxy->time_ns->vvar_projected && !capable(CAP_SYS_ADMIN))
++		return -EACCES;
++#endif
++
+ 	/* if there is no current master make this fd it, but do not create
+ 	 * any master object for render clients
+ 	 */
+diff --git a/fs/proc/array.c b/fs/proc/array.c
+index 38f96af7b521be02926674e7482a95be857de747..1afe217b78a512756adc9265ae52cf9a2d0f835f 100644
+--- a/fs/proc/array.c
++++ b/fs/proc/array.c
+@@ -57,6 +57,7 @@
+ #include <linux/errno.h>
+ #include <linux/time.h>
+ #include <linux/time_namespace.h>
++#include <linux/uts_resources.h>
+ #include <linux/kernel.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/tty.h>
+@@ -163,7 +164,7 @@ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
+ 
+ 	ppid = task_ppid_nr_ns(p, ns);
+ 	tgid = task_tgid_nr_ns(p, ns);
+-	ngid = task_numa_group_id(p);
++	ngid = task_numa_group_id_ns(p, ns);
+ 	cred = get_task_cred(p);
+ 
+ 	task_lock(p);
+@@ -437,8 +438,18 @@ __weak void arch_proc_pid_thread_features(struct seq_file *m,
+ int proc_pid_status(struct seq_file *m, struct pid_namespace *ns,
+ 			struct pid *pid, struct task_struct *task)
+ {
+-	struct mm_struct *mm = get_task_mm(task);
++	struct mm_struct *mm;
++	struct uts_resource_view *view = uts_resources_proc_source(m);
++	bool same_scope;
+ 
++	if (view) {
++		rcu_read_lock();
++		same_scope = task_ucounts(task)->resource_scope == uts_resources_cgroup(view);
++		rcu_read_unlock();
++		if (!same_scope || !uts_resources_live(view))
++			return -ENODEV;
++	}
++	mm = get_task_mm(task);
+ 	seq_puts(m, "Name:\t");
+ 	proc_task_name(m, task, true);
+ 	seq_putc(m, '\n');
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index c8d783f3b2ac637da32c8fbeafe8369618229701..7a5fd8a05c5a5bb8e129c1e3be839ed1460cf49e 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -53,6 +53,7 @@
+ #include <linux/errno.h>
+ #include <linux/time.h>
+ #include <linux/proc_fs.h>
++#include <linux/magic.h>
+ #include <linux/stat.h>
+ #include <linux/task_io_accounting_ops.h>
+ #include <linux/init.h>
+@@ -2031,6 +2032,15 @@ int pid_getattr(struct mnt_idmap *idmap, const struct path *path,
+ 
+ /* dentry stuff */
+ 
++/* Static pid_entry names remain valid for the inode lifetime. */
++const char *proc_task_inode_name(struct inode *inode)
++{
++	if (inode->i_sb->s_magic != PROC_SUPER_MAGIC)
++		return NULL;
++	/* Generic proc entries use i_private for data; task entries leave it free. */
++	return PROC_I(inode)->pid ? inode->i_private : NULL;
++}
++
+ /*
+  * Set <pid>/... inode ownership (can change due to setuid(), etc.)
+  */
+@@ -2684,6 +2694,7 @@ static struct dentry *proc_pident_instantiate(struct dentry *dentry,
+ 	if (p->fop)
+ 		inode->i_fop = p->fop;
+ 	ei->op = p->op;
++	inode->i_private = (void *)p->name;
+ 	pid_update_inode(task, inode);
+ 	return d_splice_alias_ops(inode, dentry, &pid_dentry_operations);
+ }
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 7d618919a9bc59ff287017278279a411702e35eb..85ff6299b9306922dfef0e6bf1cac5de6a5cceaa 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -728,6 +728,9 @@ static inline void cgroup_path_from_kernfs_id(u64 id, char *buf, size_t buflen)
+ void __css_rstat_updated(struct cgroup_subsys_state *css, int cpu);
+ void css_rstat_updated(struct cgroup_subsys_state *css, int cpu);
+ void cgroup_resource_cputime(struct cgroup *cgrp, struct task_cputime *time);
++#ifdef CONFIG_CGROUP_PIDS
++u64 cgroup_resource_pids_limit(struct cgroup *cgrp);
++#endif
+ 
+ void css_rstat_flush(struct cgroup_subsys_state *css);
+ 
+diff --git a/include/linux/proc_fs.h b/include/linux/proc_fs.h
+index 57b9dcd0e1bffd06c7066998d426ca7d08ad7c45..6404e3ce737c73e51f3793fae50a2aba4a97e939 100644
+--- a/include/linux/proc_fs.h
++++ b/include/linux/proc_fs.h
+@@ -89,6 +89,7 @@ typedef int (*proc_write_t)(struct file *, char *, size_t);
+ 
+ extern void proc_root_init(void);
+ extern void proc_flush_pid(struct pid *);
++const char *proc_task_inode_name(struct inode *inode);
+ 
+ extern struct proc_dir_entry *proc_symlink(const char *,
+ 		struct proc_dir_entry *, const char *);
+@@ -174,6 +175,11 @@ void arch_proc_pid_thread_features(struct seq_file *m, struct task_struct *task)
+ 
+ #else /* CONFIG_PROC_FS */
+ 
++static inline const char *proc_task_inode_name(struct inode *inode)
++{
++	return NULL;
++}
++
+ static inline void proc_root_init(void)
+ {
+ }
+diff --git a/include/linux/sched/numa_balancing.h b/include/linux/sched/numa_balancing.h
+index 52b22c5c396db0984d62d53e59ef3fd31711190c..f2bce12af91f588796a299e76e29ba9e87c4ae46 100644
+--- a/include/linux/sched/numa_balancing.h
++++ b/include/linux/sched/numa_balancing.h
+@@ -28,6 +28,7 @@ enum numa_vmaskip_reason {
+ #ifdef CONFIG_NUMA_BALANCING
+ extern void task_numa_fault(int last_node, int node, int pages, int flags);
+ extern pid_t task_numa_group_id(struct task_struct *p);
++extern pid_t task_numa_group_id_ns(struct task_struct *p, struct pid_namespace *ns);
+ extern void set_numabalancing_state(bool enabled);
+ extern void task_numa_free(struct task_struct *p, bool final);
+ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
+@@ -41,6 +42,10 @@ static inline pid_t task_numa_group_id(struct task_struct *p)
+ {
+ 	return 0;
+ }
++static inline pid_t task_numa_group_id_ns(struct task_struct *p, struct pid_namespace *ns)
++{
++	return 0;
++}
+ static inline void set_numabalancing_state(bool enabled)
+ {
+ }
+diff --git a/include/linux/time_namespace.h b/include/linux/time_namespace.h
+index 508d26c9c66ae23a41690ca8fe12cd16de44ec5c..5ce274ae9d2a5328fa7d0040f709c6616a4a7296 100644
+--- a/include/linux/time_namespace.h
++++ b/include/linux/time_namespace.h
+@@ -26,6 +26,8 @@ struct timens_offsets {
+ struct time_namespace {
+ #ifdef CONFIG_UTS_NS_VIEWS
+ 	struct uts_resource_view *uts_view;
++	struct list_head	vvar_list;
++	bool			vvar_projected;
+ #endif
+ 	struct user_namespace	*user_ns;
+ 	struct ucounts		*ucounts;
+@@ -59,6 +61,16 @@ void free_time_ns(struct time_namespace *ns);
+ void timens_on_fork(struct nsproxy *nsproxy, struct task_struct *tsk);
+ struct page *find_timens_vvar_page(struct vm_area_struct *vma);
+ 
++#ifdef CONFIG_UTS_NS_VIEWS
++void timens_enable_uts_vdso(struct time_namespace *ns);
++void timens_free_vvar(struct time_namespace *ns);
++void timens_update_vvar(void);
++void timens_vdso_rng_update(bool reseed, bool ready);
++#else
++static inline void timens_update_vvar(void) { }
++static inline void timens_vdso_rng_update(bool reseed, bool ready) { }
++#endif
++
+ static inline void put_time_ns(struct time_namespace *ns)
+ {
+ 	if (ns_ref_put(ns))
+@@ -117,6 +129,9 @@ static inline ktime_t timens_ktime_to_host(clockid_t clockid, ktime_t tim)
+ }
+ 
+ #else
++static inline void timens_update_vvar(void) { }
++static inline void timens_vdso_rng_update(bool reseed, bool ready) { }
++
+ static inline void __init time_ns_init(void)
+ {
+ }
+diff --git a/include/linux/user_namespace.h b/include/linux/user_namespace.h
+index 9a9aebbf96b9f2a2f44ca4517bc36cdcf0d83c02..f6dd62fa64b0aa05180ea805c2b566472e7ede81 100644
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@ -119,6 +119,7 @@ struct user_namespace {
+ struct ucounts {
+ 	struct hlist_nulls_node node;
+ 	struct user_namespace *ns;
++	struct cgroup *resource_scope;
+ 	kuid_t uid;
+ 	struct rcu_head rcu;
+ 	rcuref_t count;
+@@ -134,6 +135,8 @@ void retire_userns_sysctls(struct user_namespace *ns);
+ struct ucounts *inc_ucount(struct user_namespace *ns, kuid_t uid, enum ucount_type type);
+ void dec_ucount(struct ucounts *ucounts, enum ucount_type type);
+ struct ucounts *alloc_ucounts(struct user_namespace *ns, kuid_t uid);
++struct ucounts *alloc_ucounts_scoped(struct user_namespace *ns, kuid_t uid,
++				    struct cgroup *scope);
+ void put_ucounts(struct ucounts *ucounts);
+ 
+ static inline struct ucounts * __must_check get_ucounts(struct ucounts *ucounts)
+diff --git a/include/linux/uts_resources.h b/include/linux/uts_resources.h
+index 9e4ea1e993c6318e321081c23f239268988942ab..5a950b635f4b1411a6b6be88fe211d7e70fc9208 100644
+--- a/include/linux/uts_resources.h
++++ b/include/linux/uts_resources.h
+@@ -13,6 +13,7 @@ struct net;
+ struct uts_resource_view;
+ struct uts_event_projection;
+ struct uts_native_view;
++struct task_struct;
+ 
+ /* Fixed ABI class numbers, shared by sysfs and standard uevent projection. */
+ static inline const char *uts_event_class_name(unsigned int class)
+@@ -105,6 +106,13 @@ struct uts_resource_view *uts_resources_proc_source(struct seq_file *m);
+ int uts_resources_cpu_visible_in(struct uts_resource_view *view, unsigned int cpu);
+ int uts_resources_snapshot(struct uts_resource_view *view, struct uts_resource_snapshot *s);
+ bool uts_resources_active(void);
++bool uts_resources_native_active(void);
++struct cgroup *uts_resources_ucounts_scope(void);
++#ifdef CONFIG_ARM64
++bool arch_uts_vdso_ready(void);
++#else
++static inline bool arch_uts_vdso_ready(void) { return false; }
++#endif
+ int uts_resources_cpu_visible(unsigned int cpu);
+ bool uts_resources_admin(void);
+ struct uts_resource_view *uts_resources_acquire(struct uts_namespace *ns);
+@@ -118,7 +126,9 @@ bool uts_resources_live(struct uts_resource_view *view);
+ struct uts_event_projection *uts_resources_events(struct uts_resource_view *view);
+ void uts_resources_publish_events(struct uts_resource_view *view, struct uts_event_projection *events);
+ void memory_resource_watermarks(u64 managed, u64 watermarks[3]);
++unsigned long uts_resources_task_limit(struct task_struct *task);
+ #else
++static inline unsigned long uts_resources_task_limit(struct task_struct *task) { return ~0UL; }
+ static inline struct uts_resource_view *uts_resources_acquire(struct uts_namespace *ns) { return NULL; }
+ static inline void uts_resources_release(struct uts_resource_view *view) {}
+ static inline struct uts_resource_view *uts_resources_get(struct uts_resource_view *view) { return NULL; }
+@@ -132,6 +142,8 @@ static inline bool uts_resources_may_enter(struct uts_namespace *old, struct uts
+ static inline int uts_resources_sysinfo(struct sysinfo *info) { return 0; }
+ static inline int uts_resources_proc(struct seq_file *m, enum uts_resource_proc which) { return 0; }
+ static inline bool uts_resources_active(void) { return false; }
++static inline bool uts_resources_native_active(void) { return false; }
++static inline struct cgroup *uts_resources_ucounts_scope(void) { return NULL; }
+ static inline struct uts_resource_view *uts_resources_proc_source(struct seq_file *m) { return NULL; }
+ static inline int uts_resources_cpu_visible_in(struct uts_resource_view *view, unsigned int cpu) { return 1; }
+ static inline int uts_resources_cpu_visible(unsigned int cpu) { return 1; }
+diff --git a/include/uapi/linux/nsfs.h b/include/uapi/linux/nsfs.h
+index 74e36e2c3dd8ed4cb2909d9913864890948b61d1..92537511db5304ae4324599fe462b4519822eac6 100644
+--- a/include/uapi/linux/nsfs.h
++++ b/include/uapi/linux/nsfs.h
+@@ -209,6 +209,11 @@ struct uts_view_config {
+ #define UTS_VIEW_PSI (1ULL << 5)
+ #define UTS_VIEW_CPU_STAT (1ULL << 6)
+ #define UTS_VIEW_PROC_FILTER (1ULL << 7)
++#define UTS_VIEW_TASK_STATS (1ULL << 8)
++#define UTS_VIEW_SIGNAL_ACCOUNTING (1ULL << 9)
++#define UTS_VIEW_PRIVATE_VDSO (1ULL << 10)
++#define UTS_VIEW_SYNC_FILE_TIME (1ULL << 11)
++#define UTS_VIEW_DRM_CLIENT (1ULL << 12)
+ 
+ struct uts_view_info {
+ 	__u32 abi;
+diff --git a/include/vdso/datapage.h b/include/vdso/datapage.h
+index 23c39b96190fdfc2f31bf76a8614d69a3a98017c..82d492032e4a0bc6f84a0605429b248dad0f4d05 100644
+--- a/include/vdso/datapage.h
++++ b/include/vdso/datapage.h
+@@ -2,6 +2,13 @@
+ #ifndef __VDSO_DATAPAGE_H
+ #define __VDSO_DATAPAGE_H
+ 
++#include <vdso/page.h>
++
++/* Keep RNG state in the last cache line of the shared time page. */
++#ifdef CONFIG_UTS_NS_VIEWS
++#define VDSO_RNG_DATA_OFFSET (PAGE_SIZE - 64)
++#endif
++
+ #ifndef __ASSEMBLY__
+ 
+ #include <linux/compiler.h>
+@@ -17,7 +24,6 @@
+ #include <vdso/ktime.h>
+ #include <vdso/limits.h>
+ #include <vdso/math64.h>
+-#include <vdso/page.h>
+ #include <vdso/processor.h>
+ #include <vdso/time.h>
+ #include <vdso/time32.h>
+@@ -198,7 +204,11 @@ enum vdso_pages {
+ #else /* !__ASSEMBLY__ */
+ 
+ #ifdef CONFIG_VDSO_GETRANDOM
++#ifdef CONFIG_UTS_NS_VIEWS
++#define __vdso_u_rng_data	PROVIDE(vdso_u_rng_data = vdso_u_data + VDSO_RNG_DATA_OFFSET);
++#else
+ #define __vdso_u_rng_data	PROVIDE(vdso_u_rng_data = vdso_u_data + 2 * PAGE_SIZE);
++#endif
+ #else
+ #define __vdso_u_rng_data
+ #endif
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+index 5b64c8dde5eb288ae037602d6e1a8f398f39962b..ab664fde4af752cc58bebf58ddb56d1de867ca1e 100644
+--- a/kernel/cgroup/pids.c
++++ b/kernel/cgroup/pids.c
+@@ -70,6 +70,20 @@ static struct pids_cgroup *css_pids(struct cgroup_subsys_state *css)
+ 	return container_of(css, struct pids_cgroup, css);
+ }
+ 
++/* The instance budget is its delegated root, never an external ancestor. */
++u64 cgroup_resource_pids_limit(struct cgroup *cgrp)
++{
++	struct cgroup_subsys_state *css;
++	u64 limit = PID_MAX_LIMIT;
++
++	rcu_read_lock();
++	css = rcu_dereference(cgrp->subsys[pids_cgrp_id]);
++	if (css)
++		limit = min_t(u64, atomic64_read(&css_pids(css)->limit), PID_MAX_LIMIT);
++	rcu_read_unlock();
++	return limit;
++}
++
+ static struct pids_cgroup *parent_pids(struct pids_cgroup *pids)
+ {
+ 	return css_pids(pids->css.parent);
+diff --git a/kernel/cred.c b/kernel/cred.c
+index dbf6b687dc5c5a25cf2eb8af933c64f26c444b3f..5b7360723b182b0f81b20ea534dfb253245814b3 100644
+--- a/kernel/cred.c
++++ b/kernel/cred.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/export.h>
+ #include <linux/cred.h>
++#include <linux/uts_resources.h>
+ #include <linux/slab.h>
+ #include <linux/sched.h>
+ #include <linux/sched/coredump.h>
+@@ -274,6 +275,10 @@ struct cred *prepare_exec_creds(void)
+ 
+ 	new->suid = new->fsuid = new->euid;
+ 	new->sgid = new->fsgid = new->egid;
++	if (set_cred_ucounts(new)) {
++		abort_creds(new);
++		return NULL;
++	}
+ 
+ 	return new;
+ }
+@@ -433,11 +438,11 @@ int commit_creds(struct cred *new)
+ 	 * RLIMIT_NPROC limits on user->processes have already been checked
+ 	 * in set_user().
+ 	 */
+-	if (new->user != old->user || new->user_ns != old->user_ns)
++	if (new->ucounts != old->ucounts)
+ 		inc_rlimit_ucounts(new->ucounts, UCOUNT_RLIMIT_NPROC, 1);
+ 	rcu_assign_pointer(task->real_cred, new);
+ 	rcu_assign_pointer(task->cred, new);
+-	if (new->user != old->user || new->user_ns != old->user_ns)
++	if (new->ucounts != old->ucounts)
+ 		dec_rlimit_ucounts(old->ucounts, UCOUNT_RLIMIT_NPROC, 1);
+ 
+ 	/* send notifications */
+@@ -533,15 +538,18 @@ EXPORT_SYMBOL(cred_fscmp);
+ int set_cred_ucounts(struct cred *new)
+ {
+ 	struct ucounts *new_ucounts, *old_ucounts = new->ucounts;
++	struct cgroup *scope = uts_resources_ucounts_scope();
+ 
+ 	/*
+ 	 * This optimization is needed because alloc_ucounts() uses locks
+ 	 * for table lookups.
+ 	 */
+-	if (old_ucounts->ns == new->user_ns && uid_eq(old_ucounts->uid, new->uid))
++	if (old_ucounts->ns == new->user_ns && uid_eq(old_ucounts->uid, new->uid) &&
++	    old_ucounts->resource_scope == scope)
+ 		return 0;
+ 
+-	if (!(new_ucounts = alloc_ucounts(new->user_ns, new->uid)))
++	new_ucounts = alloc_ucounts_scoped(new->user_ns, new->uid, scope);
++	if (!new_ucounts)
+ 		return -EAGAIN;
+ 
+ 	new->ucounts = new_ucounts;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 67e8c2065d827dae8b876670e8e174362c475847..97fe3988905cf2baff694885f23bbc1a6f96aa2c 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1538,6 +1538,7 @@ struct numa_group {
+ 	spinlock_t lock; /* nr_tasks, tasks */
+ 	int nr_tasks;
+ 	pid_t gid;
++	struct pid *pid;
+ 	int active_nodes;
+ 
+ 	struct rcu_head rcu;
+@@ -1690,6 +1691,19 @@ pid_t task_numa_group_id(struct task_struct *p)
+ 	return gid;
+ }
+ 
++pid_t task_numa_group_id_ns(struct task_struct *p, struct pid_namespace *ns)
++{
++	struct numa_group *ng;
++	pid_t gid = 0;
++
++	rcu_read_lock();
++	ng = rcu_dereference(p->numa_group);
++	if (ng)
++		gid = pid_nr_ns(ng->pid, ns);
++	rcu_read_unlock();
++	return gid;
++}
++
+ /*
+  * The averaged statistics, shared & private, memory & CPU,
+  * occupy the first half of the array. The second half of the
+@@ -3079,10 +3093,18 @@ static inline int get_numa_group(struct numa_group *grp)
+ 	return refcount_inc_not_zero(&grp->refcount);
+ }
+ 
++static void free_numa_group(struct rcu_head *rcu)
++{
++	struct numa_group *grp = container_of(rcu, struct numa_group, rcu);
++
++	put_pid(grp->pid);
++	kfree(grp);
++}
++
+ static inline void put_numa_group(struct numa_group *grp)
+ {
+ 	if (refcount_dec_and_test(&grp->refcount))
+-		kfree_rcu(grp, rcu);
++		call_rcu(&grp->rcu, free_numa_group);
+ }
+ 
+ static void task_numa_group(struct task_struct *p, int cpupid, int flags,
+@@ -3108,6 +3130,7 @@ static void task_numa_group(struct task_struct *p, int cpupid, int flags,
+ 		grp->max_faults_cpu = 0;
+ 		spin_lock_init(&grp->lock);
+ 		grp->gid = p->pid;
++		grp->pid = get_task_pid(p, PIDTYPE_PID);
+ 
+ 		for (i = 0; i < NR_NUMA_HINT_FAULT_STATS * nr_node_ids; i++)
+ 			grp->faults[i] = p->numa_faults[i];
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 631cc05ad3ff8836da6a453e6ed611180f3cf840..79ee774ab5d4221e92311ce3e2ede1c448da8ca8 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -10,6 +10,7 @@
+ #include <linux/mm_inline.h>
+ #include <linux/utsname.h>
+ #include <linux/uts_resources.h>
++#include <linux/uts_resources.h>
+ #include <linux/mman.h>
+ #include <linux/reboot.h>
+ #include <linux/prctl.h>
+@@ -1548,6 +1549,9 @@ static int do_prlimit(struct task_struct *tsk, unsigned int resource,
+ 	if (new_rlim) {
+ 		if (new_rlim->rlim_cur > new_rlim->rlim_max)
+ 			return -EINVAL;
++		if ((resource == RLIMIT_SIGPENDING || resource == RLIMIT_NPROC) &&
++		    new_rlim->rlim_max > uts_resources_task_limit(tsk))
++			return -EPERM;
+ 		if (resource == RLIMIT_NOFILE &&
+ 				new_rlim->rlim_max > sysctl_nr_open)
+ 			return -EPERM;
+@@ -1568,8 +1572,15 @@ static int do_prlimit(struct task_struct *tsk, unsigned int resource,
+ 			retval = security_task_setrlimit(tsk, resource, new_rlim);
+ 	}
+ 	if (!retval) {
+-		if (old_rlim)
++		if (old_rlim) {
+ 			*old_rlim = *rlim;
++			if (resource == RLIMIT_SIGPENDING || resource == RLIMIT_NPROC) {
++				unsigned long limit = uts_resources_task_limit(tsk);
++
++				old_rlim->rlim_cur = min(old_rlim->rlim_cur, limit);
++				old_rlim->rlim_max = min(old_rlim->rlim_max, limit);
++			}
++		}
+ 		if (new_rlim)
+ 			*rlim = *new_rlim;
+ 	}
+@@ -1674,6 +1685,12 @@ SYSCALL_DEFINE2(old_getrlimit, unsigned int, resource,
+ 	task_lock(current->group_leader);
+ 	x = current->signal->rlim[resource];
+ 	task_unlock(current->group_leader);
++	if (resource == RLIMIT_SIGPENDING || resource == RLIMIT_NPROC) {
++		unsigned long limit = uts_resources_task_limit(current);
++
++		x.rlim_cur = min(x.rlim_cur, limit);
++		x.rlim_max = min(x.rlim_max, limit);
++	}
+ 	if (x.rlim_cur > 0x7FFFFFFF)
+ 		x.rlim_cur = 0x7FFFFFFF;
+ 	if (x.rlim_max > 0x7FFFFFFF)
+@@ -1694,6 +1711,12 @@ COMPAT_SYSCALL_DEFINE2(old_getrlimit, unsigned int, resource,
+ 	task_lock(current->group_leader);
+ 	r = current->signal->rlim[resource];
+ 	task_unlock(current->group_leader);
++	if (resource == RLIMIT_SIGPENDING || resource == RLIMIT_NPROC) {
++		unsigned long limit = uts_resources_task_limit(current);
++
++		r.rlim_cur = min(r.rlim_cur, limit);
++		r.rlim_max = min(r.rlim_max, limit);
++	}
+ 	if (r.rlim_cur > 0x7FFFFFFF)
+ 		r.rlim_cur = 0x7FFFFFFF;
+ 	if (r.rlim_max > 0x7FFFFFFF)
+diff --git a/kernel/time/namespace.c b/kernel/time/namespace.c
+index 73d5dfbbca95e74ab7977a88bad85d1cc9603ceb..511cfe38d6556ffd6d869fa66ce1db159bf48b94 100644
+--- a/kernel/time/namespace.c
++++ b/kernel/time/namespace.c
+@@ -110,6 +110,7 @@ static struct time_namespace *clone_time_ns(struct user_namespace *user_ns,
+ 	ns->offsets = old_ns->offsets;
+ 	ns->frozen_offsets = false;
+ #ifdef CONFIG_UTS_NS_VIEWS
++	INIT_LIST_HEAD(&ns->vvar_list);
+ 	uts_views_copy(&ns->uts_view, &old_ns->uts_view);
+ #endif
+ 	ns_tree_add(ns);
+@@ -150,6 +151,7 @@ DEFINE_MUTEX(timens_offset_lock);
+ void free_time_ns(struct time_namespace *ns)
+ {
+ #ifdef CONFIG_UTS_NS_VIEWS
++	timens_free_vvar(ns);
+ 	uts_resources_release(ns->uts_view);
+ #endif
+ 	ns_tree_remove(ns);
+diff --git a/kernel/time/namespace_vdso.c b/kernel/time/namespace_vdso.c
+index 0e154f9015012cd4e832b7e45968a1eec0f3ce32..b38623c196fd14b2b52ebbb9f7c6dd324294efb7 100644
+--- a/kernel/time/namespace_vdso.c
++++ b/kernel/time/namespace_vdso.c
+@@ -8,12 +8,139 @@
+ #include <linux/mm.h>
+ #include <linux/time_namespace.h>
+ #include <linux/time.h>
++#include <linux/uts_resources.h>
+ #include <linux/vdso_datastore.h>
+ 
+ #include <vdso/clocksource.h>
+ #include <vdso/datapage.h>
++#include <vdso/helpers.h>
++#include <vdso/vsyscall.h>
+ 
+ #include "namespace_internal.h"
++#include "timekeeping_internal.h"
++
++#ifdef CONFIG_UTS_NS_VIEWS
++/* Registration, updates and removal are serialized by the timekeeper lock. */
++static LIST_HEAD(timens_vvar_list);
++
++static struct vdso_rng_data *timens_rng_data(struct time_namespace *ns)
++{
++	return page_address(ns->vvar_page) + VDSO_RNG_DATA_OFFSET;
++}
++
++static void timens_register_vvar(struct time_namespace *ns)
++{
++	struct vdso_rng_data *rng = timens_rng_data(ns);
++
++	if (!list_empty(&ns->vvar_list))
++		return;
++	list_add_tail(&ns->vvar_list, &timens_vvar_list);
++	rng->generation = ns->vvar_projected ? 1 :
++		READ_ONCE(vdso_k_rng_data->generation);
++	rng->is_ready = READ_ONCE(vdso_k_rng_data->is_ready);
++}
++
++static void timens_project_timestamp(struct vdso_clock *vc, unsigned int clk,
++				     const struct timespec64 *offset,
++				     unsigned int shift)
++{
++	struct vdso_timestamp *ts = &vc->basetime[clk];
++	u64 limit = (u64)NSEC_PER_SEC << shift;
++
++	ts->sec += offset->tv_sec;
++	ts->nsec += (u64)offset->tv_nsec << shift;
++	if (ts->nsec >= limit) {
++		ts->nsec -= limit;
++		ts->sec++;
++	}
++}
++
++static void timens_project_vvar(struct time_namespace *ns)
++{
++	const struct vdso_time_data *host = vdso_k_time_data;
++	struct vdso_time_data projected = *host;
++	struct vdso_time_data *vdata = page_address(ns->vvar_page);
++	struct vdso_clock *vc = projected.clock_data;
++	unsigned int i;
++
++	timens_project_timestamp(&vc[CS_HRES_COARSE], CLOCK_MONOTONIC,
++				 &ns->offsets.monotonic, vc[CS_HRES_COARSE].shift);
++	timens_project_timestamp(&vc[CS_HRES_COARSE], CLOCK_BOOTTIME,
++				 &ns->offsets.boottime, vc[CS_HRES_COARSE].shift);
++	timens_project_timestamp(&vc[CS_HRES_COARSE], CLOCK_MONOTONIC_COARSE,
++				 &ns->offsets.monotonic, 0);
++	timens_project_timestamp(&vc[CS_RAW], CLOCK_MONOTONIC_RAW,
++				 &ns->offsets.monotonic, vc[CS_RAW].shift);
++	vdso_write_begin(vdata);
++	/* Readers can ignore seq: host bases must never reach the mapped page. */
++	memcpy(&vdata->arch_data, &projected.arch_data, sizeof(vdata->arch_data));
++	for (i = 0; i < CS_BASES; i++)
++		memcpy(&vdata->clock_data[i].clock_mode, &vc[i].clock_mode,
++		       sizeof(vc[i]) - offsetof(struct vdso_clock, clock_mode));
++	vdata->hrtimer_res = host->hrtimer_res;
++	vdso_write_end(vdata);
++	__arch_sync_vdso_time_data(vdata);
++}
++
++void timens_enable_uts_vdso(struct time_namespace *ns)
++{
++	struct vdso_time_data *vdata = page_address(ns->vvar_page);
++	unsigned long flags = timekeeper_lock_irqsave();
++	unsigned int i;
++
++	/* Binding precedes guest exec; no untrusted task can retain the old map. */
++	for (i = 0; i < CS_BASES; i++)
++		vdata->clock_data[i].seq = 0;
++	ns->vvar_projected = true;
++	timens_register_vvar(ns);
++	WRITE_ONCE(timens_rng_data(ns)->generation, 1);
++	timens_project_vvar(ns);
++	ns->frozen_offsets = true;
++	timekeeper_unlock_irqrestore(flags);
++}
++
++void timens_free_vvar(struct time_namespace *ns)
++{
++	unsigned long flags = timekeeper_lock_irqsave();
++
++	list_del_init(&ns->vvar_list);
++	timekeeper_unlock_irqrestore(flags);
++}
++
++void timens_update_vvar(void)
++{
++	struct time_namespace *ns;
++
++	list_for_each_entry(ns, &timens_vvar_list, vvar_list) {
++		if (ns->vvar_projected)
++			timens_project_vvar(ns);
++	}
++}
++
++void timens_vdso_rng_update(bool reseed, bool ready)
++{
++	unsigned long flags = timekeeper_lock_irqsave();
++	struct time_namespace *ns;
++
++	list_for_each_entry(ns, &timens_vvar_list, vvar_list) {
++		struct vdso_rng_data *rng = timens_rng_data(ns);
++		unsigned long generation;
++
++		if (reseed) {
++			generation = ns->vvar_projected ?
++				READ_ONCE(rng->generation) + 1 :
++				READ_ONCE(vdso_k_rng_data->generation);
++			if (!generation)
++				generation++;
++			/* Pairs with getrandom's barrier before refreshing its key. */
++			smp_store_release((unsigned long *)&rng->generation, generation);
++		}
++		if (ready)
++			WRITE_ONCE(rng->is_ready, true);
++	}
++	timekeeper_unlock_irqrestore(flags);
++}
++#endif
+ 
+ static struct timens_offset offset_from_ts(struct timespec64 off)
+ {
+@@ -106,6 +233,13 @@ static void timens_set_vvar_page(struct task_struct *task,
+ 		return;
+ 
+ 	ns->frozen_offsets = true;
++
++#ifdef CONFIG_UTS_NS_VIEWS
++	if (uts_resources_native(ns->uts_view)) {
++		timens_enable_uts_vdso(ns);
++		return;
++	}
++#endif
+ 	vdata = page_address(ns->vvar_page);
+ 	vc = vdata->clock_data;
+ 
+@@ -116,6 +250,14 @@ static void timens_set_vvar_page(struct task_struct *task,
+ 		for (i = 0; i < ARRAY_SIZE(vdata->aux_clock_data); i++)
+ 			timens_setup_vdso_clock_data(&vdata->aux_clock_data[i], ns);
+ 	}
++#ifdef CONFIG_UTS_NS_VIEWS
++	{
++		unsigned long flags = timekeeper_lock_irqsave();
++
++		timens_register_vvar(ns);
++		timekeeper_unlock_irqrestore(flags);
++	}
++#endif
+ }
+ 
+ /*
+diff --git a/kernel/time/vsyscall.c b/kernel/time/vsyscall.c
+index aa59919b8f2c23e9a502f676a8359b4d533f270c..5474e31050f786da590e8e313d4468da68396b1f 100644
+--- a/kernel/time/vsyscall.c
++++ b/kernel/time/vsyscall.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/hrtimer.h>
+ #include <linux/timekeeper_internal.h>
++#include <linux/time_namespace.h>
+ #include <vdso/datapage.h>
+ #include <vdso/helpers.h>
+ #include <vdso/vsyscall.h>
+@@ -124,6 +125,7 @@ void update_vsyscall(struct timekeeper *tk)
+ 	vdso_write_end(vdata);
+ 
+ 	__arch_sync_vdso_time_data(vdata);
++	timens_update_vvar();
+ }
+ 
+ void update_vsyscall_tz(void)
+diff --git a/kernel/ucount.c b/kernel/ucount.c
+index fc4a8f2d3096513db2667311550772491d52c185..551da8f5b2a638639666a7ed693eeb0fcda8169e 100644
+--- a/kernel/ucount.c
++++ b/kernel/ucount.c
+@@ -4,6 +4,7 @@
+ #include <linux/sysctl.h>
+ #include <linux/slab.h>
+ #include <linux/cred.h>
++#include <linux/cgroup.h>
+ #include <linux/hash.h>
+ #include <linux/kmemleak.h>
+ #include <linux/user_namespace.h>
+@@ -21,11 +22,12 @@ static struct hlist_nulls_head ucounts_hashtable[UCOUNTS_HASHTABLE_ENTRIES] = {
+ };
+ static DEFINE_SPINLOCK(ucounts_lock);
+ 
+-#define ucounts_hashfn(ns, uid)						\
+-	hash_long((unsigned long)__kuid_val(uid) + (unsigned long)(ns), \
++#define ucounts_hashfn(ns, uid, scope)						\
++	hash_long((unsigned long)__kuid_val(uid) + (unsigned long)(ns) + \
++		  (unsigned long)(scope), \
+ 		  UCOUNTS_HASHTABLE_BITS)
+-#define ucounts_hashentry(ns, uid)	\
+-	(ucounts_hashtable + ucounts_hashfn(ns, uid))
++#define ucounts_hashentry(ns, uid, scope)	\
++	(ucounts_hashtable + ucounts_hashfn(ns, uid, scope))
+ 
+ #ifdef CONFIG_SYSCTL
+ static struct ctl_table_set *
+@@ -129,7 +131,7 @@ void retire_userns_sysctls(struct user_namespace *ns)
+ #endif
+ }
+ 
+-static struct ucounts *find_ucounts(struct user_namespace *ns, kuid_t uid,
++static struct ucounts *find_ucounts(struct user_namespace *ns, kuid_t uid, struct cgroup *scope,
+ 				    struct hlist_nulls_head *hashent)
+ {
+ 	struct ucounts *ucounts;
+@@ -137,7 +139,8 @@ static struct ucounts *find_ucounts(struct user_namespace *ns, kuid_t uid,
+ 
+ 	guard(rcu)();
+ 	hlist_nulls_for_each_entry_rcu(ucounts, pos, hashent, node) {
+-		if (uid_eq(ucounts->uid, uid) && (ucounts->ns == ns)) {
++		if (uid_eq(ucounts->uid, uid) && (ucounts->ns == ns) &&
++		    ucounts->resource_scope == scope) {
+ 			if (rcuref_get(&ucounts->count))
+ 				return ucounts;
+ 		}
+@@ -147,19 +150,21 @@ static struct ucounts *find_ucounts(struct user_namespace *ns, kuid_t uid,
+ 
+ static void hlist_add_ucounts(struct ucounts *ucounts)
+ {
+-	struct hlist_nulls_head *hashent = ucounts_hashentry(ucounts->ns, ucounts->uid);
++	struct hlist_nulls_head *hashent =
++		ucounts_hashentry(ucounts->ns, ucounts->uid, ucounts->resource_scope);
+ 
+ 	spin_lock_irq(&ucounts_lock);
+ 	hlist_nulls_add_head_rcu(&ucounts->node, hashent);
+ 	spin_unlock_irq(&ucounts_lock);
+ }
+ 
+-struct ucounts *alloc_ucounts(struct user_namespace *ns, kuid_t uid)
++struct ucounts *alloc_ucounts_scoped(struct user_namespace *ns, kuid_t uid,
++				    struct cgroup *scope)
+ {
+-	struct hlist_nulls_head *hashent = ucounts_hashentry(ns, uid);
++	struct hlist_nulls_head *hashent = ucounts_hashentry(ns, uid, scope);
+ 	struct ucounts *ucounts, *new;
+ 
+-	ucounts = find_ucounts(ns, uid, hashent);
++	ucounts = find_ucounts(ns, uid, scope, hashent);
+ 	if (ucounts)
+ 		return ucounts;
+ 
+@@ -169,10 +174,11 @@ struct ucounts *alloc_ucounts(struct user_namespace *ns, kuid_t uid)
+ 
+ 	new->ns = ns;
+ 	new->uid = uid;
++	new->resource_scope = scope;
+ 	rcuref_init(&new->count, 1);
+ 
+ 	spin_lock_irq(&ucounts_lock);
+-	ucounts = find_ucounts(ns, uid, hashent);
++	ucounts = find_ucounts(ns, uid, scope, hashent);
+ 	if (ucounts) {
+ 		spin_unlock_irq(&ucounts_lock);
+ 		kfree(new);
+@@ -181,10 +187,17 @@ struct ucounts *alloc_ucounts(struct user_namespace *ns, kuid_t uid)
+ 
+ 	hlist_nulls_add_head_rcu(&new->node, hashent);
+ 	get_user_ns(new->ns);
++	if (scope)
++		cgroup_get(scope);
+ 	spin_unlock_irq(&ucounts_lock);
+ 	return new;
+ }
+ 
++struct ucounts *alloc_ucounts(struct user_namespace *ns, kuid_t uid)
++{
++	return alloc_ucounts_scoped(ns, uid, NULL);
++}
++
+ void put_ucounts(struct ucounts *ucounts)
+ {
+ 	unsigned long flags;
+@@ -195,6 +208,8 @@ void put_ucounts(struct ucounts *ucounts)
+ 		spin_unlock_irqrestore(&ucounts_lock, flags);
+ 
+ 		put_user_ns(ucounts->ns);
++		if (ucounts->resource_scope)
++			cgroup_put(ucounts->resource_scope);
+ 		kfree_rcu(ucounts, rcu);
+ 	}
+ }
+diff --git a/kernel/uts_resources.c b/kernel/uts_resources.c
+index b9c765c9e34022b9261fbebcc9f941f9978bf095..b1c7496eaf629e2508f39e56311a7ce4027cde22 100644
+--- a/kernel/uts_resources.c
++++ b/kernel/uts_resources.c
+@@ -38,12 +38,50 @@ struct uts_resource_view {
+ 	unsigned long previous_active;
+ };
+ 
++/* The target PID namespace pins this binding until all of its tasks exit. */
++static struct uts_resource_view *task_resource_view(struct task_struct *task)
++{
++#ifdef CONFIG_UTS_NS_VIEWS
++	return READ_ONCE(task_active_pid_ns(task)->uts_view);
++#else
++	return NULL;
++#endif
++}
++
++unsigned long uts_resources_task_limit(struct task_struct *task)
++{
++	struct uts_resource_view *view = task_resource_view(task);
++	unsigned long limit;
++
++	if (!view)
++		return ULONG_MAX;
++	if (!uts_resources_live(view))
++		return 0;
++#ifdef CONFIG_CGROUP_PIDS
++	/* One queue budget per configured task slot, shared by this instance UID. */
++	limit = cgroup_resource_pids_limit(view->root);
++#else
++	limit = 0;
++#endif
++	return limit;
++}
++
+ static struct uts_resource_view *current_resource_view(void)
+ {
+ 	/* Pair with the host's one-time publication of fully initialized fields. */
+ 	return smp_load_acquire(&current->nsproxy->uts_ns->resources);
+ }
+ 
++struct cgroup *uts_resources_ucounts_scope(void)
++{
++	struct uts_resource_view *view;
++
++	if (!current->nsproxy)
++		return NULL;
++	view = current_resource_view();
++	return view ? view->root : NULL;
++}
++
+ bool uts_resources_admin(void)
+ {
+ 	return current_user_ns() == &init_user_ns &&
+@@ -146,6 +184,11 @@ bool uts_resources_active(void)
+ 	return current_resource_view() != NULL;
+ }
+ 
++bool uts_resources_native_active(void)
++{
++	return uts_resources_native(current_resource_view()) != NULL;
++}
++
+ struct uts_resource_view *uts_resources_proc_source(struct seq_file *m)
+ {
+ #ifdef CONFIG_UTS_NS_VIEWS
+diff --git a/kernel/uts_views.c b/kernel/uts_views.c
+index b2a22f0000f9f9e6e621492151badfa97f3e4b8c..813fe5ec9c2cb2cdceca22b5b78c2e20f6f9ea17 100644
+--- a/kernel/uts_views.c
++++ b/kernel/uts_views.c
+@@ -302,7 +302,14 @@ static int configure_view(struct uts_resource_view *view, void __user *argp)
+ 	       sizeof(native->info.profile_sha256));
+ 	native->info.capabilities = UTS_VIEW_SYSINFO | UTS_VIEW_EVENTS |
+ 				    UTS_VIEW_PROC | UTS_VIEW_PROC_FILTER |
+-				    UTS_VIEW_PSI | UTS_VIEW_CPU_STAT;
++				    UTS_VIEW_PSI | UTS_VIEW_CPU_STAT |
++				    UTS_VIEW_TASK_STATS | UTS_VIEW_SIGNAL_ACCOUNTING;
++	if (arch_uts_vdso_ready())
++		native->info.capabilities |= UTS_VIEW_PRIVATE_VDSO;
++	if (IS_ENABLED(CONFIG_SYNC_FILE))
++		native->info.capabilities |= UTS_VIEW_SYNC_FILE_TIME;
++	if (IS_ENABLED(CONFIG_DRM))
++		native->info.capabilities |= UTS_VIEW_DRM_CLIENT;
+ 	if (IS_ENABLED(CONFIG_ANDROID_UID_CPUTIME))
+ 		native->info.capabilities |= UTS_VIEW_UID_CPU;
+ 	rtnl_lock();
+@@ -317,6 +324,7 @@ static int configure_view(struct uts_resource_view *view, void __user *argp)
+ 	cgroup_instance_enable();
+ 	pid->uts_view = uts_resources_get(view);
+ 	time->uts_view = uts_resources_get(view);
++	timens_enable_uts_vdso(time);
+ 	uts_resources_publish_native(view, native);
+ 	rtnl_unlock();
+ 	native = NULL;
+diff --git a/lib/vdso/datastore.c b/lib/vdso/datastore.c
+index 64d868dad8dd1f9407e75592b73b4d3e49b6dce1..5d084a3377cb1aa30e937e5da6f2a2d5c2c4e483 100644
+--- a/lib/vdso/datastore.c
++++ b/lib/vdso/datastore.c
+@@ -5,6 +5,7 @@
+ #include <linux/mm.h>
+ #include <linux/time_namespace.h>
+ #include <linux/types.h>
++#include <linux/uts_resources.h>
+ #include <linux/vdso_datastore.h>
+ #include <vdso/datapage.h>
+ 
+@@ -21,12 +22,19 @@ static_assert(sizeof(vdso_time_data_store) == PAGE_SIZE);
+ #endif /* CONFIG_GENERIC_GETTIMEOFDAY */
+ 
+ #ifdef CONFIG_VDSO_GETRANDOM
++#ifdef CONFIG_UTS_NS_VIEWS
++struct vdso_rng_data *vdso_k_rng_data =
++	(void *)vdso_time_data_store.page + VDSO_RNG_DATA_OFFSET;
++static_assert(sizeof(struct vdso_time_data) <= VDSO_RNG_DATA_OFFSET);
++static_assert(sizeof(struct vdso_rng_data) <= PAGE_SIZE - VDSO_RNG_DATA_OFFSET);
++#else
+ static union {
+ 	struct vdso_rng_data	data;
+ 	u8			page[PAGE_SIZE];
+ } vdso_rng_data_store __page_aligned_data;
+ struct vdso_rng_data *vdso_k_rng_data = &vdso_rng_data_store.data;
+ static_assert(sizeof(vdso_rng_data_store) == PAGE_SIZE);
++#endif
+ #endif /* CONFIG_VDSO_GETRANDOM */
+ 
+ #ifdef CONFIG_ARCH_HAS_VDSO_ARCH_DATA
+@@ -43,6 +51,8 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 	struct page *timens_page = find_timens_vvar_page(vma);
+ 	unsigned long addr, pfn;
+ 	vm_fault_t err;
++	bool projected = IS_ENABLED(CONFIG_UTS_NS_VIEWS) &&
++		uts_resources_native_active();
+ 
+ 	switch (vmf->pgoff) {
+ 	case VDSO_TIME_PAGE_OFFSET:
+@@ -50,6 +60,10 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 			return VM_FAULT_SIGBUS;
+ 		pfn = __phys_to_pfn(__pa_symbol(vdso_k_time_data));
+ 		if (timens_page) {
++			if (projected) {
++				pfn = page_to_pfn(timens_page);
++				break;
++			}
+ 			/*
+ 			 * Fault in VVAR page too, since it will be accessed
+ 			 * to get clock data anyway.
+@@ -62,6 +76,8 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 		}
+ 		break;
+ 	case VDSO_TIMENS_PAGE_OFFSET:
++		if (projected)
++			return VM_FAULT_SIGBUS;
+ 		/*
+ 		 * If a task belongs to a time namespace then a namespace
+ 		 * specific VVAR is mapped with the VVAR_DATA_PAGE_OFFSET and
+@@ -74,6 +90,8 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 		pfn = __phys_to_pfn(__pa_symbol(vdso_k_time_data));
+ 		break;
+ 	case VDSO_RNG_PAGE_OFFSET:
++		if (IS_ENABLED(CONFIG_UTS_NS_VIEWS))
++			return VM_FAULT_SIGBUS;
+ 		if (!IS_ENABLED(CONFIG_VDSO_GETRANDOM))
+ 			return VM_FAULT_SIGBUS;
+ 		pfn = __phys_to_pfn(__pa_symbol(vdso_k_rng_data));
+diff --git a/security/selinux/global_sidtab.c b/security/selinux/global_sidtab.c
+index b30c293e92df27234d58bc4e72c7891f5f35f9e3..afb810dfde70b5544980522ea5afe7e729244467 100644
+--- a/security/selinux/global_sidtab.c
++++ b/security/selinux/global_sidtab.c
+@@ -532,6 +532,24 @@ int security_transition_sid(struct selinux_state *state, u32 ssid, u32 tsid,
+ 	return map_ss_sid_to_global(state, ss_outsid, out_sid, GFP_ATOMIC);
+ }
+ 
++int security_task_inode_sid(struct selinux_state *state, u32 sid,
++			    const struct qstr *name, u32 *out_sid)
++{
++	u32 ss_sid, ss_outsid;
++	int rc;
++
++	*out_sid = sid;
++	if (!selinux_initialized(state))
++		return 0;
++	rc = map_global_sid_to_ss(state, sid, &ss_sid, GFP_ATOMIC);
++	if (rc)
++		return rc;
++	rc = selinux_ss_task_inode_sid(state, ss_sid, name, &ss_outsid);
++	if (rc || ss_outsid == ss_sid)
++		return rc;
++	return map_ss_sid_to_global(state, ss_outsid, out_sid, GFP_ATOMIC);
++}
++
+ int security_port_sid(struct selinux_state *state, u8 protocol, u16 port,
+ 		      u32 *out_sid)
+ {
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 5566f419e6657aacee26453103a73f744e805b4f..314e6feee8b5f3ac7195c16aa925493ef0fb87f5 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -4894,6 +4894,14 @@ static void selinux_task_to_inode(struct task_struct *p,
+ {
+ 	struct inode_security_struct *isec = selinux_inode(inode);
+ 	u32 sid = task_sid_obj(p);
++	const char *name = proc_task_inode_name(inode);
++
++	if (name && S_ISREG(inode->i_mode)) {
++		struct qstr qname = QSTR_INIT(name, strlen(name));
++
++		if (security_task_inode_sid(current_selinux_state, sid, &qname, &sid))
++			sid = SECINITSID_UNLABELED;
++	}
+ 
+ 	spin_lock(&isec->lock);
+ 	isec->sclass = inode_mode_to_security_class(inode->i_mode);
+diff --git a/security/selinux/include/security.h b/security/selinux/include/security.h
+index e9a4c940bfce2f578780771bd497c4db39640aa5..23a6df302351da4f650641e3f08f296511a37cdc 100644
+--- a/security/selinux/include/security.h
++++ b/security/selinux/include/security.h
+@@ -349,6 +349,9 @@ void security_compute_xperms_decision(struct selinux_state *state, u32 ssid,
+ int security_transition_sid(struct selinux_state *state, u32 ssid, u32 tsid,
+ 			    u16 tclass, const struct qstr *qstr, u32 *out_sid);
+ 
++int security_task_inode_sid(struct selinux_state *state, u32 sid,
++			    const struct qstr *name, u32 *out_sid);
++
+ int security_sid_to_context(struct selinux_state *state, u32 sid,
+ 			    const char **scontext, u32 *scontext_len);
+ 
+@@ -431,6 +434,12 @@ static inline int security_transition_sid(struct selinux_state *state, u32 ssid,
+ 					 out_sid);
+ }
+ 
++static inline int security_task_inode_sid(struct selinux_state *state, u32 sid,
++					  const struct qstr *name, u32 *out_sid)
++{
++	return selinux_ss_task_inode_sid(state, sid, name, out_sid);
++}
++
+ static inline int security_sid_to_context(struct selinux_state *state, u32 sid,
+ 					  const char **scontext, u32 *scontext_len)
+ {
+diff --git a/security/selinux/include/selinux_ss.h b/security/selinux/include/selinux_ss.h
+index 2a5597c5fe5b2b6d097debaec06814b938d3c756..1ea098f52da9ad822f0870f5b6c7ec137efc6edc 100644
+--- a/security/selinux/include/selinux_ss.h
++++ b/security/selinux/include/selinux_ss.h
+@@ -26,6 +26,9 @@ int selinux_ss_transition_sid(struct selinux_state *state, u32 ssid, u32 tsid,
+ 			      u16 tclass, const struct qstr *qstr,
+ 			      u32 *out_sid);
+ 
++int selinux_ss_task_inode_sid(struct selinux_state *state, u32 sid,
++			     const struct qstr *name, u32 *out_sid);
++
+ int selinux_ss_transition_sid_user(struct selinux_state *state, u32 ssid,
+ 				   u32 tsid, u16 tclass, const char *objname,
+ 				   u32 *out_sid);
+diff --git a/security/selinux/ss/services.c b/security/selinux/ss/services.c
+index 175ee193602beed4da00f18e1ba1328c905c9736..95b136e9c952c1e19ed5722f3850f5ccad30294a 100644
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@ -1709,7 +1709,7 @@ static int compute_sid_handle_invalid_context(
+ 	return -EACCES;
+ }
+ 
+-static void filename_compute_type(struct policydb *policydb,
++static bool filename_compute_type(struct policydb *policydb,
+ 				  struct context *newcontext,
+ 				  u32 stype, u32 ttype, u16 tclass,
+ 				  const char *objname)
+@@ -1723,7 +1723,7 @@ static void filename_compute_type(struct policydb *policydb,
+ 	 * if the ttype does not contain any rules.
+ 	 */
+ 	if (!ebitmap_get_bit(&policydb->filename_trans_ttypes, ttype))
+-		return;
++		return false;
+ 
+ 	ft.ttype = ttype;
+ 	ft.tclass = tclass;
+@@ -1733,10 +1733,11 @@ static void filename_compute_type(struct policydb *policydb,
+ 	while (datum) {
+ 		if (ebitmap_get_bit(&datum->stypes, stype - 1)) {
+ 			newcontext->type = datum->otype;
+-			return;
++			return true;
+ 		}
+ 		datum = datum->next;
+ 	}
++	return false;
+ }
+ 
+ static int security_compute_sid(struct selinux_state *state,
+@@ -1746,7 +1747,7 @@ static int security_compute_sid(struct selinux_state *state,
+ 				u16 specified,
+ 				const char *objname,
+ 				u32 *out_sid,
+-				bool kern)
++				bool kern, bool named_only)
+ {
+ 	struct selinux_policy *policy;
+ 	struct policydb *policydb;
+@@ -1886,9 +1887,17 @@ static int security_compute_sid(struct selinux_state *state,
+ 	}
+ 
+ 	/* if we have a objname this is a file trans check so check those rules */
+-	if (objname)
+-		filename_compute_type(policydb, &newcontext, scontext->type,
+-				      tcontext->type, tclass, objname);
++	if (objname) {
++		bool matched = filename_compute_type(policydb, &newcontext,
++						     scontext->type, tcontext->type,
++						     tclass, objname);
++
++		/* Task proc files keep the exact task SID without an explicit rule. */
++		if (named_only && !matched) {
++			*out_sid = tsid;
++			goto out_unlock;
++		}
++	}
+ 
+ 	/* Check for class-specific changes. */
+ 	if (specified & AVTAB_TRANSITION) {
+@@ -1968,7 +1977,15 @@ int selinux_ss_transition_sid(struct selinux_state *state,
+ {
+ 	return security_compute_sid(state, ssid, tsid, tclass,
+ 				    AVTAB_TRANSITION,
+-				    qstr ? qstr->name : NULL, out_sid, true);
++				    qstr ? qstr->name : NULL, out_sid, true, false);
++}
++
++int selinux_ss_task_inode_sid(struct selinux_state *state, u32 sid,
++			     const struct qstr *name, u32 *out_sid)
++{
++	return security_compute_sid(state, sid, sid, SECCLASS_FILE,
++				    AVTAB_TRANSITION, name->name, out_sid,
++				    true, true);
+ }
+ 
+ int selinux_ss_transition_sid_user(struct selinux_state *state,
+@@ -1977,7 +1994,7 @@ int selinux_ss_transition_sid_user(struct selinux_state *state,
+ {
+ 	return security_compute_sid(state, ssid, tsid, tclass,
+ 				    AVTAB_TRANSITION,
+-				    objname, out_sid, false);
++				    objname, out_sid, false, false);
+ }
+ 
+ /**
+@@ -2002,7 +2019,7 @@ int selinux_ss_member_sid(struct selinux_state *state,
+ {
+ 	return security_compute_sid(state, ssid, tsid, tclass,
+ 				    AVTAB_MEMBER, NULL,
+-				    out_sid, false);
++				    out_sid, false, false);
+ }
+ 
+ /**
+@@ -2027,7 +2044,7 @@ int selinux_ss_change_sid(struct selinux_state *state,
+ {
+ 	return security_compute_sid(state,
+ 				    ssid, tsid, tclass, AVTAB_CHANGE, NULL,
+-				    out_sid, false);
++				    out_sid, false, false);
+ }
+ 
+ static inline int convert_context_handle_invalid_context(

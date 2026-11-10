@@ -1,0 +1,326 @@
+From: 5656565566 <contact@home56.top>
+Date: Tue, 10 Nov 2026 12:16:22 +0800
+Subject: [PATCH] timerfd: isolate alarm timers in bound instance views
+
+Keep host alarmtimer and physical wakeup control in the initial namespace.
+For a sealed, live instance, authorize its bound user namespace and use an
+hrtimer backend for local alarm timerfds. Pin the creating time namespace,
+retain the logical clock ID, and reject use from another instance.
+
+Relative realtime alarms retain suspend-inclusive expiry. Absolute boottime
+uses the object's pinned time offsets, not the namespace of a later caller.
+No new userspace interface or per-tick accounting is introduced.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+---
+ fs/timerfd.c              | 84 ++++++++++++++++++++++++++++++++++++++++-------
+ include/linux/uts_views.h |  4 +++
+ kernel/uts_views.c        | 43 ++++++++++++++++++++++++
+ 3 files changed, 120 insertions(+), 11 deletions(-)
+
+diff --git a/fs/timerfd.c b/fs/timerfd.c
+index c68f28d9c..21f3c16ff 100644
+--- a/fs/timerfd.c
++++ b/fs/timerfd.c
+@@ -27,6 +27,9 @@
+ #include <linux/compat.h>
+ #include <linux/rcupdate.h>
+ #include <linux/time_namespace.h>
++#include <linux/timekeeping.h>
++#include <linux/uts_views.h>
++#include <linux/user_namespace.h>
+ 
+ struct timerfd_ctx {
+ 	union {
+@@ -44,15 +47,32 @@ struct timerfd_ctx {
+ 	struct list_head clist;
+ 	spinlock_t cancel_lock;
+ 	bool might_cancel;
++	struct time_namespace *instance_ns;
+ };
+ 
+ static LIST_HEAD(cancel_list);
+ static DEFINE_SPINLOCK(cancel_lock);
+ 
++static bool alarm_clockid(int clockid)
++{
++	return clockid == CLOCK_REALTIME_ALARM || clockid == CLOCK_BOOTTIME_ALARM;
++}
++
+ static inline bool isalarm(struct timerfd_ctx *ctx)
+ {
+-	return ctx->clockid == CLOCK_REALTIME_ALARM ||
+-		ctx->clockid == CLOCK_BOOTTIME_ALARM;
++	return !ctx->instance_ns && alarm_clockid(ctx->clockid);
++}
++
++static int timerfd_clockid(struct timerfd_ctx *ctx)
++{
++	if (ctx->instance_ns)
++		return ctx->clockid == CLOCK_REALTIME_ALARM ? CLOCK_REALTIME : CLOCK_BOOTTIME;
++	return ctx->clockid;
++}
++
++static bool timerfd_instance_matches(struct timerfd_ctx *ctx)
++{
++	return !ctx->instance_ns || uts_views_time_matches(ctx->instance_ns);
+ }
+ 
+ /*
+@@ -189,12 +209,18 @@ static int timerfd_setup(struct timerfd_ctx *ctx, int flags,
+ {
+ 	enum hrtimer_mode htmode;
+ 	ktime_t texp;
+-	int clockid = ctx->clockid;
++	int clockid = timerfd_clockid(ctx);
+ 
+ 	htmode = (flags & TFD_TIMER_ABSTIME) ?
+ 		HRTIMER_MODE_ABS: HRTIMER_MODE_REL;
+ 
+ 	texp = timespec64_to_ktime(ktmr->it_value);
++	/* Relative REALTIME hrtimers normally use MONOTONIC; local alarms include suspend. */
++	if (ctx->instance_ns && clockid == CLOCK_REALTIME && !(flags & TFD_TIMER_ABSTIME)) {
++		htmode = HRTIMER_MODE_ABS;
++		if (texp)
++			texp = ktime_add_safe(ktime_get_real(), texp);
++	}
+ 	ctx->expired = 0;
+ 	ctx->ticks = 0;
+ 	ctx->tintv = timespec64_to_ktime(ktmr->it_interval);
+@@ -210,8 +236,15 @@ static int timerfd_setup(struct timerfd_ctx *ctx, int flags,
+ 	}
+ 
+ 	if (texp != 0) {
+-		if (flags & TFD_TIMER_ABSTIME)
+-			texp = timens_ktime_to_host(clockid, texp);
++		if (flags & TFD_TIMER_ABSTIME) {
++#ifdef CONFIG_TIME_NS
++			if (ctx->instance_ns)
++				texp = do_timens_ktime_to_host(clockid, texp,
++							     &ctx->instance_ns->offsets);
++			else
++#endif
++				texp = timens_ktime_to_host(clockid, texp);
++		}
+ 		if (isalarm(ctx)) {
+ 			if (flags & TFD_TIMER_ABSTIME)
+ 				alarm_start(&ctx->t.alarm, texp);
+@@ -239,6 +272,8 @@ static int timerfd_release(struct inode *inode, struct file *file)
+ 		alarm_cancel(&ctx->t.alarm);
+ 	else
+ 		hrtimer_cancel(&ctx->t.tmr);
++	if (ctx->instance_ns)
++		put_time_ns(ctx->instance_ns);
+ 	kfree_rcu(ctx, rcu);
+ 	return 0;
+ }
+@@ -249,6 +284,9 @@ static __poll_t timerfd_poll(struct file *file, poll_table *wait)
+ 	__poll_t events = 0;
+ 	unsigned long flags;
+ 
++	if (!timerfd_instance_matches(ctx))
++		return EPOLLERR;
++
+ 	poll_wait(file, &ctx->wqh, wait);
+ 
+ 	spin_lock_irqsave(&ctx->wqh.lock, flags);
+@@ -266,6 +304,9 @@ static ssize_t timerfd_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ 	ssize_t res;
+ 	u64 ticks = 0;
+ 
++	if (!timerfd_instance_matches(ctx))
++		return -EPERM;
++
+ 	if (iov_iter_count(to) < sizeof(ticks))
+ 		return -EINVAL;
+ 
+@@ -324,6 +365,9 @@ static void timerfd_show(struct seq_file *m, struct file *file)
+ 	struct timerfd_ctx *ctx = file->private_data;
+ 	struct timespec64 value, interval;
+ 
++	if (!timerfd_instance_matches(ctx))
++		return;
++
+ 	spin_lock_irq(&ctx->wqh.lock);
+ 	value = ktime_to_timespec64(timerfd_get_remaining(ctx));
+ 	interval = ktime_to_timespec64(ctx->tintv);
+@@ -353,6 +397,9 @@ static long timerfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg
+ 	struct timerfd_ctx *ctx = file->private_data;
+ 	int ret = 0;
+ 
++	if (!timerfd_instance_matches(ctx))
++		return -EPERM;
++
+ 	switch (cmd) {
+ 	case TFD_IOC_SET_TICKS: {
+ 		u64 ticks;
+@@ -396,6 +443,7 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
+ 	int ufd;
+ 	struct timerfd_ctx *ctx;
+ 	struct file *file;
++	struct time_namespace *instance = NULL;
+ 
+ 	/* Check the TFD_* constants for consistency.  */
+ 	BUILD_BUG_ON(TFD_CLOEXEC != O_CLOEXEC);
+@@ -409,10 +457,14 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
+ 	     clockid != CLOCK_BOOTTIME_ALARM))
+ 		return -EINVAL;
+ 
+-	if ((clockid == CLOCK_REALTIME_ALARM ||
+-	     clockid == CLOCK_BOOTTIME_ALARM) &&
+-	    !capable(CAP_WAKE_ALARM))
+-		return -EPERM;
++	if (alarm_clockid(clockid)) {
++#ifdef CONFIG_UTS_NS_VIEWS
++		if (current_user_ns() != &init_user_ns && current->nsproxy->time_ns->uts_view)
++			instance = current->nsproxy->time_ns;
++#endif
++		if (instance ? !uts_views_alarm_capable(instance) : !capable(CAP_WAKE_ALARM))
++			return -EPERM;
++	}
+ 
+ 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+ 	if (!ctx)
+@@ -421,6 +473,8 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
+ 	init_waitqueue_head(&ctx->wqh);
+ 	spin_lock_init(&ctx->cancel_lock);
+ 	ctx->clockid = clockid;
++	if (instance)
++		ctx->instance_ns = get_time_ns(instance);
+ 
+ 	if (isalarm(ctx))
+ 		alarm_init(&ctx->t.alarm,
+@@ -428,12 +482,14 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
+ 			   ALARM_REALTIME : ALARM_BOOTTIME,
+ 			   timerfd_alarmproc);
+ 	else
+-		hrtimer_setup(&ctx->t.tmr, timerfd_tmrproc, clockid, HRTIMER_MODE_ABS);
++		hrtimer_setup(&ctx->t.tmr, timerfd_tmrproc, timerfd_clockid(ctx), HRTIMER_MODE_ABS);
+ 
+ 	ctx->moffs = ktime_mono_to_real(0);
+ 
+ 	ufd = get_unused_fd_flags(flags & TFD_SHARED_FCNTL_FLAGS);
+ 	if (ufd < 0) {
++		if (ctx->instance_ns)
++			put_time_ns(ctx->instance_ns);
+ 		kfree(ctx);
+ 		return ufd;
+ 	}
+@@ -443,6 +499,8 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
+ 			    FMODE_NOWAIT);
+ 	if (IS_ERR(file)) {
+ 		put_unused_fd(ufd);
++		if (ctx->instance_ns)
++			put_time_ns(ctx->instance_ns);
+ 		kfree(ctx);
+ 		return PTR_ERR(file);
+ 	}
+@@ -471,7 +529,8 @@ static int do_timerfd_settime(int ufd, int flags,
+ 
+ 	ctx = fd_file(f)->private_data;
+ 
+-	if (isalarm(ctx) && !capable(CAP_WAKE_ALARM))
++	if (ctx->instance_ns ? !uts_views_alarm_capable(ctx->instance_ns) :
++	    alarm_clockid(ctx->clockid) && !capable(CAP_WAKE_ALARM))
+ 		return -EPERM;
+ 
+ 	timerfd_setup_cancel(ctx, flags);
+@@ -534,6 +593,9 @@ static int do_timerfd_gettime(int ufd, struct itimerspec64 *t)
+ 		return -EINVAL;
+ 	ctx = fd_file(f)->private_data;
+ 
++	if (!timerfd_instance_matches(ctx))
++		return -EPERM;
++
+ 	spin_lock_irq(&ctx->wqh.lock);
+ 	if (ctx->expired && ctx->tintv) {
+ 		ctx->expired = 0;
+diff --git a/include/linux/uts_views.h b/include/linux/uts_views.h
+index 305efff0b..d6564a7b0 100644
+--- a/include/linux/uts_views.h
++++ b/include/linux/uts_views.h
+@@ -59,6 +59,8 @@ long uts_views_ioctl(struct uts_namespace *ns, unsigned int cmd,
+ 		     unsigned long arg);
+ void uts_views_destroy(struct uts_native_view *native);
+ bool uts_views_live(struct uts_resource_view *view);
++bool uts_views_time_matches(struct time_namespace *ns);
++bool uts_views_alarm_capable(struct time_namespace *ns);
+ bool uts_views_may_enter(struct uts_resource_view *old,
+ 			 struct uts_resource_view *target);
+ void uts_views_copy(struct uts_resource_view **target,
+@@ -83,6 +85,8 @@ int uts_views_stat(struct seq_file *m, struct uts_resource_view *view,
+ int uts_views_sysctl_value(enum uts_view_sysctl sysctl, int fallback);
+ #else
+ struct uts_native_view;
++static inline bool uts_views_time_matches(struct time_namespace *ns) { return false; }
++static inline bool uts_views_alarm_capable(struct time_namespace *ns) { return false; }
+ static inline int uts_views_sysctl_value(enum uts_view_sysctl sysctl,
+ 					 int fallback)
+ {
+diff --git a/kernel/uts_views.c b/kernel/uts_views.c
+index 813fe5ec9..7d2ec4fa3 100644
+--- a/kernel/uts_views.c
++++ b/kernel/uts_views.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/build_bug.h>
++#include <linux/capability.h>
+ #include <linux/cgroup.h>
+ #include <linux/ctype.h>
+ #include <linux/file.h>
+@@ -22,6 +23,7 @@
+ #include <linux/slab.h>
+ #include <linux/time_namespace.h>
+ #include <linux/uaccess.h>
++#include <linux/user_namespace.h>
+ #include <linux/utsname.h>
+ #include <linux/uts_resources.h>
+ #include <linux/uts_views.h>
+@@ -29,6 +31,47 @@
+ 
+ static DEFINE_MUTEX(uts_view_lock);
+ 
++/* The host-bound PID namespace owns the capability, including in child namespaces. */
++static struct user_namespace *time_view_user_ns(struct time_namespace *ns)
++{
++	struct uts_resource_view *view = ns->uts_view;
++	struct uts_native_view *native;
++	struct pid_namespace *pid;
++	bool inside;
++
++	if (!view || current->nsproxy->time_ns->uts_view != view ||
++	    current->nsproxy->uts_ns->resources != view ||
++	    task_active_pid_ns(current)->uts_view != view || !uts_resources_live(view))
++		return NULL;
++	native = uts_resources_native(view);
++	if (!native || !(native->info.flags & UTS_VIEW_BOUND))
++		return NULL;
++
++	rcu_read_lock();
++	inside = cgroup_is_descendant(task_dfl_cgroup(current), uts_resources_cgroup(view));
++	rcu_read_unlock();
++	if (!inside)
++		return NULL;
++
++	for (pid = task_active_pid_ns(current); pid; pid = pid->parent) {
++		if (pid->ns.ns_id == native->info.pidns_id)
++			return pid->user_ns != &init_user_ns ? pid->user_ns : NULL;
++	}
++	return NULL;
++}
++
++bool uts_views_time_matches(struct time_namespace *ns)
++{
++	return time_view_user_ns(ns) != NULL;
++}
++
++bool uts_views_alarm_capable(struct time_namespace *ns)
++{
++	struct user_namespace *owner = time_view_user_ns(ns);
++
++	return owner && ns_capable(owner, CAP_WAKE_ALARM);
++}
++
+ static_assert(sizeof(struct uts_view_config) == 4304);
+ static_assert(offsetof(struct uts_view_config, cmdline) == 208);
+ static_assert(sizeof(struct uts_view_info) == 128);

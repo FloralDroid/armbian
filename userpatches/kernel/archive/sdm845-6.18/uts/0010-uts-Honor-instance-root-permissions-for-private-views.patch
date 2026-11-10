@@ -1,0 +1,257 @@
+From: 5656565566 <contact@home56.top>
+Subject: [PATCH] uts: Honor instance root permissions for private views
+
+Use the proc view owner namespace for existing private sysctl permissions.
+Check both open and IO, reject foreign resource domains, and preserve
+shared-kernel security floors and SELinux checks. Namespaced SYS_ADMIN
+replaces initial-user-namespace SYS_ADMIN only for private restriction values.
+
+Initialize private tree nodes and attributes with the mapped root of the
+bound network namespace. Preserve existing attribute modes and stores;
+never change the real host sysfs nodes or their ownership.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+
+diff --git a/fs/proc/internal.h b/fs/proc/internal.h
+index bb8d720ef02c77f523af01fafda93c021d3a9d6e..2c0e388d628646e52b522f68d35b2756f11c354b 100644
+--- a/fs/proc/internal.h
++++ b/fs/proc/internal.h
+@@ -24,12 +24,16 @@ struct proc_dir_entry;
+ bool proc_native_visible(struct super_block *sb, struct proc_dir_entry *de);
+ void proc_native_inode(struct inode *inode, struct proc_dir_entry *de);
+ bool proc_native_sysctl_visible(struct dentry *dir, const char *name);
++int proc_native_sysctl_permission(struct inode *inode, const struct ctl_table *table,
++				 int mask);
+ int proc_native_sysctl(struct file *file, const struct ctl_table *table, int write,
+ 		       void *buffer, size_t *length, loff_t *pos);
+ #else
+ static inline bool proc_native_visible(struct super_block *sb, struct proc_dir_entry *de) { return true; }
+ static inline void proc_native_inode(struct inode *inode, struct proc_dir_entry *de) {}
+ static inline bool proc_native_sysctl_visible(struct dentry *dir, const char *name) { return true; }
++static inline int proc_native_sysctl_permission(struct inode *inode,
++			const struct ctl_table *table, int mask) { return 1; }
+ static inline int proc_native_sysctl(struct file *file, const struct ctl_table *table, int write,
+ 				     void *buffer, size_t *length, loff_t *pos) { return 1; }
+ #endif
+diff --git a/fs/proc/native.c b/fs/proc/native.c
+index 281e73e691fd84fb323664593852dbf6ee255840..ccca3167c82b15201e492a61b25dac3f4ab1d96c 100644
+--- a/fs/proc/native.c
++++ b/fs/proc/native.c
+@@ -9,12 +9,15 @@
+ #include <linux/sched/cputime.h>
+ #include <linux/fs.h>
+ #include <linux/namei.h>
++#include <linux/nsproxy.h>
+ #include <linux/pid_namespace.h>
+ #include <linux/psi.h>
+ #include <linux/seq_file.h>
+ #include <linux/sysctl.h>
+ #include <linux/utsname.h>
+ #include <linux/uts_resources.h>
++#include <linux/uts_namespace.h>
++#include <linux/user_namespace.h>
+ #include "internal.h"
+ 
+ static bool named(const char *name, const char *const *names, size_t count)
+@@ -270,7 +273,51 @@ bool proc_native_sysctl_visible(struct dentry *dir, const char *name)
+ 	return false;
+ }
+ 
++int proc_native_sysctl_permission(struct inode *inode, const struct ctl_table *table,
++				 int mask)
++{
++	static const char *const paths[] = {
++		"/sys/kernel/pid_max", "/sys/kernel/kptr_restrict",
++		"/sys/kernel/dmesg_restrict", "/sys/kernel/perf_event_paranoid",
++		"/sys/kernel/randomize_va_space", "/sys/vm/mmap_rnd_bits",
++		"/sys/vm/mmap_rnd_compat_bits", "/sys/kernel/hostname",
++		"/sys/kernel/domainname",
++	};
++	struct proc_fs_info *fs = proc_sb_info(inode->i_sb);
++	struct user_namespace *user_ns;
++	struct dentry *dentry;
++	char buffer[128], *path;
++	int mode = table->mode;
++	bool private;
++
++	if (!fs->uts_view)
++		return 1;
++	if (mask & MAY_NOT_BLOCK)
++		return -ECHILD;
++	dentry = d_find_alias(inode);
++	if (!dentry)
++		return -ENOENT;
++	path = dentry_path_raw(dentry, buffer, sizeof(buffer));
++	private = !IS_ERR(path) && named(path, paths, ARRAY_SIZE(paths));
++	dput(dentry);
++	if (!private)
++		return 1;
++	if (!uts_resources_live(fs->uts_view))
++		return -ENODEV;
++	if (smp_load_acquire(&current->nsproxy->uts_ns->resources) != fs->uts_view)
++		return -EPERM;
++
++	/* Only existing private handlers use namespace-relative owner bits. */
++	user_ns = fs->uts_ns->user_ns;
++	if (uid_eq(current_euid(), make_kuid(user_ns, 0)))
++		mode >>= 6;
++	else if (in_egroup_p(make_kgid(user_ns, 0)))
++		mode >>= 3;
++	return (mask & ~mode & (MAY_READ | MAY_WRITE | MAY_EXEC)) ? -EACCES : 0;
++}
++
+ static int native_restrict_sysctl(const struct ctl_table *table, int *value,
++				 struct user_namespace *user_ns, bool sysadmin,
+ 				 int write, void *buffer, size_t *length,
+ 				 loff_t *pos)
+ {
+@@ -281,7 +328,13 @@ static int native_restrict_sysctl(const struct ctl_table *table, int *value,
+ 
+ 	/* Instance policy may tighten a shared kernel's restrictions. */
+ 	local.data = &result;
+-	ret = table->proc_handler(&local, write, buffer, length, pos);
++	if (sysadmin) {
++		if (write && !ns_capable(user_ns, CAP_SYS_ADMIN))
++			return -EPERM;
++		ret = proc_dointvec_minmax(&local, write, buffer, length, pos);
++	} else {
++		ret = table->proc_handler(&local, write, buffer, length, pos);
++	}
+ 	if (!ret && write) {
+ 		if (result < minimum)
+ 			return -EPERM;
+@@ -323,14 +376,17 @@ int proc_native_sysctl(struct file *file, const struct ctl_table *table,
+ 	}
+ 	if (!strcmp(path, "/sys/kernel/kptr_restrict")) {
+ 		return native_restrict_sysctl(table, &native->kptr_restrict,
++					      fs->uts_ns->user_ns, true,
+ 					      write, buffer, length, pos);
+ 	}
+ 	if (!strcmp(path, "/sys/kernel/dmesg_restrict")) {
+ 		return native_restrict_sysctl(table, &native->dmesg_restrict,
++					      fs->uts_ns->user_ns, true,
+ 					      write, buffer, length, pos);
+ 	}
+ 	if (!strcmp(path, "/sys/kernel/perf_event_paranoid")) {
+ 		return native_restrict_sysctl(table, &native->perf_event_paranoid,
++					      fs->uts_ns->user_ns, false,
+ 					      write, buffer, length, pos);
+ 	}
+ 	if (!strcmp(path, "/sys/kernel/randomize_va_space")) {
+diff --git a/fs/proc/proc_sysctl.c b/fs/proc/proc_sysctl.c
+index a27ff61c9babedb7f55aaaff0799e201cf5c644b..4764cc883cd2e4b66a4eb258c29eb346ebeb92c3 100644
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@ -569,8 +569,10 @@ static ssize_t proc_sys_call_handler(struct kiocb *iocb, struct iov_iter *iter,
+ 	 * At this point we know that the sysctl was not unregistered
+ 	 * and won't be until we finish.
+ 	 */
+-	error = -EPERM;
+-	if (sysctl_perm(head, table, write ? MAY_WRITE : MAY_READ))
++	error = proc_native_sysctl_permission(inode, table, write ? MAY_WRITE : MAY_READ);
++	if (error == 1)
++		error = sysctl_perm(head, table, write ? MAY_WRITE : MAY_READ);
++	if (error)
+ 		goto out;
+ 
+ 	/* if that can happen at all, it should be -EINVAL, not -EISDIR */
+@@ -818,8 +820,11 @@ static int proc_sys_permission(struct mnt_idmap *idmap,
+ 	table = PROC_I(inode)->sysctl_entry;
+ 	if (!table) /* global root - r-xr-xr-x */
+ 		error = mask & MAY_WRITE ? -EACCES : 0;
+-	else /* Use the permissions on the sysctl table entry */
+-		error = sysctl_perm(head, table, mask & ~MAY_NOT_BLOCK);
++	else {
++		error = proc_native_sysctl_permission(inode, table, mask);
++		if (error == 1)
++			error = sysctl_perm(head, table, mask & ~MAY_NOT_BLOCK);
++	}
+ 
+ 	sysctl_head_finish(head);
+ 	return error;
+diff --git a/fs/sysfs/native.c b/fs/sysfs/native.c
+index c51d112867d137309cd7e854ab816fcf663ccbc0..99f5a78abb261f0e537013ee769dc65e481ed497 100644
+--- a/fs/sysfs/native.c
++++ b/fs/sysfs/native.c
+@@ -15,6 +15,7 @@
+ #include <linux/slab.h>
+ #include <linux/utsname.h>
+ #include <linux/uts_resources.h>
++#include <linux/user_namespace.h>
+ #include <net/net_namespace.h>
+ #include <media/v4l2-dev.h>
+ #include "native.h"
+@@ -256,11 +257,23 @@ static ssize_t node_store(struct kobject *kobj, struct attribute *attr,
+ 
+ static const struct sysfs_ops native_ops = { .show = node_show,
+ 					     .store = node_store };
++
++static void node_ownership(const struct kobject *kobj, kuid_t *uid, kgid_t *gid)
++{
++	const struct uts_sysfs_node *node =
++		container_of(kobj, struct uts_sysfs_node, kobj);
++	const struct uts_sysfs *tree = node->native->sysfs_data;
++
++	*uid = tree->uid;
++	*gid = tree->gid;
++}
++
+ static const struct kobj_type native_type = {
+ 	.release = node_release,
+ 	.sysfs_ops = &native_ops,
+ 	.namespace = node_namespace,
+ 	.child_ns_type = node_child_namespace,
++	.get_ownership = node_ownership,
+ };
+ 
+ /* Keep dynamic attribute pointers with their node, until its files are removed. */
+@@ -488,6 +501,7 @@ int uts_sysfs_create(struct uts_native_view *native, struct net *net)
+ 	struct node_attributes *anchor;
+ 	struct uts_sysfs_node *devices, *system, *fs, *dev, *node;
+ 	struct net_device *netdev;
++	struct iattr ownership;
+ 	int ret;
+ 
+ 	ASSERT_RTNL();
+@@ -498,6 +512,13 @@ int uts_sysfs_create(struct uts_native_view *native, struct net *net)
+ 		kfree(anchor);
+ 		return -ENOMEM;
+ 	}
++	tree->uid = make_kuid(net->user_ns, 0);
++	tree->gid = make_kgid(net->user_ns, 0);
++	if (!uid_valid(tree->uid) || !gid_valid(tree->gid)) {
++		kfree(tree);
++		kfree(anchor);
++		return -EOVERFLOW;
++	}
+ 	INIT_LIST_HEAD(&tree->nodes);
+ 	INIT_LIST_HEAD(&tree->global);
+ 	INIT_LIST_HEAD(&anchor->attributes);
+@@ -516,6 +537,14 @@ int uts_sysfs_create(struct uts_native_view *native, struct net *net)
+ 	anchor->node.kobj.sd = kernfs_root_to_node(native->sysfs);
+ 	anchor->node.kobj.sd->priv = &anchor->node.kobj;
+ 	native->sysfs_data = tree;
++	ownership = (struct iattr) {
++		.ia_valid = ATTR_UID | ATTR_GID,
++		.ia_uid = tree->uid,
++		.ia_gid = tree->gid,
++	};
++	ret = kernfs_setattr(anchor->node.kobj.sd, &ownership);
++	if (ret)
++		return ret;
+ #define DIR(dst, parent, name)                                               \
+ 	do {                                                                 \
+ 		(dst) = uts_sysfs_node(tree, (parent), (name), UV_DIRECTORY, \
+diff --git a/fs/sysfs/native.h b/fs/sysfs/native.h
+index 8f3118c962fc9db0da2592789d5624b764484423..0e7a624e1548d983187468d41e4735c0d0d8784d 100644
+--- a/fs/sysfs/native.h
++++ b/fs/sysfs/native.h
+@@ -41,6 +41,8 @@ struct uts_sysfs {
+ 	struct list_head global;
+ 	struct list_head nodes;
+ 	struct uts_native_view *native;
++	kuid_t uid;
++	kgid_t gid;
+ 	struct uts_sysfs_node *anchor, *cpus, *net, *class_net;
+ 	struct uts_sysfs_node *classes, *dev_char, *virtual;
+ 	struct uts_sysfs_node *dev_block, *blocks;

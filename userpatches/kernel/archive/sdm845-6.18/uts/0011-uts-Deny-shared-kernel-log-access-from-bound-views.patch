@@ -1,0 +1,81 @@
+From: 5656565566 <contact@home56.top>
+Subject: [PATCH] uts: Deny access to the shared kernel log from bound views
+
+Keep all syslog and kmsg operations behind the resource-view boundary,
+including operations on a file opened before entering the bound view.
+Android userspace logs remain private and usable.
+
+Signed-off-by: 5656565566 <contact@home56.top>
+
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index 65566c2a7e6592ddf9dd45bcca084a8a42567cf6..834c5b947eee2fa95c3ad61542e59af673b05a58 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -40,6 +40,7 @@
+ #include <linux/kmsg_dump.h>
+ #include <linux/syslog.h>
+ #include <linux/uts_views.h>
++#include <linux/uts_resources.h>
+ #include <linux/cpu.h>
+ #include <linux/rculist.h>
+ #include <linux/poll.h>
+@@ -616,6 +617,9 @@ static int syslog_action_restricted(int type)
+ 
+ static int check_syslog_permissions(int type, int source)
+ {
++	if (uts_resources_active())
++		return -EPERM;
++
+ 	/*
+ 	 * If this is from /proc/kmsg and we've already opened it, then we've
+ 	 * already done the capabilities checks at open time.
+@@ -746,6 +750,9 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
+ 	size_t len = iov_iter_count(from);
+ 	ssize_t ret = len;
+ 
++	if (uts_resources_active())
++		return -EPERM;
++
+ 	if (len > PRINTKRB_RECORD_MAX)
+ 		return -EINVAL;
+ 
+@@ -808,6 +815,9 @@ static ssize_t devkmsg_read(struct file *file, char __user *buf,
+ 	};
+ 	ssize_t ret;
+ 
++	if (uts_resources_active())
++		return -EPERM;
++
+ 	ret = mutex_lock_interruptible(&user->lock);
+ 	if (ret)
+ 		return ret;
+@@ -872,6 +882,9 @@ static loff_t devkmsg_llseek(struct file *file, loff_t offset, int whence)
+ 	struct devkmsg_user *user = file->private_data;
+ 	loff_t ret = 0;
+ 
++	if (uts_resources_active())
++		return -EPERM;
++
+ 	if (offset)
+ 		return -ESPIPE;
+ 
+@@ -904,6 +917,9 @@ static __poll_t devkmsg_poll(struct file *file, poll_table *wait)
+ 	struct printk_info info;
+ 	__poll_t ret = 0;
+ 
++	if (uts_resources_active())
++		return EPOLLERR;
++
+ 	poll_wait(file, &log_wait, wait);
+ 
+ 	if (prb_read_valid_info(prb, atomic64_read(&user->seq), &info, NULL)) {
+@@ -922,6 +938,9 @@ static int devkmsg_open(struct inode *inode, struct file *file)
+ 	struct devkmsg_user *user;
+ 	int err;
+ 
++	if (uts_resources_active())
++		return -EPERM;
++
+ 	if (devkmsg_log & DEVKMSG_LOG_MASK_OFF)
+ 		return -EPERM;
+ 
